@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// herdr-swarm pane renderer — status mode (U5).
+// herdr-swarm pane renderer — status mode (U5) and harvest mode (U6).
 //
 // STRICTLY READ-ONLY on the run manifest: the single-writer rule (plan KTD)
 // says writers are launchers and harvest verbs only. This process reconciles
@@ -7,13 +7,19 @@
 // writes any of them back; tests/renderer.test.mjs asserts a full poll cycle
 // performs zero fs writes.
 //
-// U6 seam: HERDR_SWARM_PANE_MODE selects the pane's mode at spawn time
-// (status-pane.sh exports "status"; harvest-pane.sh will export "harvest").
-// Only status is implemented here; unknown modes linger with a message
-// instead of flash-closing the pane.
-import { execFile } from "node:child_process";
+// Harvest mode is UI + state machine + orchestration ONLY (destructive-
+// surface KTD): every state-mutating git/herdr step runs through
+// `bash scripts/harvest-step.sh <verb>` — no git-mutation or raw-CLI strings
+// live in this file (tests/harvest.test.mjs greps for violations), keeping
+// all rm -rf-class and ref-mutating code in one bash surface under the stub
+// harness.
+//
+// HERDR_SWARM_PANE_MODE selects the pane's mode at spawn time
+// (status-pane.sh exports "status"; harvest-pane.sh exports "harvest").
+// Unknown modes linger with a message instead of flash-closing the pane.
+import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -428,10 +434,10 @@ export class Renderer {
 
 	async run() {
 		if (this.mode !== "status") {
-			// U6 seam: harvest (or any future mode) is selected by env but not
-			// built yet — linger with the message instead of flash-closing.
+			// Unknown mode (harvest dispatches to HarvestRenderer in the main
+			// guard) — linger with the message instead of flash-closing.
 			process.stdout.write(
-				`herdr-swarm: pane mode '${sanitizeText(this.mode)}' is not implemented yet (harvest lands in U6).\n`,
+				`herdr-swarm: unknown pane mode '${sanitizeText(this.mode)}'.\n`,
 			);
 			await new Promise((r) => setTimeout(r, 600_000));
 			return;
@@ -475,6 +481,569 @@ export class Renderer {
 	}
 }
 
+// --- harvest mode (U6) -------------------------------------------------------
+
+// Exit-code contract of scripts/harvest-step.sh; lockstep-asserted against
+// the bash constants by tests/harvest.test.mjs so the two can never drift.
+export const STEP_EC = {
+	DRIFT: 30,
+	SEQUENCER: 31,
+	LOCUS: 32,
+	CONFLICT: 33,
+	HOOK: 34,
+	SWAP: 35,
+	REFUSED: 36,
+	IGNORED: 37,
+	DIRTY: 38,
+};
+
+// harvest-step's stdout protocol: "key<TAB>v1<TAB>v2…" lines -> multimap
+// {key: [[v1,v2,…], …]}. Typed lines, never prose parsing.
+export function parseStepOutput(text) {
+	const out = {};
+	for (const line of String(text || "").split("\n")) {
+		if (line.trim() === "") continue;
+		const [k, ...v] = line.split("\t");
+		(out[k] ||= []).push(v);
+	}
+	return out;
+}
+
+// One preview-verb result -> the renderer's per-slot preview model.
+export function previewFromStep(res) {
+	const one = (k) => res.out[k]?.[0]?.[0] ?? null;
+	const locus = res.out.locus?.[0] ?? [];
+	return {
+		state: res.code === 0 ? one("state") : "error",
+		baseSha: one("base_sha"),
+		dirty: Number(one("dirty") ?? 0),
+		locus: locus[0] ?? null,
+		locusPath: locus[1] ?? null,
+		stat: (res.out.stat ?? []).map((v) => v.join("\t")),
+		error: res.code !== 0 ? String(res.stderr || "").trim() : null,
+	};
+}
+
+// Pure screen builder for harvest mode — takes a plain model so tests assert
+// on views (conflict list, drift banner, prompts) without a PTY.
+// model: { runInfo, banner, phase, rows }  where rows carry {slot, label,
+// branch, status, preview} and phase is the state machine node.
+export function renderHarvest(model, cols = 80) {
+	const lines = [];
+	const title = model.runInfo
+		? ` herdr-swarm harvest  run:${sanitizeText(String(model.runInfo.run_id))}  base:${sanitizeText(
+				String(model.runInfo.base_ref || "").replace(/^refs\/heads\//, ""),
+			)}`
+		: " herdr-swarm harvest";
+	lines.push(`${ESC}[7m${title.slice(0, cols)}${ESC}[0m`);
+	if (model.banner) lines.push(` ! ${sanitizeText(model.banner)}`.slice(0, cols));
+	lines.push(
+		` ${pad("#", 3)}${pad("state", 17)}${pad("dirty", 7)}${pad("label", 14)}branch`,
+	);
+	if (!model.rows?.length) lines.push("  (no slots in this run)");
+	for (const r of model.rows ?? []) {
+		const p = r.preview;
+		const state = p ? p.state : r.status;
+		const line = ` ${pad(r.slot, 3)}${pad(sanitizeText(state ?? "?"), 17)}${pad(
+			p?.dirty ?? "-",
+			7,
+		)}${pad(sanitizeText(r.label ?? ""), 14)}${sanitizeText(r.branch ?? "")}`.slice(0, cols);
+		// Dirty and error rows need the user before any merge can happen —
+		// same "loud" treatment blocked gets in status mode.
+		lines.push(
+			state === "dirty" || state === "error"
+				? `${ESC}[7m${line}${ESC}[0m`
+				: line,
+		);
+		for (const s of p?.stat ?? [])
+			lines.push(`      ${sanitizeText(s)}`.slice(0, cols));
+	}
+	lines.push("");
+	const ph = model.phase ?? { name: "list" };
+	switch (ph.name) {
+		case "resume": {
+			const o = ph.offers[ph.idx];
+			lines.push(
+				` RESUME: slot ${o.slot} has a completed but un-swapped merge commit ${String(o.sha).slice(0, 10)}.`,
+			);
+			lines.push(`${ESC}[2m [y]complete the swap  [n]leave it journaled${ESC}[0m`);
+			break;
+		}
+		case "dirty":
+			lines.push(` slot ${ph.slot} has uncommitted work:`);
+			lines.push(
+				`${ESC}[2m [w]commit as WIP  [s]kip slot  [d]iscard (typed confirm)  [b]ack${ESC}[0m`,
+			);
+			break;
+		case "discard":
+			lines.push(
+				` DISCARD slot ${ph.slot}: a snapshot ref is written first, but this deletes uncommitted work.`,
+			);
+			lines.push(` Type the slot branch name to confirm, Enter to submit, Esc to cancel:`);
+			lines.push(` > ${sanitizeText(ph.typed)}`);
+			break;
+		case "confirm-user":
+			lines.push(
+				` MERGE slot ${ph.slot} IN YOUR CHECKOUT: base is checked out at ${sanitizeText(ph.path ?? "?")}.`,
+			);
+			lines.push(
+				` The tree was verified clean and will be re-verified at merge time.`,
+			);
+			lines.push(`${ESC}[2m [y]merge in my tree  [any other key]cancel${ESC}[0m`);
+			break;
+		case "conflict": {
+			lines.push(
+				ph.kind === "hook"
+					? ` ${ESC}[7mHOOK/OTHER FAILURE${ESC}[0m slot ${ph.slot} — merge failed without conflicts:`
+					: ` ${ESC}[7mCONFLICT${ESC}[0m slot ${ph.slot} — conflicted files:`,
+			);
+			for (const f of ph.files ?? []) lines.push(`   ${sanitizeText(f)}`);
+			if (ph.message) lines.push(` ${sanitizeText(ph.message)}`.slice(0, cols));
+			lines.push(
+				`${ESC}[2m [s]hell into merge tree  [a]bort merge  [b]ack${ESC}[0m`,
+			);
+			break;
+		}
+		case "ignored":
+			lines.push(
+				` ARCHIVE slot ${ph.slot}: removal would silently delete these ignored files:`,
+			);
+			for (const f of ph.files ?? []) lines.push(`   ${sanitizeText(f)}`);
+			lines.push(`${ESC}[2m [y]archive anyway  [n]keep the worktree${ESC}[0m`);
+			break;
+		default:
+			lines.push(
+				`${ESC}[2m 1-9:select slot (merge/prompt)  r:re-preview  q:quit${ESC}[0m`,
+			);
+	}
+	return lines.join("\n");
+}
+
+export class HarvestRenderer {
+	constructor(env = process.env) {
+		this.env = env;
+		this.manifestFile = env.HERDR_SWARM_MANIFEST || manifestPath(env);
+		// The verb script is the ONLY mutation channel; resolved from the
+		// plugin root so the pane's cwd never matters.
+		this.stepScript = path.join(
+			env.HERDR_PLUGIN_ROOT ||
+				path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+			"scripts",
+			"harvest-step.sh",
+		);
+		this.rows = [];
+		this.runInfo = null;
+		this.banner = "";
+		this.phase = { name: "list" };
+		this.busy = false; // a destructive verb is in flight — input masked
+		this.lastScreen = null;
+		this.write = (s) => process.stdout.write(s);
+	}
+
+	// Run one harvest-step verb. Input (and SIGINT — see run()) is masked
+	// while it runs: interrupting a verb mid-merge is never fatal (lock +
+	// journal), but it strands state the user then has to resume — so the
+	// renderer simply refuses to race its own verbs.
+	async step(verb, args = [], extraEnv = {}) {
+		this.busy = true;
+		try {
+			const r = await new Promise((resolve) => {
+				execFile(
+					"bash",
+					[this.stepScript, verb, ...args.map(String)],
+					{ env: { ...this.env, ...extraEnv }, maxBuffer: 16 * 1024 * 1024 },
+					(err, stdout, stderr) =>
+						resolve({
+							code: err ? (typeof err.code === "number" ? err.code : 1) : 0,
+							stdout: stdout ?? "",
+							stderr: stderr ?? "",
+						}),
+				);
+			});
+			r.out = parseStepOutput(r.stdout);
+			return r;
+		} finally {
+			this.busy = false;
+		}
+	}
+
+	lastErrLine(res) {
+		const ls = String(res.stderr || "")
+			.split("\n")
+			.filter((l) => l.trim() !== "");
+		return ls[ls.length - 1] || `harvest step failed (${res.code})`;
+	}
+
+	// Re-read the manifest and re-preview every slot. Called after EVERY
+	// successful merge (plan: re-baseline remaining previews) and on drift.
+	async refresh() {
+		let text = null;
+		try {
+			text = fs.readFileSync(this.manifestFile, "utf8");
+		} catch {
+			/* missing -> typed result below */
+		}
+		const parsed = parseManifest(text);
+		if (!parsed.ok) {
+			this.rows = [];
+			this.runInfo = null;
+			this.banner =
+				parsed.reason === "missing"
+					? "no active swarm run for this workspace"
+					: `manifest is corrupt (${parsed.detail}) — harvest refuses to guess`;
+			return;
+		}
+		const m = parsed.manifest;
+		this.runInfo = { run_id: m.run_id, base_ref: m.base_ref, repo_root: m.repo_root };
+		const rows = [];
+		for (const s of m.slots) {
+			const row = {
+				slot: s.slot,
+				label: s.label,
+				branch: s.branch,
+				status: s.status,
+				preview: null,
+			};
+			// Archived slots are settled history — no verb call, no row noise.
+			if (s.status !== "archived") {
+				row.preview = previewFromStep(await this.step("preview", [s.slot]));
+			}
+			rows.push(row);
+		}
+		this.rows = rows;
+	}
+
+	async reload() {
+		await this.refresh();
+		this.paint();
+	}
+
+	async doMerge(slot) {
+		const row = this.rows.find((r) => r.slot === slot);
+		if (!row?.preview?.baseSha) return;
+		const r = await this.step("merge", [slot, row.preview.baseSha]);
+		if (r.code === 0) {
+			this.banner = `slot ${slot} merged`;
+			await this.doArchive(slot);
+			// Re-baseline: every remaining preview must diff and merge against
+			// the NEW base SHA (R7: drift re-checked before every merge).
+			await this.reload();
+		} else if (r.code === STEP_EC.DRIFT) {
+			this.banner = "base moved since preview — re-previewing all slots";
+			this.phase = { name: "list" };
+			await this.reload();
+		} else if (r.code === STEP_EC.CONFLICT || r.code === STEP_EC.HOOK) {
+			this.phase = {
+				name: "conflict",
+				slot,
+				kind: r.code === STEP_EC.HOOK ? "hook" : "conflict",
+				files: (r.out.conflict_file ?? []).map((v) => v[0]),
+				tree: r.out.merge_tree?.[0]?.[0] ?? null,
+				message: this.lastErrLine(r),
+			};
+			this.paint();
+		} else {
+			this.banner = this.lastErrLine(r);
+			this.phase = { name: "list" };
+			this.paint();
+		}
+	}
+
+	async doArchive(slot, ack = false) {
+		const r = await this.step(
+			"archive",
+			[slot],
+			ack ? { HERDR_SWARM_ACK_IGNORED: "1" } : {},
+		);
+		if (r.code === STEP_EC.IGNORED) {
+			this.phase = {
+				name: "ignored",
+				slot,
+				files: (r.out.ignored ?? []).map((v) => v[0]),
+			};
+			this.paint();
+		} else if (r.code === STEP_EC.DIRTY) {
+			this.phase = { name: "dirty", slot };
+			this.paint();
+		} else if (r.code !== 0) {
+			this.banner = this.lastErrLine(r);
+			this.paint();
+		}
+	}
+
+	async selectSlot(slot) {
+		const row = this.rows.find((r) => r.slot === slot);
+		if (!row?.preview) return;
+		const p = row.preview;
+		if (p.state === "dirty") {
+			this.phase = { name: "dirty", slot };
+			this.paint();
+		} else if (p.state === "clean") {
+			if (p.locus === "user-tree") {
+				// The confirm is UI; the verb re-verifies clean+SHA when invoked
+				// (the prompt can sit for minutes — merge-locus KTD).
+				this.phase = { name: "confirm-user", slot, path: p.locusPath };
+				this.paint();
+			} else {
+				await this.doMerge(slot);
+			}
+		} else if (p.state === "merged" || p.state === "skipped" || p.state === "failed") {
+			await this.doArchive(slot);
+			await this.reload();
+		} else {
+			this.banner = `slot ${slot} is '${p.state}' — nothing to do here`;
+			this.paint();
+		}
+	}
+
+	// PTY handoff for shell-into-merge-tree: the child must own a sane
+	// terminal, so leave the alt screen and raw mode first; the finally
+	// restores BOTH even when the shell exits while the merge is still
+	// conflicted or the spawn itself throws — terminal state is this
+	// process's responsibility no matter what the merge tree looks like.
+	shellInto(dir) {
+		this.write(`${ESC}[?1049l${ESC}[?25h`);
+		this.setRaw(false);
+		try {
+			this.spawnShell(dir);
+		} finally {
+			this.setRaw(true);
+			this.write(`${ESC}[?1049h${ESC}[?25l`);
+			this.lastScreen = null; // the shell scribbled on the screen: full repaint
+			this.paint();
+		}
+	}
+
+	// Seam for tests: overridden to observe ordering without a real shell.
+	spawnShell(dir) {
+		spawnSync(this.env.SHELL || "/bin/sh", [], {
+			cwd: dir,
+			stdio: "inherit",
+			env: this.env,
+		});
+	}
+
+	setRaw(on) {
+		try {
+			if (process.stdin.isTTY) process.stdin.setRawMode(on);
+		} catch {
+			/* not a TTY */
+		}
+	}
+
+	async onKey(ch) {
+		// busy: a destructive verb is in flight — every key (including ^C, see
+		// run()'s SIGINT handler) is masked until it returns.
+		if (this.busy) return;
+		const ph = this.phase;
+		if (ph.name === "discard") {
+			// Line-input mode for the typed confirmation.
+			if (ch === "\x1b") {
+				this.phase = { name: "list" };
+				this.paint();
+			} else if (ch === "\r" || ch === "\n") {
+				const typed = ph.typed;
+				const row = this.rows.find((r) => r.slot === ph.slot);
+				this.phase = { name: "list" };
+				if (typed === row?.branch) {
+					// Snapshot BEFORE discard — the verb refuses otherwise, but the
+					// renderer sequences it explicitly so the user sees the ref.
+					const snap = await this.step("snapshot", [ph.slot]);
+					if (snap.code !== 0) {
+						this.banner = this.lastErrLine(snap);
+					} else {
+						const d = await this.step("discard", [ph.slot], {
+							HERDR_SWARM_CONFIRM: typed,
+						});
+						this.banner =
+							d.code === 0
+								? `slot ${ph.slot} discarded (backup: ${snap.out.snapshot?.[0]?.[0] ?? "recorded"})`
+								: this.lastErrLine(d);
+					}
+					await this.reload();
+				} else {
+					this.banner = "discard cancelled — the typed name did not match";
+					this.paint();
+				}
+			} else if (ch === "\x7f" || ch === "\b") {
+				ph.typed = ph.typed.slice(0, -1);
+				this.paint();
+			} else if (ch >= " " && ch <= "~") {
+				ph.typed += ch;
+				this.paint();
+			}
+			return;
+		}
+		if (ch === "q" || ch === "\x03") {
+			this.cleanup();
+			process.exit(0);
+		}
+		switch (ph.name) {
+			case "resume": {
+				const offer = ph.offers[ph.idx];
+				if (ch === "y" || ch === "Y") {
+					const r = await this.step("resume", ["complete", offer.slot]);
+					this.banner =
+						r.code === 0 ? `slot ${offer.slot} swap completed` : this.lastErrLine(r);
+				}
+				if (ph.idx + 1 < ph.offers.length) {
+					this.phase = { ...ph, idx: ph.idx + 1 };
+					this.paint();
+				} else {
+					this.phase = { name: "list" };
+					await this.reload();
+				}
+				break;
+			}
+			case "dirty":
+				if (ch === "w") {
+					const r = await this.step("commit-wip", [ph.slot]);
+					this.banner = r.code === 0 ? `slot ${ph.slot} committed as WIP` : this.lastErrLine(r);
+					this.phase = { name: "list" };
+					await this.reload();
+				} else if (ch === "s") {
+					const r = await this.step("skip", [ph.slot]);
+					this.banner = r.code === 0 ? `slot ${ph.slot} skipped` : this.lastErrLine(r);
+					this.phase = { name: "list" };
+					await this.reload();
+				} else if (ch === "d") {
+					this.phase = { name: "discard", slot: ph.slot, typed: "" };
+					this.paint();
+				} else if (ch === "b" || ch === "\x1b") {
+					this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
+			case "confirm-user":
+				if (ch === "y" || ch === "Y") {
+					const slot = ph.slot;
+					this.phase = { name: "list" };
+					await this.doMerge(slot);
+				} else {
+					this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
+			case "conflict":
+				if (ch === "s" && ph.tree) {
+					this.shellInto(ph.tree);
+				} else if (ch === "a") {
+					const r = await this.step("abort-merge", [ph.slot]);
+					this.banner =
+						r.code === 0 ? `slot ${ph.slot} merge aborted` : this.lastErrLine(r);
+					this.phase = { name: "list" };
+					await this.reload();
+				} else if (ch === "b" || ch === "\x1b") {
+					// Leave the conflict in place (the user may resolve by hand);
+					// resume/abort-merge still know about it via the journal.
+					this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
+			case "ignored":
+				if (ch === "y" || ch === "Y") {
+					const slot = ph.slot;
+					this.phase = { name: "list" };
+					await this.doArchive(slot, true);
+					await this.reload();
+				} else {
+					this.banner = `slot ${ph.slot} kept — worktree not removed`;
+					this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
+			default:
+				if (ch >= "1" && ch <= "9") await this.selectSlot(Number(ch));
+				else if (ch === "r") {
+					this.banner = "";
+					await this.reload();
+				}
+		}
+	}
+
+	screen() {
+		const cols = process.stdout.columns || 80;
+		return renderHarvest(
+			{ runInfo: this.runInfo, banner: this.banner, phase: this.phase, rows: this.rows },
+			cols,
+		);
+	}
+
+	paint() {
+		const out = this.screen();
+		if (out === this.lastScreen) return;
+		this.lastScreen = out;
+		this.write(
+			`${ESC}[H${out.split("\n").join(`${ESC}[K\n`)}${ESC}[K\n${ESC}[0J`,
+		);
+	}
+
+	cleanup() {
+		try {
+			if (process.stdin.isTTY) process.stdin.setRawMode(false);
+		} catch {
+			/* never set */
+		}
+		this.write(`${ESC}[?1049l${ESC}[?25h`);
+	}
+
+	async run() {
+		for (const sig of ["SIGTERM", "SIGHUP"]) {
+			process.on(sig, () => {
+				this.cleanup();
+				process.exit(0);
+			});
+		}
+		// SIGINT masked while a verb is in flight (destructive-surface KTD):
+		// the verb's lock+journal make an interrupt survivable, but never free.
+		process.on("SIGINT", () => {
+			if (this.busy) return;
+			this.cleanup();
+			process.exit(0);
+		});
+		process.on("uncaughtException", (err) => {
+			this.cleanup();
+			console.error("herdr-swarm harvest renderer crashed:", err.message);
+			process.exit(1);
+		});
+		if (process.stdin.isTTY) {
+			process.stdin.setRawMode(true);
+			process.stdin.resume();
+			process.stdin.on("data", (chunk) => {
+				(async () => {
+					for (const ch of chunk.toString("utf8")) await this.onKey(ch);
+				})().catch(() => {
+					/* onKey failures surface via banners, never kill the pane */
+				});
+			});
+		}
+		this.write(`${ESC}[?1049h${ESC}[?25l`);
+		process.stdout.on("resize", () => {
+			this.lastScreen = null;
+			this.paint();
+		});
+		// Journal scan FIRST (manifest KTD): a crashed merge is surfaced before
+		// any new destructive step is offered.
+		const r = await this.step("resume");
+		const offers = (r.out.resume_offer ?? []).map(([slot, sha]) => ({
+			slot: Number(slot),
+			sha,
+		}));
+		const dangling = r.out.resume_dangling ?? [];
+		if (dangling.length) {
+			this.banner = `DANGLING merge commit(s): ${dangling
+				.map((v) => `slot ${v[0]} @ ${String(v[1]).slice(0, 10)} (kept in ${v[2]})`)
+				.join("; ")}`;
+		}
+		if (offers.length) this.phase = { name: "resume", offers, idx: 0 };
+		await this.refresh();
+		this.paint();
+		// The pane lives until the user quits; headless (tests, pane without a
+		// TTY) it lingers after the first paint like every other pane script.
+		await new Promise(() => {});
+	}
+}
+
 if (
 	process.argv[1] &&
 	import.meta.url === pathToFileURL(process.argv[1]).href
@@ -482,7 +1051,8 @@ if (
 	// Construct inside the async wrapper so constructor failures hit the same
 	// catch and never flash-close the pane.
 	(async () => {
-		await new Renderer().run();
+		const mode = process.env.HERDR_SWARM_PANE_MODE || "status";
+		await (mode === "harvest" ? new HarvestRenderer() : new Renderer()).run();
 	})().catch((err) => {
 		// Restore raw mode + screen even when the crash predates run()'s own
 		// handlers — a pane left in raw mode swallows keystrokes for the whole
