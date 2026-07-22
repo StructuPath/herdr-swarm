@@ -185,7 +185,7 @@ This repo deliberately does **not** carry the `herdr-plugin` marketplace topic
 yet: fan-out refuses on herdr 0.7.5 (the current latest stable), and listing a
 fan-out tool whose entry point refuses on the version fresh installers run
 would be a first-use dead end. The topic push waits until an arbitrary-argv
-agent-start path exists there. Until then the repo is public and
-link-installable.
+agent-start path exists there. The repo is private for now; `herdr plugin link`
+against a local clone is the supported install path.
 
 MIT © StructuPath
