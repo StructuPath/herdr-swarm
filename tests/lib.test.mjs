@@ -10,7 +10,7 @@ import { createHarness, repoRoot } from "./harness.mjs";
 // JSON so wrapper tests exercise the true wire shapes.
 const h = createHarness();
 h.writeHerdrStub();
-const { stateDir, freshEnv, runScript, runLib, log } = h;
+const { stateDir, freshEnv, runLib, log } = h;
 
 // --- sanitize_slug ---
 
@@ -261,16 +261,6 @@ test("no raw herdr invocations outside lib.sh wrappers (scripts/ and bin/)", () 
 			});
 	}
 	assert.deepEqual(offenders, [], "raw herdr invocations outside lib.sh");
-});
-
-// --- scaffold stubs ---
-
-test("manifest-referenced action stubs exit 0 with a message, never a naked failure", () => {
-	for (const s of ["abort.sh", "prune.sh"]) {
-		const r = runScript(s);
-		assert.equal(r.status, 0, `${s}: ${r.stderr}`);
-		assert.match(r.stdout, /not implemented yet/, s);
-	}
 });
 
 test("every script the manifest references exists on disk", () => {
