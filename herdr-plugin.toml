@@ -1,0 +1,59 @@
+id = "structupath.swarm"
+name = "Swarm"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Worktree-per-agent fan-out, per-slot change visibility, and review-first harvest for parallel coding agents"
+platforms = ["macos", "linux"]
+
+# Action ids are hyphenated on purpose: herdr rejects dots in action ids.
+
+[[actions]]
+id = "fanout"
+title = "Fan out agents"
+description = "Spawn N agents, each in its own worktree on a run-unique branch (opens the fan-out pane)"
+command = ["bash", "scripts/fanout.sh"]
+
+[[actions]]
+id = "status"
+title = "Open swarm status pane"
+description = "Per-slot agent state, branch, and change counts against the fork point"
+command = ["bash", "scripts/status.sh"]
+
+[[actions]]
+id = "harvest"
+title = "Harvest worktrees"
+description = "Review each slot's diff and merge it back to base, one slot at a time"
+command = ["bash", "scripts/harvest.sh"]
+
+[[actions]]
+id = "abort"
+title = "Abort run and clean up"
+description = "Stop agents and remove swarm-owned worktrees and panes; branches are kept"
+command = ["bash", "scripts/abort.sh"]
+
+[[actions]]
+id = "prune"
+title = "Prune merged swarm branches"
+description = "Delete fully-merged swarm/* branches and backup refs after an explicit dry-run listing"
+command = ["bash", "scripts/prune.sh"]
+
+# Pane titles double as the cleanup sweep labels (pane list reports them as
+# "label") — keep them distinctive so a sweep can never match a user pane.
+
+[[panes]]
+id = "fanout-pane"
+title = "Swarm Fan-out"
+placement = "split"
+command = ["bash", "scripts/fanout-pane.sh"]
+
+[[panes]]
+id = "status-pane"
+title = "Swarm Status"
+placement = "split"
+command = ["bash", "scripts/status-pane.sh"]
+
+[[panes]]
+id = "harvest-pane"
+title = "Swarm Harvest"
+placement = "split"
+command = ["bash", "scripts/harvest-pane.sh"]
