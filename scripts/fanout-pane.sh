@@ -15,6 +15,9 @@
 #   5. per slot 1..N: "y" to give that slot its own task (then free lines
 #      terminated by a lone "."), anything else keeps the shared prompt
 #
+# Every prompt above also has an ENV override (see the "Non-interactive input
+# channel" block below), so an agent or CI job can start a run without a TTY.
+#
 # Per-slot ordering is pinned write-ahead (manifest KTD — the manifest must
 # stay a superset of git/herdr reality at every instant):
 #   pending row (branch known, path null) → worktree create → record
@@ -73,6 +76,58 @@ read_task() {
 		__buf+="$__line"$'\n'
 	done
 	fatal 1 "herdr-swarm: task input ended without the terminating '.' line."
+}
+
+# --- Non-interactive input channel (env) -------------------------------------
+# Fan-out was the only capability with no scriptable path: abort and prune are
+# zero-TTY env-gated actions and harvest-step.sh is a verb CLI with typed exit
+# codes, so an agent could inspect, harvest, and clean up a run but never start
+# one. Each variable below REPLACES exactly one prompt; anything unset falls
+# back to the prompt, so the stdin protocol above is untouched.
+#
+#   HERDR_SWARM_SLOTS      slot count (same cap check the prompt runs)
+#   HERDR_SWARM_PRESETS    comma-separated preset names, one per slot; a single
+#                          name applies to every slot
+#   HERDR_SWARM_TASK_FILE  file whose contents become the shared task — a FILE,
+#                          not a var, because the task is normally multi-line
+#                          and the stdin protocol's lone "." terminator has no
+#                          environment equivalent
+#   HERDR_SWARM_TASK       single-line shared task; the file wins if both are set
+#   HERDR_SWARM_DETRITUS   delete | rename | abort — replaces the d/r/q prompt
+#   HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes
+#                          replaces the typed "delete-unmerged" second gate.
+#                          Without it a scripted `delete` that hits unmerged
+#                          leftovers REFUSES: the P0 guard is not bypassable
+#                          just because nobody is at the keyboard.
+#
+# Per-slot task overrides stay interactive-only. Encoding N free-form multi-line
+# prompts into the environment buys nothing a caller cannot get by fanning out
+# once per distinct task, and every encoding scheme reintroduces the terminator
+# problem HERDR_SWARM_TASK_FILE exists to dodge.
+SCRIPTED=0
+if [ -n "${HERDR_SWARM_SLOTS:-}${HERDR_SWARM_PRESETS:-}${HERDR_SWARM_TASK:-}${HERDR_SWARM_TASK_FILE:-}${HERDR_SWARM_DETRITUS:-}" ]; then
+	SCRIPTED=1
+fi
+# Prompting needs a terminal to prompt at. In a scripted run with no TTY every
+# remaining prompt is a hang waiting to happen — an agent that pipes nothing and
+# waits forever is worse than a refusal — so those prompts become fatal-by-name
+# instead. Interactive runs (SCRIPTED=0, including the piped-stdin test suite)
+# keep reading stdin exactly as before.
+NO_PROMPTS=0
+if [ "$SCRIPTED" -eq 1 ] && [ ! -t 0 ]; then
+	NO_PROMPTS=1
+fi
+# Set once the corresponding value arrived from the environment; the flags gate
+# the follow-up prompts those answers imply (per-slot overrides, the typed
+# force-delete word), which have no meaning in a run nobody is watching.
+TASK_FROM_ENV=0
+DETRITUS_FROM_ENV=0
+
+require_var() {
+	# require_var <env-name> <what> — called at a prompt site with no env value
+	# in a run that cannot prompt. Names the variable and dies; never reads.
+	[ "$NO_PROMPTS" -eq 1 ] || return 0
+	fatal 1 "herdr-swarm: non-interactive fan-out needs $1 ($2) — stdin is not a terminal, so there is nothing to prompt. Set it and rerun."
 }
 
 # --- JSON helpers (node is a plugin prereq; same choice as lib.sh) ----------
@@ -246,10 +301,24 @@ force_delete_unmerged() {
 	} >&2
 	printf '%s' "$names" | _archived_runs_for_branches
 	echo "herdr-swarm: non-destructive routes: run Harvest on that run to merge the work back, or answer [r] instead to rename these under swarm-kept/." >&2
-	prompt_line reply "Type '$DETRITUS_FORCE_WORD' to force-delete the branches listed above, anything else to keep them: "
-	if [ "$reply" != "$DETRITUS_FORCE_WORD" ]; then
-		echo "herdr-swarm: kept — nothing was force-deleted." >&2
-		return 0
+	if [ "$DETRITUS_FROM_ENV" -eq 1 ]; then
+		# The scripted mirror of the typed word, gated exactly like prune's
+		# destructive classes: HERDR_SWARM_DETRITUS=delete authorized detritus
+		# in general, before any of it was known to be unmerged, so it is no
+		# more consent for -D than the interactive [d] keystroke was. Refusing
+		# here leaves the branches behind, and the caller's re-check then fails
+		# the whole fan-out non-zero — which is the point.
+		if [ "${HERDR_SWARM_DETRITUS_ACK_UNMERGED:-}" != "yes" ]; then
+			echo "herdr-swarm: REFUSED — HERDR_SWARM_DETRITUS=delete does not authorize force-deleting unmerged work. Set HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes to authorize it, or HERDR_SWARM_DETRITUS=rename to keep the work under swarm-kept/." >&2
+			echo "herdr-swarm: kept — nothing was force-deleted." >&2
+			return 0
+		fi
+	else
+		prompt_line reply "Type '$DETRITUS_FORCE_WORD' to force-delete the branches listed above, anything else to keep them: "
+		if [ "$reply" != "$DETRITUS_FORCE_WORD" ]; then
+			echo "herdr-swarm: kept — nothing was force-deleted." >&2
+			return 0
+		fi
 	fi
 	while IFS= read -r b; do
 		[ -n "$b" ] || continue
@@ -341,7 +410,18 @@ rc=0
 preflight_check_detritus || rc=$?
 if [ "$rc" -eq "$PF_EC_DETRITUS" ]; then
 	# Inventory already printed by the check; surface-and-choose (R3).
-	prompt_line choice "Leftover swarm detritus: [d]elete / [r]ename to swarm-kept/ / [q]uit and harvest it first: "
+	if [ -n "${HERDR_SWARM_DETRITUS:-}" ]; then
+		DETRITUS_FROM_ENV=1
+		case "$HERDR_SWARM_DETRITUS" in
+		delete) choice="d" ;;
+		rename) choice="r" ;;
+		abort) choice="q" ;;
+		*) fatal 1 "herdr-swarm: HERDR_SWARM_DETRITUS='$HERDR_SWARM_DETRITUS' is not one of delete / rename / abort." ;;
+		esac
+	else
+		require_var HERDR_SWARM_DETRITUS "leftover-branch handling: delete / rename / abort"
+		prompt_line choice "Leftover swarm detritus: [d]elete / [r]ename to swarm-kept/ / [q]uit and harvest it first: "
+	fi
 	case "$choice" in
 	d | D) delete_detritus ;;
 	r | R) rename_detritus ;;
@@ -356,41 +436,96 @@ fi
 
 # --- Collect inputs (nothing is created until every input is validated) -----
 
-while :; do
-	prompt_line n "How many agents? "
-	preflight_check_slot_cap "$n" && break
-	# Cap check printed its own message; re-prompt rather than dying — a
-	# typo'd N should not cost the user the whole flow.
-done
+if [ -n "${HERDR_SWARM_SLOTS:-}" ]; then
+	# No re-prompt loop here: a scripted caller cannot fix a typo mid-run, so a
+	# bad count is a refusal with the cap check's own message above it.
+	n="$HERDR_SWARM_SLOTS"
+	preflight_check_slot_cap "$n" || fatal $? "herdr-swarm: HERDR_SWARM_SLOTS='$n' refused."
+else
+	require_var HERDR_SWARM_SLOTS "the slot count"
+	while :; do
+		prompt_line n "How many agents? "
+		preflight_check_slot_cap "$n" && break
+		# Cap check printed its own message; re-prompt rather than dying — a
+		# typo'd N should not cost the user the whole flow.
+	done
+fi
 
 plist="$(presets_list)" || fatal 1 "herdr-swarm: preset catalog is invalid — fix $(presets_file) and rerun."
 default_preset="${plist%%$'\t'*}"
-echo "Available presets:"
-while IFS=$'\t' read -r pname pargs; do
-	[ -n "$pname" ] && printf '  %s — %s\n' "$pname" "$pargs"
-done <<<"$plist"
 
 declare -a preset_names slot_argvs slot_tasks
-for ((i = 1; i <= n; i++)); do
-	while :; do
-		prompt_line p "Slot $i preset [$default_preset]: "
-		[ -n "$p" ] || p="$default_preset"
-		if a="$(preset_argv "$p")"; then
-			preset_names[i]="$p"
-			slot_argvs[i]="$a"
-			break
+if [ -n "${HERDR_SWARM_PRESETS:-}" ]; then
+	IFS=',' read -r -a env_presets <<<"$HERDR_SWARM_PRESETS"
+	# Exact count or exactly one. A short list quietly defaulting the tail
+	# would start agents the caller never named — and every slot is a worktree,
+	# a branch, and a process, so "close enough" is not a recoverable guess.
+	if [ "${#env_presets[@]}" -ne 1 ] && [ "${#env_presets[@]}" -ne "$n" ]; then
+		fatal 1 "herdr-swarm: HERDR_SWARM_PRESETS lists ${#env_presets[@]} preset name(s) but the run has $n slot(s) — give one name per slot, or a single name to apply to all."
+	fi
+	for ((i = 1; i <= n; i++)); do
+		if [ "${#env_presets[@]}" -eq 1 ]; then
+			p="${env_presets[0]}"
+		else
+			p="${env_presets[i - 1]}"
 		fi
-		# preset_argv printed why; re-prompt with the menu names.
-		echo "Pick one of: $(printf '%s' "$plist" | cut -f1 | tr '\n' ' ')"
+		# Trim surrounding whitespace so "a, b" reads the same as "a,b"; the
+		# name itself is still charset-validated by preset_argv (branch names).
+		p="${p#"${p%%[![:space:]]*}"}"
+		p="${p%"${p##*[![:space:]]}"}"
+		a="$(preset_argv "$p")" || fatal 1 "herdr-swarm: HERDR_SWARM_PRESETS names an unusable preset '$p' (slot $i)."
+		preset_names[i]="$p"
+		slot_argvs[i]="$a"
 	done
-done
+else
+	require_var HERDR_SWARM_PRESETS "one preset name per slot (comma-separated)"
+	echo "Available presets:"
+	while IFS=$'\t' read -r pname pargs; do
+		[ -n "$pname" ] && printf '  %s — %s\n' "$pname" "$pargs"
+	done <<<"$plist"
+	for ((i = 1; i <= n; i++)); do
+		while :; do
+			prompt_line p "Slot $i preset [$default_preset]: "
+			[ -n "$p" ] || p="$default_preset"
+			if a="$(preset_argv "$p")"; then
+				preset_names[i]="$p"
+				slot_argvs[i]="$a"
+				break
+			fi
+			# preset_argv printed why; re-prompt with the menu names.
+			echo "Pick one of: $(printf '%s' "$plist" | cut -f1 | tr '\n' ' ')"
+		done
+	done
+fi
 
-echo "Shared task prompt for all slots — end with a single '.' on its own line:"
-read_task shared_task
+if [ -n "${HERDR_SWARM_TASK_FILE:-}" ]; then
+	# The file wins over HERDR_SWARM_TASK on purpose: it is the channel that can
+	# carry a real multi-line brief, so a caller that set both meant this one.
+	[ -f "$HERDR_SWARM_TASK_FILE" ] || fatal 1 "herdr-swarm: HERDR_SWARM_TASK_FILE '$HERDR_SWARM_TASK_FILE' is not a readable file."
+	shared_task="$(cat "$HERDR_SWARM_TASK_FILE")" || fatal 1 "herdr-swarm: could not read HERDR_SWARM_TASK_FILE '$HERDR_SWARM_TASK_FILE'."
+	# Command substitution ate the trailing newline; restore it so the task file
+	# has the same shape it gets from the interactive reader (body, then footer).
+	shared_task="$shared_task"$'\n'
+	TASK_FROM_ENV=1
+elif [ -n "${HERDR_SWARM_TASK:-}" ]; then
+	shared_task="$HERDR_SWARM_TASK"$'\n'
+	TASK_FROM_ENV=1
+else
+	require_var "HERDR_SWARM_TASK_FILE or HERDR_SWARM_TASK" "the shared task prompt"
+	echo "Shared task prompt for all slots — end with a single '.' on its own line:"
+	read_task shared_task
+fi
 trimmed="${shared_task//[[:space:]]/}"
 [ -n "$trimmed" ] || fatal 1 "herdr-swarm: empty task prompt — nothing to hand the agents."
 
 for ((i = 1; i <= n; i++)); do
+	if [ "$TASK_FROM_ENV" -eq 1 ]; then
+		# Per-slot overrides are interactive-only (see the env block up top):
+		# the shared task arrived from the environment, so there is no prompt
+		# session to elaborate it in.
+		slot_tasks[i]="$shared_task"
+		continue
+	fi
 	prompt_line ans "Override the task for slot $i (${preset_names[i]})? [y/N] "
 	case "$ans" in
 	y | Y | yes | YES)

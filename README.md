@@ -104,6 +104,60 @@ add your own, see below):
      Snapshots belonging to the **active run** are never deleted, even with
      this flag — abort or harvest the run first.
 
+### Scripting fan-out
+
+Fan-out normally prompts, but every prompt has an environment override, so an
+agent, a script, or a CI job can start a run with no TTY. Each variable replaces
+exactly one prompt; anything you leave unset still prompts, so interactive use is
+unchanged.
+
+| Variable | Replaces |
+|---|---|
+| `HERDR_SWARM_SLOTS` | slot count (same cap check, raise with `HERDR_SWARM_MAX_SLOTS`) |
+| `HERDR_SWARM_PRESETS` | comma-separated preset names, one per slot; a single name applies to all slots |
+| `HERDR_SWARM_TASK_FILE` | path to a file whose contents become the shared task |
+| `HERDR_SWARM_TASK` | single-line shared task; **`HERDR_SWARM_TASK_FILE` wins if both are set** |
+| `HERDR_SWARM_DETRITUS` | `delete` \| `rename` \| `abort` — the leftover-branch prompt |
+| `HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes` | the typed `delete-unmerged` second confirmation |
+
+```sh
+printf 'Add retry-with-backoff to the HTTP client.\nKeep the public API unchanged.\n' > /tmp/brief.md
+
+HERDR_SWARM_SLOTS=3 \
+HERDR_SWARM_PRESETS=claude,claude,codex \
+HERDR_SWARM_TASK_FILE=/tmp/brief.md \
+HERDR_SWARM_DETRITUS=rename \
+  herdr plugin action run structupath.swarm.fanout
+```
+
+Notes:
+
+- **The task file is a file, not a variable, on purpose.** The task is normally
+  multi-line, and the stdin protocol terminates a task on a lone `.` line — an
+  environment variable has no equivalent terminator.
+- **`delete` does not bypass the unmerged-work guard.** If a leftover `swarm/*`
+  branch holds commits that are not in your base, `HERDR_SWARM_DETRITUS=delete`
+  refuses and the fan-out exits non-zero rather than reaching `git branch -D`.
+  `HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes` is the explicit opt-in, exactly as
+  prune gates its destructive classes separately. `rename` keeps the work under
+  `swarm-kept/` and always succeeds.
+- **Per-slot task overrides stay interactive-only.** Fan out once per distinct
+  task instead; there is no env encoding for N free-form multi-line prompts.
+- **Nothing blocks on a read.** With any of these variables set and stdin not a
+  terminal, a missing piece is a loud refusal naming the variable — never a
+  process waiting forever for input nobody will type.
+
+### Can an agent drive the whole plugin?
+
+Yes — all four mutating capabilities are scriptable:
+
+| Capability | Scriptable path |
+|---|---|
+| Fan out | the variables above (zero-TTY) |
+| Harvest | `scripts/harvest-step.sh <verb>` — a verb CLI with typed exit codes and `key<TAB>value` stdout |
+| Abort | `scripts/abort.sh` — a zero-TTY action, env-gated |
+| Prune | `scripts/prune.sh` — a zero-TTY action, dry run by default, env-gated per resource class |
+
 ### Keybinding
 
 ```toml

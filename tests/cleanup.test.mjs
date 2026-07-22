@@ -79,6 +79,46 @@ test("dirty slot worktree is KEPT and reported — never prompted, never forced"
 	assert.ok(branchExists(r.repo, r.branch(1)), "branch untouched (R10)");
 });
 
+// Residual finding 2, abort's half: the same shared verify_slot_ownership
+// harvest's read_slot uses, with abort's own posture. Abort never destroys
+// what it cannot verify — but it also never lets one unverifiable row abandon
+// the rest of the teardown, so the mismatch KEEPS and reports rather than
+// exiting.
+test("abort KEEPS a slot whose branch is outside the run namespace and still tears the rest down", () => {
+	const r = mkRun({ slots: 2 });
+	// A cross-repo or hand-edited manifest row: this branch is not ours, so
+	// neither is anything it names.
+	editManifest(r, (d) => {
+		d.slots.find((s) => s.slot === 1).branch = "swarm/some-other-run/s1";
+	});
+	const a = run(r, "abort.sh");
+	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
+	assert.equal(fs.existsSync(r.wt(1)), true, "unverifiable worktree survives");
+	assert.match(a.stderr, /slot 1 KEPT — ownership check failed/);
+	assert.match(a.stderr, /outside this run's namespace/);
+	// The whole run is not abandoned over one bad row.
+	assert.equal(fs.existsSync(r.wt(2)), false, "slot 2 was still reaped");
+	assert.match(a.stdout, /worktrees removed 1, kept 1/);
+	assert.equal(r.slotRow(1).status, "running", "kept slot is not marked archived");
+});
+
+test("abort KEEPS a slot whose recorded path is another branch's worktree", () => {
+	// Two REAL worktrees: the failure must be the branch/path PAIRING, not
+	// mere existence — a plain directory would pass for the wrong reason.
+	const r = mkRun({ slots: 2 });
+	editManifest(r, (d) => {
+		// Slot 2 archived so abort skips it and its worktree stays on disk as
+		// the thing slot 1 wrongly claims.
+		d.slots.find((s) => s.slot === 2).status = "archived";
+		d.slots.find((s) => s.slot === 1).path = r.wt(2);
+	});
+	const a = run(r, "abort.sh");
+	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
+	assert.match(a.stderr, /slot 1 KEPT — ownership check failed/);
+	assert.match(a.stderr, /is not a worktree of .* checked out on/);
+	assert.equal(fs.existsSync(r.wt(2)), true, "the other slot's worktree untouched");
+});
+
 // The recovery route abort prints is Harvest, and Harvest reads the LIVE
 // manifest — archiving it would strand exactly the work abort just chose to
 // protect.

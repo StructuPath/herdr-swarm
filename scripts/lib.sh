@@ -783,6 +783,63 @@ manifest_run_context() {
 	printf '%s\n' "$out"
 }
 
+# verify_slot_ownership <run_id> <branch> <path>: does this manifest row name
+# resources THIS run owns? Silent 0 when it does; a one-line reason on stdout
+# and 1 when it does not.
+#
+# THE THIRD INSTANCE of the drift pattern in
+# docs/solutions/best-practices/cross-script-invariant-drift.md (after the
+# locus guard and the run_id charset guard): run_id is charset-checked before
+# it reaches a path, but slot branch and slot path came straight out of the
+# manifest into `git worktree remove`, `reset --hard`, and `clean -fd` behind
+# nothing but a `[ -d ]`. A corrupted, hand-edited, or cross-repo manifest
+# could therefore aim an rm -rf-class removal at any directory on disk. The
+# verifier lives HERE, in the one file both consumers already source, so the
+# rule is code in a shared helper rather than a comment each caller must
+# remember — countermeasure 1 of that doc. Callers differ only in what they do
+# with the answer (harvest refuses; abort keeps and reports), which is exactly
+# why this returns a boolean instead of exiting itself.
+#
+# Two independent locks, different keys (same shape as swap_base's namespace
+# check): the branch must sit in the run's OWN namespace, and the path must be
+# a worktree GIT itself reports for that branch — the manifest's own path
+# string is never the authority for whether the path is ours.
+verify_slot_ownership() {
+	local run_id="${1-}" branch="${2-}" wtpath="${3-}" want listed p q
+	if [ -z "$run_id" ]; then
+		printf 'no run_id to check slot ownership against\n'
+		return 1
+	fi
+	# `?*` not `*`: "swarm/<run>/" with an empty tail is not a slot branch.
+	case "$branch" in
+	"swarm/$run_id/"?*) ;;
+	*)
+		printf "branch '%s' is outside this run's namespace swarm/%s/*\n" "$branch" "$run_id"
+		return 1
+		;;
+	esac
+	# A null path is the legitimate write-ahead pending row (manifest KTD:
+	# path/ids stay null until herdr returns them) — nothing to own yet.
+	[ -n "$wtpath" ] || return 0
+	# Not on disk means nothing removable: the callers' own `[ -d ]` checks
+	# report "worktree is gone", a normal state that must not become a refusal.
+	[ -d "$wtpath" ] || return 0
+	# Compare physical paths: /tmp is a symlink to /private/tmp on macOS, and
+	# git records the resolved form, so a raw string compare would refuse
+	# perfectly legitimate slots.
+	want="$(cd "$wtpath" 2>/dev/null && pwd -P)" || want="$wtpath"
+	listed="$(repo_git worktree list --porcelain 2>/dev/null | awk -v ref="branch refs/heads/$branch" '
+		/^worktree /{p=substr($0,10)} $0==ref{print p}')"
+	while IFS= read -r p; do
+		[ -n "$p" ] || continue
+		q="$(cd "$p" 2>/dev/null && pwd -P)" || q="$p"
+		[ "$q" = "$want" ] && return 0
+	done <<<"$listed"
+	printf "path '%s' is not a worktree of %s checked out on '%s'\n" \
+		"$wtpath" "${SWARM_REPO:-?}" "$branch"
+	return 1
+}
+
 # manifest_update_slot <slot> <json-patch>: read-modify-write of one slot
 # row (shallow merge). MUST be called with the mutation lock held — this
 # function deliberately does not take the lock itself, because callers batch

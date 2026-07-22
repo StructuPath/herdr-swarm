@@ -888,10 +888,14 @@ test("discard clears STAGED changes too, so the slot can afterwards be archived"
 test("archive's git-removal failure keeps stdout protocol-clean and reports the error on stderr", () => {
 	h.writeHerdrStub();
 	const run = mkRun({ status: "merged" });
-	// No workspace recorded (herdr state lost) -> plain git removal; a plain
-	// directory makes that removal fail for a NON-dirty reason.
-	const notAWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "hs-notwt-"));
-	patchSlot(run, 1, { workspace_id: null, path: notAWorktree });
+	// No workspace recorded (herdr state lost) -> plain git removal. The
+	// failure has to come from a REAL, run-owned worktree now: pointing the
+	// slot at a plain directory (the original fixture) is refused by the slot
+	// ownership check before git ever runs, so it would test the guard rather
+	// than this stdout-hygiene path. A lock makes `worktree remove` refuse on
+	// a perfectly clean tree — a non-dirty failure, same as before.
+	patchSlot(run, 1, { workspace_id: null });
+	h.git(run.repo, "worktree", "lock", run.wt(1));
 	const r = step(run, "archive", [1]);
 	assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
 	assert.equal(
@@ -899,8 +903,152 @@ test("archive's git-removal failure keeps stdout protocol-clean and reports the 
 		"",
 		"git noise on stdout would corrupt the key<TAB>value protocol",
 	);
-	assert.match(r.stderr, /not a working tree/i, "the error text survives");
+	assert.match(r.stderr, /locked/i, "the error text survives");
 	assert.equal(run.slotRow(1).status, "merged", "nothing archived");
+});
+
+// ---------------------------------------------------------------------------
+// Slot ownership (residual finding 2 — the THIRD instance of the drift pattern
+// in docs/solutions/best-practices/cross-script-invariant-drift.md). run_id was
+// charset-guarded; slot branch and slot path still reached `worktree remove`,
+// `reset --hard`, and `clean -fd` behind only a `[ -d ]`. The guard lives in
+// read_slot — the one function every slot verb passes through — so these tests
+// drive the VERBS, not the helper: the claim is "no verb can get past it".
+// ---------------------------------------------------------------------------
+
+// A logging git shim in front of the real binary. The scripts' git calls are
+// real (stubbing git would fake away exactly the worktree pairing under test),
+// so proving "refused BEFORE any mutation" needs the call record itself, not
+// just surviving state — a guard that refuses after a `reset --hard` would
+// leave identical-looking state in a fixture with nothing to lose.
+function withGitCallLog(fn) {
+	h.writeStub("git", 'echo "git $*" >> "$STUB_LOG"\nexec /usr/bin/git "$@"');
+	try {
+		return fn();
+	} finally {
+		fs.rmSync(path.join(h.stubDir, "git"), { force: true });
+	}
+}
+
+// Subcommand-precise, deliberately not a substring match: `merge-base` and
+// `worktree list` are read-only and would both trip a naive /merge|worktree/.
+const MUTATING_SUBCOMMANDS = new Set([
+	"add", "am", "branch", "checkout", "cherry-pick", "clean", "commit",
+	"commit-tree", "fetch", "init", "merge", "mv", "pull", "push", "read-tree",
+	"rebase", "reset", "restore", "revert", "rm", "stash", "switch", "tag",
+	"update-ref", "write-tree",
+]);
+function mutatingGitCalls(log) {
+	const out = [];
+	for (const line of log.split("\n")) {
+		if (!line.startsWith("git ")) continue;
+		const argv = line.slice(4).trim().split(/\s+/);
+		let i = 0;
+		// Skip the global options every call site uses to name its target.
+		while (argv[i]?.startsWith("-")) i += argv[i] === "-C" || argv[i] === "-c" ? 2 : 1;
+		const sub = argv[i];
+		if (sub === "worktree") {
+			if (["add", "remove", "prune", "lock", "move", "repair"].includes(argv[i + 1]))
+				out.push(line);
+		} else if (MUTATING_SUBCOMMANDS.has(sub)) {
+			out.push(line);
+		}
+	}
+	return out;
+}
+
+// Every verb that reads a slot row. discard also gets the confirmation token
+// it would otherwise refuse on — the ownership refusal must win over, not hide
+// behind, the checks that already existed.
+const SLOT_VERBS = [
+	["preview", [1], {}],
+	["commit-wip", [1], {}],
+	["snapshot", [1], {}],
+	["skip", [1], {}],
+	["archive", [1], {}],
+	["abort-merge", [1], {}],
+];
+
+test("a slot branch outside swarm/<run>/* is refused by every slot verb, before any git mutation", () => {
+	withGitCallLog(() => {
+		for (const [verb, args, env] of SLOT_VERBS) {
+			const run = mkRun({ status: "merged" });
+			// A cross-repo or hand-edited manifest: the row names a branch this
+			// run never minted, so nothing about the slot is ours to touch.
+			patchSlot(run, 1, { branch: "swarm/some-other-run/s1" });
+			const r = step(run, verb, args, env);
+			assert.equal(r.status, EC.REFUSED, `${verb}: ${r.stdout}\n${r.stderr}`);
+			assert.match(r.stderr, /ownership check FAILED/, `${verb} says why`);
+			assert.match(r.stderr, /outside this run's namespace/, `${verb} names the mismatch`);
+			assert.deepEqual(
+				mutatingGitCalls(h.log()),
+				[],
+				`${verb} mutated git before refusing`,
+			);
+			assert.ok(fs.existsSync(run.wt(1)), `${verb} left the worktree alone`);
+		}
+	});
+});
+
+test("merge and discard refuse a foreign slot branch too (the two rm -rf-class verbs)", () => {
+	withGitCallLog(() => {
+		const run = mkRun({ slots: 2 });
+		commitIn(run.wt(1), "a.txt");
+		const base = h.git(run.repo, "rev-parse", "HEAD").stdout.trim();
+		patchSlot(run, 1, {
+			branch: "swarm/some-other-run/s1",
+			backup_ref: base, // clears discard's snapshot precondition
+		});
+		const m = step(run, "merge", [1, base]);
+		assert.equal(m.status, EC.REFUSED, `${m.stdout}\n${m.stderr}`);
+		const d = step(run, "discard", [1], {
+			HERDR_SWARM_CONFIRM: "swarm/some-other-run/s1",
+		});
+		assert.equal(d.status, EC.REFUSED, `${d.stdout}\n${d.stderr}`);
+		assert.deepEqual(mutatingGitCalls(h.log()), [], "no reset --hard, no clean -fd");
+	});
+});
+
+test("a slot path that is a REAL worktree of a DIFFERENT branch is refused (pairing, not existence)", () => {
+	withGitCallLog(() => {
+		// Two real worktrees on purpose. A fixture pointing at a plain directory
+		// would pass for the wrong reason — mere existence is what the old
+		// `[ -d ]` already tested, and the whole point of this guard is that a
+		// registered worktree is not automatically THIS slot's worktree.
+		const run = mkRun({ slots: 2, status: "merged" });
+		patchSlot(run, 1, { path: run.wt(2) });
+		const r = step(run, "archive", [1]);
+		assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
+		assert.match(r.stderr, /is not a worktree of .* checked out on/);
+		assert.deepEqual(mutatingGitCalls(h.log()), []);
+		assert.ok(fs.existsSync(run.wt(2)), "slot 2's worktree survived slot 1's verb");
+	});
+});
+
+test("a slot path outside the repo entirely is refused", () => {
+	withGitCallLog(() => {
+		const run = mkRun({ status: "merged" });
+		// Exists, so the `[ -d ]` checks would wave it straight through to
+		// `git worktree remove` — the exact shape finding 2 describes.
+		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hs-foreign-"));
+		fs.writeFileSync(path.join(outside, "precious.txt"), "user data\n");
+		patchSlot(run, 1, { path: outside });
+		const r = step(run, "archive", [1]);
+		assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
+		assert.deepEqual(mutatingGitCalls(h.log()), []);
+		assert.ok(fs.existsSync(path.join(outside, "precious.txt")), "untouched");
+	});
+});
+
+test("a legitimate pending row (null path) still passes the ownership check", () => {
+	// The write-ahead shape (manifest KTD): the row exists before `worktree
+	// create` returns, so path is null. Refusing it would break fan-out
+	// recovery — a null path is normal, not a mismatch.
+	const run = mkRun();
+	patchSlot(run, 1, { path: null, status: "pending" });
+	const r = step(run, "preview", [1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /^state\tmissing$/m);
 });
 
 // ---------------------------------------------------------------------------

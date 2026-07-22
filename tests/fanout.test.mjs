@@ -158,6 +158,43 @@ function spawnPane(input, env, cwd, { detached = false } = {}) {
 	});
 }
 
+// Env-driven runs get NO stdin at all: stdio "ignore" hands the pane /dev/null
+// as fd 0, which is exactly the shape a plugin action, a cron job, or an agent
+// subprocess sees. `input:` is deliberately absent — a scripted fan-out that
+// still needs a byte from stdin has not been made non-interactive.
+function runPaneNoStdin(env, cwd) {
+	return spawnSync("bash", [paneScript], {
+		cwd,
+		env,
+		stdio: ["ignore", "pipe", "pipe"],
+		encoding: "utf8",
+		timeout: 30000,
+	});
+}
+
+// Same, but fd 0 is an OPEN pipe nobody ever writes to or closes — the one
+// shape that can actually hang. Any read blocks forever, so the SIGKILL that
+// the timer delivers is how a regression surfaces: a failed assertion on a
+// killed process, never a wedged suite.
+function runPaneStalledStdin(env, cwd, ms = 15000) {
+	return new Promise((resolve) => {
+		const c = spawn("bash", [paneScript], {
+			cwd,
+			env,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		c.stdout.on("data", (d) => (stdout += d));
+		c.stderr.on("data", (d) => (stderr += d));
+		const timer = setTimeout(() => c.kill("SIGKILL"), ms);
+		c.on("close", (code, signal) => {
+			clearTimeout(timer);
+			resolve({ code, signal, stdout, stderr });
+		});
+	});
+}
+
 const readManifest = () => JSON.parse(fs.readFileSync(manifestFile, "utf8"));
 const lines = (input) => input.join("\n") + "\n";
 
@@ -733,4 +770,258 @@ test("fan-out targets the workspace's repo, not the process cwd", () => {
 		/\.swarm-task\.md/,
 		"the cwd repo's exclude file was never written",
 	);
+});
+
+// --- non-interactive fan-out (env channel) -----------------------------------
+
+// Residual finding 1: fan-out was the only capability an agent could not drive.
+// Abort and prune are zero-TTY env-gated actions and harvest-step.sh is a verb
+// CLI, so a run could be inspected, harvested, and cleaned up — but never
+// started. These tests pin the closing of that gap, including the part that
+// must NOT close: the unmerged-work guard.
+
+test("env-driven: SLOTS+PRESETS+TASK fan out with no stdin at all", () => {
+	const { repo, wtRoot, env } = setup({
+		HERDR_SWARM_SLOTS: "2",
+		HERDR_SWARM_PRESETS: "claude,codex",
+		HERDR_SWARM_TASK: "Ship the thing",
+	});
+	writeStub("codex", "exit 0");
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /created 2, started 2, failed 0/);
+	const m = readManifest();
+	assert.equal(m.slots.length, 2);
+	assert.equal(m.slots[0].branch, `swarm/${m.run_id}/s1-claude`);
+	assert.equal(m.slots[1].branch, `swarm/${m.run_id}/s2-codex`);
+	for (const s of m.slots) {
+		assert.equal(s.status, "running");
+		assert.ok(s.path && s.path.startsWith(wtRoot), `path from response: ${s.path}`);
+		assert.match(
+			fs.readFileSync(path.join(s.path, ".swarm-task.md"), "utf8"),
+			/Ship the thing/,
+		);
+	}
+	// Real branches in the real repo, not just manifest bookkeeping.
+	const refs = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout;
+	assert.match(refs, new RegExp(`swarm/${m.run_id}/s1-claude`));
+	assert.match(refs, new RegExp(`swarm/${m.run_id}/s2-codex`));
+});
+
+test("env-driven: a single preset name applies to every slot", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "3",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK: "One preset, three slots",
+	});
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	const m = readManifest();
+	assert.deepEqual(
+		m.slots.map((s) => s.branch),
+		[1, 2, 3].map((i) => `swarm/${m.run_id}/s${i}-claude`),
+	);
+});
+
+test("env-driven: a PRESETS/SLOTS count mismatch refuses before anything is created", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "3",
+		HERDR_SWARM_PRESETS: "claude,codex",
+		HERDR_SWARM_TASK: "Never runs",
+	});
+	const r = runPaneNoStdin(env, repo);
+	assert.notEqual(r.status, 0);
+	assert.match(r.stderr, /lists 2 preset name\(s\) but the run has 3 slot\(s\)/);
+	// R3: refuse before creating. No worktree, no branch, no manifest.
+	assert.doesNotMatch(log(), /worktree create/);
+	assert.equal(fs.existsSync(manifestFile), false, "no manifest was written");
+	assert.equal(
+		git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout.trim(),
+		"",
+	);
+});
+
+test("env-driven: an unknown preset name is refused, with the name in the message", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "no-such-preset",
+		HERDR_SWARM_TASK: "Never runs",
+	});
+	const r = runPaneNoStdin(env, repo);
+	assert.notEqual(r.status, 0);
+	assert.match(r.stderr, /unknown preset 'no-such-preset'/);
+	assert.match(r.stderr, /HERDR_SWARM_PRESETS names an unusable preset 'no-such-preset'/);
+	assert.doesNotMatch(log(), /worktree create/);
+});
+
+test("env-driven: TASK_FILE contents land in every slot with the standing footer, and beat TASK", () => {
+	const taskFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-task-")), "brief.md");
+	fs.writeFileSync(taskFile, "Line one of the brief\nLine two of the brief\n");
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "2",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK_FILE: taskFile,
+		// Both set: the file wins (multi-line is the channel that can carry a
+		// real brief), and the single-line var must not leak in alongside it.
+		HERDR_SWARM_TASK: "the single-line one that must lose",
+	});
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	for (const s of readManifest().slots) {
+		const tf = fs.readFileSync(path.join(s.path, ".swarm-task.md"), "utf8");
+		assert.match(tf, /Line one of the brief\nLine two of the brief/);
+		assert.doesNotMatch(tf, /must lose/, "TASK_FILE wins over TASK");
+		assert.match(tf, /Commit completed work locally/);
+		assert.match(tf, /Never push/);
+		assert.match(tf, new RegExp(`Work only in this worktree, on branch ${s.branch}`));
+	}
+});
+
+test("env-driven: a missing TASK_FILE is refused by name", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK_FILE: path.join(os.tmpdir(), "hs-no-such-task-file.md"),
+	});
+	const r = runPaneNoStdin(env, repo);
+	assert.notEqual(r.status, 0);
+	assert.match(r.stderr, /HERDR_SWARM_TASK_FILE .* is not a readable file/);
+	assert.doesNotMatch(log(), /worktree create/);
+});
+
+test("env-driven: DETRITUS=delete clears merged leftovers and the fan-out proceeds", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK: "After cleanup",
+		HERDR_SWARM_DETRITUS: "delete",
+	});
+	git(repo, "branch", "swarm/r0/merged");
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /deleted branch swarm\/r0\/merged/);
+	assert.doesNotMatch(branchRefs(repo), /swarm\/r0\/merged/);
+	assert.equal(readManifest().slots.length, 1);
+});
+
+test("env-driven: an unknown DETRITUS value is refused", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK: "Never runs",
+		HERDR_SWARM_DETRITUS: "nuke",
+	});
+	git(repo, "branch", "swarm/r0/merged");
+	const r = runPaneNoStdin(env, repo);
+	assert.notEqual(r.status, 0);
+	assert.match(r.stderr, /HERDR_SWARM_DETRITUS='nuke' is not one of delete \/ rename \/ abort/);
+	assert.match(branchRefs(repo), /swarm\/r0\/merged/, "nothing was touched");
+});
+
+// The P0 guard, on the path that has no keyboard. HERDR_SWARM_DETRITUS=delete
+// authorized detritus in general, before any of it was known to hold work that
+// exists in no other ref — so it is no more consent for `git branch -D` than
+// the interactive [d] keystroke was.
+test("env-driven: DETRITUS=delete REFUSES an unmerged leftover without the ack", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK: "Never runs",
+		HERDR_SWARM_DETRITUS: "delete",
+	});
+	const { tip } = seedUnmergedLeftover(repo);
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 14, `${r.stdout}\n${r.stderr}`); // PF_EC_DETRITUS
+	assert.match(branchRefs(repo), /swarm\/r0\/s1/, "unmerged branch survives");
+	// The refusal names the opt-in and the non-destructive route, and still
+	// shows the evidence the interactive path shows.
+	assert.match(r.stderr, /HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes/);
+	assert.match(r.stderr, /HERDR_SWARM_DETRITUS=rename/);
+	assert.match(r.stderr, /NOT merged into HEAD/);
+	assert.ok(r.stderr.includes(tip), "tip sha shown");
+	assert.match(r.stderr, /agent work nobody else has/, "commit subject shown");
+	assert.equal(fs.existsSync(manifestFile), false, "no run was created");
+	assert.doesNotMatch(log(), /worktree create/);
+});
+
+test("env-driven: DETRITUS_ACK_UNMERGED=yes force-deletes and the fan-out proceeds", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK: "After the ack",
+		HERDR_SWARM_DETRITUS: "delete",
+		HERDR_SWARM_DETRITUS_ACK_UNMERGED: "yes",
+	});
+	seedUnmergedLeftover(repo);
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /force-deleted branch swarm\/r0\/s1/);
+	assert.doesNotMatch(branchRefs(repo), /swarm\/r0\/s1/);
+	assert.equal(readManifest().slots.length, 1);
+});
+
+test("env-driven: DETRITUS=rename keeps the work and the fan-out proceeds", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK: "After the rename",
+		HERDR_SWARM_DETRITUS: "rename",
+	});
+	seedUnmergedLeftover(repo);
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /renamed swarm\/r0\/s1 -> swarm-kept\/r0\/s1/);
+	assert.equal(
+		git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm-kept").stdout.trim(),
+		"swarm-kept/r0/s1",
+		"the committed work is still reachable",
+	);
+	assert.equal(readManifest().slots.length, 1);
+});
+
+// The anti-hang contract. fd 0 is an open pipe nobody will ever write to, so a
+// script that still reaches a `read` blocks until the timer SIGKILLs it — which
+// this asserts against explicitly, rather than letting the suite wedge.
+test("env-driven: a missing required var fails loudly by name instead of hanging", async () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "2",
+		HERDR_SWARM_PRESETS: "claude",
+		// No HERDR_SWARM_TASK and no HERDR_SWARM_TASK_FILE — the one piece a
+		// complete run still needs.
+	});
+	const r = await runPaneStalledStdin(env, repo);
+	assert.equal(r.signal, null, "the pane must exit on its own, never be killed for hanging");
+	assert.notEqual(r.code, 0);
+	assert.match(r.stderr, /needs HERDR_SWARM_TASK_FILE or HERDR_SWARM_TASK/);
+	assert.match(r.stderr, /stdin is not a terminal/);
+	assert.doesNotMatch(log(), /worktree create/);
+	assert.equal(fs.existsSync(manifestFile), false);
+});
+
+// Missing detritus handling is the same contract one step earlier: the refusal
+// has to come from the detritus gate, not from a read that never returns.
+test("env-driven: leftover detritus with no DETRITUS var fails by name, not by hanging", async () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_SLOTS: "1",
+		HERDR_SWARM_PRESETS: "claude",
+		HERDR_SWARM_TASK: "Never runs",
+	});
+	git(repo, "branch", "swarm/r0/merged");
+	const r = await runPaneStalledStdin(env, repo);
+	assert.equal(r.signal, null, "the pane must exit on its own, never be killed for hanging");
+	assert.notEqual(r.code, 0);
+	assert.match(r.stderr, /needs HERDR_SWARM_DETRITUS/);
+	assert.match(branchRefs(repo), /swarm\/r0\/merged/, "nothing was touched");
+});
+
+// Env values must never bleed into a run the caller did not script: with none
+// of the vars set the pane is the same interactive program it always was, and
+// its piped-stdin protocol still drives every prompt (covered above too — this
+// pins the SCRIPTED=0 seam itself).
+test("no env vars set: the interactive stdin protocol is untouched", () => {
+	const { repo, env } = setup();
+	const r = runPane(lines(["1", "", "Interactive still works", ".", ""]), env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /Available presets:/, "the preset menu is still printed");
+	assert.equal(readManifest().slots.length, 1);
 });

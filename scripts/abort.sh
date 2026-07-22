@@ -166,7 +166,23 @@ SLOT_LINES="$(printf '%s' "$DOC" | node -e '
 ')"
 
 reap_slot_worktree() {
-	local slot="$1" branch="$2" wtpath="$3" wsid="$4" wt="" herdr_ok=0
+	local slot="$1" branch="$2" wtpath="$3" wsid="$4" wt="" herdr_ok=0 why
+	# Ownership before destruction, same shared verifier harvest-step.sh's
+	# read_slot uses (lib.sh) — the third instance of the drift pattern in
+	# docs/solutions/best-practices/cross-script-invariant-drift.md, closed in
+	# one helper instead of two hand-copied checks. Abort's posture differs on
+	# purpose: a mismatch KEEPS the worktree and reports it rather than
+	# refusing the run, because abort never destroys what it cannot verify and
+	# the rest of the teardown (panes, other slots, the branch inventory) is
+	# still worth doing.
+	#
+	# The branch is checked FIRST, alone: it drives the reconciliation lookup
+	# below, so a foreign branch name must never even be used to find a path.
+	if ! why="$(verify_slot_ownership "$RUN_ID" "$branch" "")"; then
+		echo "herdr-swarm: slot $slot KEPT — ownership check failed: $why. Nothing was removed for this slot." >&2
+		note_kept "slot $slot (ownership check failed: $why)"
+		return 0
+	fi
 	if [ -n "$wtpath" ] && [ -d "$wtpath" ]; then
 		wt="$wtpath"
 	elif [ -n "$branch" ]; then
@@ -184,6 +200,15 @@ reap_slot_worktree() {
 		echo "herdr-swarm: slot $slot: worktree already gone."
 		gone=$((gone + 1))
 		manifest_update_slot "$slot" '{"status":"archived"}' 2>/dev/null || true
+		return 0
+	fi
+	# Re-verify the RESOLVED path, whichever route produced it. The
+	# reconciliation branch above already pairs by branch, but the recorded-path
+	# branch does not — and a second call through the same helper is cheaper
+	# than two routes that have to agree by inspection.
+	if ! why="$(verify_slot_ownership "$RUN_ID" "$branch" "$wt")"; then
+		echo "herdr-swarm: slot $slot KEPT — ownership check failed: $why. The worktree was left untouched." >&2
+		note_kept "slot $slot worktree $wt (ownership check failed: $why)"
 		return 0
 	fi
 	if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then

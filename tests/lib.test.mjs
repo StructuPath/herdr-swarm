@@ -496,6 +496,64 @@ test("no ambient-cwd git invocations outside lib.sh (every repo git names its ta
 	assert.deepEqual(offenders, [], "ambient-cwd git invocations outside lib.sh");
 });
 
+// The third member of the parity family (after the herdr-wrapper and
+// ambient-git tests above), and the countermeasure for residual finding 2 —
+// see docs/solutions/best-practices/cross-script-invariant-drift.md. run_id
+// got its charset guard in one script and then in the other only after a
+// review caught the asymmetry; slot branch and slot path reached
+// `worktree remove` / `reset --hard` / `clean -fd` from the manifest with only
+// a `[ -d ]` in BOTH. The rule now lives in lib.sh's verify_slot_ownership,
+// and this test is what stops the next script from mutating a manifest-named
+// worktree without calling it.
+//
+// Scope note: the offense is mutating a WORKTREE named by a manifest slot row.
+// prune.sh runs `branch -d` and `update-ref -d`, but its targets come from
+// `for-each-ref refs/heads/swarm` in the repo itself and are gated on git
+// ancestry — nothing there is manifest-path-derived. fanout-pane.sh's detritus
+// reaper is the same shape: `_swarm_worktrees` reads git's own worktree list,
+// so its path/branch pairing comes from git, not from a file on disk.
+test("every script that mutates a manifest-named slot worktree calls verify_slot_ownership", () => {
+	// Mutations that can destroy work in a worktree. `worktree list` and
+	// `merge-base` are deliberately absent: read-only calls are not the hazard.
+	const WORKTREE_MUTATORS = [
+		/\bworktree\s+(?:remove|move)\b/,
+		/\bherdr_worktree_remove\b/,
+		/\breset\s+--hard\b/,
+		/\bclean\s+-[a-z]*f/,
+	];
+	// Reading a slot row's path/branch out of the manifest — the bash side
+	// (SLOT_PATH) and the inline-node side (`s.path ?? ""`) both count.
+	const SLOT_ROW_READERS = [/\bSLOT_PATH\b/, /\b[a-z]\.path\s*\?\?/];
+	const offenders = [];
+	for (const f of fs.readdirSync(path.join(repoRoot, "scripts"))) {
+		if (!f.endsWith(".sh") || f === "lib.sh") continue;
+		const file = path.join(repoRoot, "scripts", f);
+		// Comments describe these mutations at length in this repo; only code
+		// lines can actually run one.
+		const code = fs
+			.readFileSync(file, "utf8")
+			.split("\n")
+			.filter((l) => !/^\s*#/.test(l))
+			.join("\n");
+		const mutates = WORKTREE_MUTATORS.some((re) => re.test(code));
+		const readsSlotRows = SLOT_ROW_READERS.some((re) => re.test(code));
+		if (!mutates || !readsSlotRows) continue;
+		if (!/\bverify_slot_ownership\b/.test(code)) {
+			offenders.push(
+				`${file}: mutates a worktree named by a manifest slot row without calling verify_slot_ownership (lib.sh)`,
+			);
+		}
+	}
+	assert.deepEqual(offenders, [], "slot-ownership guard missing");
+	// The test is only worth anything if it is actually pointed at the two
+	// scripts finding 2 named — an over-tight regex that matches nothing would
+	// otherwise pass forever.
+	for (const f of ["harvest-step.sh", "abort.sh"]) {
+		const src = fs.readFileSync(path.join(repoRoot, "scripts", f), "utf8");
+		assert.match(src, /\bverify_slot_ownership\b/, `${f} must be in scope`);
+	}
+});
+
 // The pane titles in herdr-plugin.toml ARE the cleanup sweep labels (pane
 // list reports them as "label"), and preflight.sh re-declares them as a
 // hardcoded set for abort's corrupt-manifest sweep. A rename on one side

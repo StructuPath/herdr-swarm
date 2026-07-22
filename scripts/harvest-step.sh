@@ -109,8 +109,15 @@ BASE_BRANCH="${BASE_REF#refs/heads/}"
 # read_slot <slot>: populate SLOT_* globals from the manifest row. Journal is
 # passed through as compact JSON (JSON.stringify escapes control chars, so a
 # raw \x1f can never appear inside the field and split it).
+#
+# This is also where slot ownership is asserted: EVERY slot-consuming verb
+# passes through here, so the guard is one shared checkpoint rather than a
+# check each verb must remember (cross-script-invariant-drift, countermeasure
+# 1). Without it a manifest slot's branch and path reach `worktree remove`,
+# `reset --hard`, and `clean -fd` behind only a `[ -d ]` — the third instance
+# of the drift pattern that produced this repo's two P0s.
 read_slot() {
-	local slot="$1" line
+	local slot="$1" line why
 	line="$(printf '%s' "$DOC" | node -e '
 		const slot = process.argv[1];
 		let d = "";
@@ -132,6 +139,13 @@ read_slot() {
 	# left, so a field added after it would be swallowed into the JSON.
 	IFS="$US" read -r SLOT_LABEL SLOT_BRANCH SLOT_PATH SLOT_STATUS SLOT_BACKUP \
 		SLOT_TERMINAL SLOT_PANE SLOT_WS SLOT_AGENT SLOT_JOURNAL <<<"$line"
+	# Refuse BEFORE returning, so no verb can run a git mutation against a row
+	# this run does not own. Harvest is interactive and has somewhere to route
+	# the user, so it refuses outright; abort keeps and reports instead.
+	if ! why="$(verify_slot_ownership "$RUN_ID" "$SLOT_BRANCH" "$SLOT_PATH")"; then
+		echo "herdr-swarm: slot $slot ownership check FAILED — $why. Harvest refused; the manifest at $(manifest_path) does not describe this repo's run." >&2
+		return "$HS_EC_REFUSED"
+	fi
 }
 
 # _preview_report_idle: mirror "this slot has stopped working" into its
@@ -299,7 +313,7 @@ require_slot_arg() {
 # --- Verbs -------------------------------------------------------------------
 
 do_preview() {
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	printf 'slot\t%s\n' "$1"
 	printf 'branch\t%s\n' "$SLOT_BRANCH"
 	case "$SLOT_STATUS" in
@@ -359,7 +373,7 @@ do_preview() {
 }
 
 do_commit_wip() {
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	[ -d "$SLOT_PATH" ] || {
 		echo "herdr-swarm: slot $1 worktree is gone ($SLOT_PATH)" >&2
 		return "$HS_EC_REFUSED"
@@ -372,7 +386,7 @@ do_commit_wip() {
 }
 
 do_snapshot() {
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	[ -d "$SLOT_PATH" ] || {
 		echo "herdr-swarm: slot $1 worktree is gone ($SLOT_PATH)" >&2
 		return "$HS_EC_REFUSED"
@@ -402,7 +416,7 @@ do_snapshot() {
 }
 
 do_discard() {
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	# Snapshot-before-discard (KTD): no recorded backup ref, no discard.
 	if [ -z "$SLOT_BACKUP" ]; then
 		echo "herdr-swarm: slot $1 has no recorded snapshot — run snapshot first; discard refused." >&2
@@ -434,7 +448,7 @@ do_discard() {
 }
 
 do_skip() {
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	manifest_update_slot "$1" '{"status":"skipped"}' || return 1
 	printf 'skipped\t%s\n' "$1"
 }
@@ -446,7 +460,7 @@ do_merge() {
 		echo "herdr-swarm: merge needs the previewed base SHA (drift guard input)" >&2
 		return 1
 	fi
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	if [ "$SLOT_JOURNAL" != "null" ]; then
 		echo "herdr-swarm: slot $1 has an unfinished merge journaled — resume or abort-merge first." >&2
 		return "$HS_EC_REFUSED"
@@ -563,7 +577,7 @@ do_resume() {
 	cur="$(base_sha)" || return 1
 	if [ "$action" = "complete" ]; then
 		require_slot_arg "$target" || return 1
-		read_slot "$target" || return 1
+		read_slot "$target" || return $?
 		local expected msha hwt jlocus
 		expected="$(journal_field "$SLOT_JOURNAL" expected_base_sha)"
 		msha="$(journal_field "$SLOT_JOURNAL" merge_commit_sha)"
@@ -629,7 +643,7 @@ do_resume() {
 }
 
 do_archive() {
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	case "$SLOT_STATUS" in
 	merged | skipped | failed) ;;
 	*)
@@ -713,7 +727,7 @@ do_archive() {
 }
 
 do_abort_merge() {
-	read_slot "$1" || return 1
+	read_slot "$1" || return $?
 	if [ "$SLOT_JOURNAL" = "null" ]; then
 		echo "herdr-swarm: no merge in flight for slot $1." >&2
 		return "$HS_EC_REFUSED"
