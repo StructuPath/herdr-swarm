@@ -15,7 +15,14 @@ const manifestFile = path.join(stateDir, "run-w9.json");
 // exit codes) — same runLib, with preflight.sh as the sourced entry point
 // (it pulls lib.sh in itself).
 function runPf(snippet, env = freshEnv(), cwd) {
-	return runLib(snippet, env, { sources: ["scripts/preflight.sh"], cwd });
+	// preflight acts on SWARM_REPO (lib.sh repo_git), never the ambient cwd —
+	// exporting it first is the caller contract the fan-out pane follows, so
+	// tests drive the checks exactly the way production does.
+	return runLib(
+		`export SWARM_REPO="$(resolve_repo_root 2>/dev/null || true)" && ${snippet}`,
+		env,
+		{ sources: ["scripts/preflight.sh"], cwd },
+	);
 }
 
 test("every preflight refusal has a distinct exit code and an actionable message", () => {

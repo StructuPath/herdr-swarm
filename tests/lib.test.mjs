@@ -263,6 +263,58 @@ test("no raw herdr invocations outside lib.sh wrappers (scripts/ and bin/)", () 
 	assert.deepEqual(offenders, [], "raw herdr invocations outside lib.sh");
 });
 
+// The sibling of the herdr-wrapper invariant, and the countermeasure for the
+// bug that motivated it: fanout-pane.sh and preflight.sh ran every git call
+// against the AMBIENT cwd, so a fan-out driven for one workspace recorded (and
+// would have mutated) whatever repo the process happened to sit in. Three
+// scripts already did it right, two did not, and the suite stayed green
+// because every fixture ran with cwd already inside the target repo. A bare
+// `git <verb>` in a command position is the offense; `git -C <dir>` and
+// repo_git both name their target explicitly, and lib.sh is where the seam
+// itself is defined.
+test("no ambient-cwd git invocations outside lib.sh (every repo git names its target)", () => {
+	// A real invocation sits in command position: line start, after an
+	// operator/subshell opener (`;` `&&` `||` `|` `(` `$(` `` ` `` `{` `!`), or
+	// after a shell keyword. That is what separates `git worktree remove` and
+	// `x="$(git rev-parse …)"` from a `git` sitting inside prose.
+	const CMD_PUNCT = /[;&|(){}!`]$/;
+	const CMD_KEYWORD = /\b(?:if|then|else|elif|while|until|do)$/;
+	const files = fs
+		.readdirSync(path.join(repoRoot, "scripts"))
+		.filter((f) => f.endsWith(".sh") && f !== "lib.sh")
+		.map((f) => path.join(repoRoot, "scripts", f));
+	assert.ok(files.length > 0, "scripts must exist to be scanned");
+	const offenders = [];
+	for (const file of files) {
+		fs.readFileSync(file, "utf8")
+			.split("\n")
+			.forEach((line, i) => {
+				// Quoted bodies go first: `echo "…git merge --abort…"` is prose,
+				// not a call, and the inline-node blocks are single-quoted whole.
+				// A quoted span holding a command substitution is NOT stripped —
+				// `repo_root="$(git rev-parse --show-toplevel)"` is the literal
+				// line this whole test exists to catch, and blanking it would
+				// make the test pass over the original bug.
+				const dequote = (s, q) =>
+					s.replace(new RegExp(`${q}[^${q}]*${q}`, "g"), (m) =>
+						/\$\(|`/.test(m) ? m : `${q}${q}`,
+					);
+				const code = dequote(dequote(line, "'"), '"').replace(/#.*$/, "");
+				for (const m of code.matchAll(/\bgit\s+(\S*)/g)) {
+					const before = code.slice(0, m.index).trimEnd();
+					const inCmdPosition =
+						before === "" || CMD_PUNCT.test(before) || CMD_KEYWORD.test(before);
+					if (!inCmdPosition) continue;
+					if (m[1] === "-C") continue; // explicit target — the correct form
+					offenders.push(
+						`${file}:${i + 1}: ${line.trim()}\n    → use repo_git (or git -C <dir>); a bare git runs against the ambient cwd`,
+					);
+				}
+			});
+	}
+	assert.deepEqual(offenders, [], "ambient-cwd git invocations outside lib.sh");
+});
+
 // The pane titles in herdr-plugin.toml ARE the cleanup sweep labels (pane
 // list reports them as "label"), and preflight.sh re-declares them as a
 // hardcoded set for abort's corrupt-manifest sweep. A rename on one side

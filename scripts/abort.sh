@@ -64,6 +64,12 @@ case "$rc" in
 	# so a caller can branch without string-matching.
 	echo "herdr-swarm: manifest is CORRUPT — abort REFUSES all destruction. Restore the manifest (see the .bak hint above) and re-run." >&2
 	echo "herdr-swarm: report-only discovery — what an abort WOULD act on:"
+	# The manifest is unreadable, so its repo_root is unavailable: seed the
+	# repo_git seam from the workspace context instead (lib.sh). Empty means
+	# not-a-repo, and discovery's git side then reports nothing rather than
+	# scanning whatever repo this action's cwd happened to be.
+	SWARM_REPO="$(resolve_repo_root 2>/dev/null || true)"
+	export SWARM_REPO
 	report_only_discovery | while IFS=$'\t' read -r kind a b; do
 		case "$kind" in
 		branch) echo "  branch   $a (kept either way — abort never deletes branches)" ;;
@@ -102,6 +108,13 @@ if ! run_id_safe="$(sanitize_slug "$RUN_ID")" || [ "$run_id_safe" != "$RUN_ID" ]
 	exit 1
 fi
 
+# The repo every preflight helper below acts on. abort learns the repo from
+# the MANIFEST, not from cwd, so it pins the seam explicitly (lib.sh repo_git)
+# instead of inheriting preflight's cwd-based default — the source-time default
+# was resolved before REPO_ROOT was known.
+SWARM_REPO="$REPO_ROOT"
+export SWARM_REPO
+
 # --- (1) Panes: tracked records first, then the label sweep ------------------
 
 closed_ids=" " # space-delimited seen-set: the pidfile pane usually reappears in the sweep
@@ -128,13 +141,13 @@ done
 
 # Label sweep, scoped to this workspace and this plugin's three pane titles —
 # reuses report_only_discovery's matching (preflight.sh) so the sweep and the
-# corrupt-manifest report can never disagree about what counts as ours. The
-# subshell cd gives discovery's git side the repo cwd it assumes.
+# corrupt-manifest report can never disagree about what counts as ours. Its git
+# side targets SWARM_REPO (pinned above), so no cwd juggling is needed.
 while IFS=$'\t' read -r kind pid label; do
 	if [ "$kind" = "pane" ] && [ -n "$pid" ]; then
 		close_pane "$pid" && echo "herdr-swarm: closed pane $pid ($label)"
 	fi
-done <<<"$( (cd "$REPO_ROOT" && report_only_discovery) 2>/dev/null || true)"
+done <<<"$(report_only_discovery 2>/dev/null || true)"
 
 # --- (2) Slot worktrees + (4) harvest worktrees ------------------------------
 
@@ -315,10 +328,10 @@ fi
 # that file visible to `git status` in the kept worktree and committable into
 # history. The pattern is idempotent to re-add and removed by the next clean
 # abort, so leaving it is the cheap side of the trade.
-# Bare git in remove_exclude_pattern resolves --git-path from cwd; subshell cd
-# keeps abort's own cwd (and any caller assumptions) untouched.
+# remove_exclude_pattern resolves --git-path through repo_git, so it lands in
+# SWARM_REPO's exclude file regardless of abort's own cwd.
 if [ "$kept" -eq 0 ]; then
-	(cd "$REPO_ROOT" && remove_exclude_pattern) ||
+	remove_exclude_pattern ||
 		echo "herdr-swarm: warning: could not remove the $SWARM_TASK_FILE exclude pattern." >&2
 else
 	echo "herdr-swarm: kept the $SWARM_TASK_FILE exclude pattern — kept worktrees still contain that file, and un-excluding it would expose it to git status."

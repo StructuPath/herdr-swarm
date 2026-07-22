@@ -52,6 +52,69 @@ sanitize_slug() {
 	printf '%s\n' "$s"
 }
 
+# --- User-repo git -----------------------------------------------------------
+# Every git command aimed at the USER'S repo goes through repo_git, and
+# repo_git targets $SWARM_REPO — never the ambient cwd. A pane or action
+# inherits whatever cwd the herdr server happened to have, so a bare `git`
+# silently operates on some other repository: live, a fan-out driven for a
+# scratch workspace recorded THIS plugin's repo_root and fork_sha, then failed
+# with 'invalid reference' creating the worktree. harvest-step.sh, abort.sh,
+# and prune.sh already pass `git -C "$REPO_ROOT"` at every call site; these two
+# helpers are the same invariant with a single seam — the seam the parity test
+# in tests/lib.test.mjs enforces across every script.
+
+# resolve_repo_root: the workspace's repo, resolved WITHOUT trusting cwd.
+# herdr hands each invocation its workspace in HERDR_PLUGIN_CONTEXT_JSON
+# (workspace_cwd — spike-out/f-plugin-context-json.txt); $PWD stands in only
+# when that is absent or unparseable. Prints the toplevel; fails loudly rather
+# than degrading to "whatever repo is nearby", because the whole point is that
+# the nearby repo is the wrong one.
+resolve_repo_root() {
+	local dir="" top
+	if [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ] && command -v node >/dev/null 2>&1; then
+		# Inline node, not jq — same prereq choice the manifest helpers made.
+		dir="$(printf '%s' "$HERDR_PLUGIN_CONTEXT_JSON" | node -e '
+			let d = "";
+			process.stdin.on("data", (c) => (d += c)).on("end", () => {
+				let j;
+				try { j = JSON.parse(d); } catch { return; }
+				if (typeof j.workspace_cwd === "string") {
+					process.stdout.write(j.workspace_cwd);
+				}
+			});
+		' 2>/dev/null)" || dir=""
+	fi
+	[ -n "$dir" ] || dir="$PWD"
+	if ! top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"; then
+		echo "herdr-swarm: $dir is not a git repository — run this from a repo workspace." >&2
+		return 1
+	fi
+	printf '%s\n' "$top"
+}
+
+# repo_git: THE seam. `:?` rather than a cwd fallback on purpose — an unset
+# SWARM_REPO must fail with its own name, never silently mutate the process's
+# ambient repo, which is the exact bug this pair exists to close.
+repo_git() {
+	git -C "${SWARM_REPO:?SWARM_REPO not set — resolve_repo_root before any repo git call}" "$@"
+}
+
+# repo_git_path <name>: ABSOLUTE path to a file inside the repo's git dir
+# (info/exclude, info/sparse-checkout). `rev-parse --git-path` answers relative
+# to the REPO, and under repo_git the caller's cwd is by definition not the
+# repo — using its answer raw would land the write next to whatever directory
+# the process happened to sit in. Same normalization harvest-step.sh applies to
+# --git-common-dir. --git-path (not $GIT_DIR/…) because .git is a FILE in
+# linked worktrees and these files are shared repo-wide.
+repo_git_path() {
+	local p
+	p="$(repo_git rev-parse --git-path "$1")" || return 1
+	case "$p" in
+	/*) printf '%s\n' "$p" ;;
+	*) printf '%s\n' "$SWARM_REPO/$p" ;;
+	esac
+}
+
 # herdr CLI preflight: a missing binary otherwise surfaces as the wrong error
 # ('failed to open pane') downstream.
 require_herdr() {

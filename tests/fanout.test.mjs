@@ -524,3 +524,87 @@ test("setup.sh hook runs in each worktree; failure warns but slots still start",
 		assert.equal(readManifest().slots[0].status, "running");
 	}
 });
+
+// --- the workspace's repo is not the process's cwd ---------------------------
+
+// The fixture that would have caught the P0: every other test in this file
+// runs the pane with cwd ALREADY inside the target repo, so an ambient `git`
+// and a workspace-scoped one are indistinguishable and the suite stayed green
+// while fan-out silently operated on whatever repo the process sat in (live:
+// it recorded the plugin's own repo_root and fork_sha, then died on `fatal:
+// invalid reference`). Here the two repos are deliberately different: the
+// workspace is repo A (herdr's HERDR_PLUGIN_CONTEXT_JSON.workspace_cwd), the
+// process cwd is repo B, and B must come through untouched.
+test("fan-out targets the workspace's repo, not the process cwd", () => {
+	resetState();
+	// realpath because `rev-parse --show-toplevel` resolves symlinks, and on
+	// macOS the tmpdir is one (/var → /private/var) — the manifest records the
+	// resolved form, so the fixture must compare against it.
+	const repoA = fs.realpathSync(makeRepo()); // the workspace herdr handed us
+	const repoB = fs.realpathSync(makeRepo()); // the cwd this pane inherited
+	// Distinct HEADs, so a fork_sha from the wrong repo cannot coincide with
+	// the right one and pass by luck.
+	fs.writeFileSync(path.join(repoA, "a.txt"), "a\n");
+	git(repoA, "add", "a.txt");
+	git(repoA, "commit", "-q", "-m", "repo A work");
+	fs.writeFileSync(path.join(repoB, "b.txt"), "b\n");
+	git(repoB, "add", "b.txt");
+	git(repoB, "commit", "-q", "-m", "repo B work");
+	const headA = git(repoA, "rev-parse", "HEAD").stdout.trim();
+	const headB = git(repoB, "rev-parse", "HEAD").stdout.trim();
+	assert.notEqual(headA, headB, "fixture repos must not share a HEAD");
+
+	const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wtroot-"));
+	const env = freshEnv({
+		STUB_REPO: repoA,
+		STUB_WT_ROOT: wtRoot,
+		HERDR_SWARM_LINGER_SECS: "0",
+		// The one channel that names the workspace — spike f.
+		HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({
+			workspace_id: "w9",
+			workspace_label: path.basename(repoA),
+			workspace_cwd: repoA,
+			invocation_source: "cli",
+		}),
+	});
+	const r = runPane(lines(["1", "", "Cross-repo task", ".", ""]), env, repoB);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+
+	// 1. The manifest records repo A, at repo A's fork point.
+	const m = readManifest();
+	assert.equal(m.repo_root, repoA, "repo_root is the workspace repo");
+	assert.equal(m.fork_sha, headA, "fork_sha is repo A's HEAD");
+	assert.notEqual(m.fork_sha, headB, "fork_sha is NOT the cwd repo's HEAD");
+
+	// 2. Branch and worktree landed in A.
+	const branchesA = git(repoA, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm")
+		.stdout.trim();
+	assert.equal(branchesA, `swarm/${m.run_id}/s1-claude`, "swarm branch created in A");
+	assert.match(
+		git(repoA, "worktree", "list", "--porcelain").stdout,
+		new RegExp(`branch refs/heads/swarm/${m.run_id}/s1-claude`),
+		"slot worktree registered in A",
+	);
+
+	// 3. Repo B is untouched: no branches, no worktrees, no exclude line. This
+	//    is the half that fails loudly if a single call site regresses to a
+	//    bare `git` while the rest of the flow still looks correct.
+	assert.equal(
+		git(repoB, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout.trim(),
+		"",
+		"no swarm branch in the cwd repo",
+	);
+	assert.equal(
+		git(repoB, "worktree", "list", "--porcelain").stdout.trim().split("\n\n").length,
+		1,
+		"cwd repo still has only its own working tree",
+	);
+	const excludeA = path.join(repoA, ".git/info/exclude");
+	const excludeB = path.join(repoB, ".git/info/exclude");
+	assert.match(fs.readFileSync(excludeA, "utf8"), /^\.swarm-task\.md$/m, "A excluded");
+	assert.doesNotMatch(
+		fs.existsSync(excludeB) ? fs.readFileSync(excludeB, "utf8") : "",
+		/\.swarm-task\.md/,
+		"the cwd repo's exclude file was never written",
+	);
+});

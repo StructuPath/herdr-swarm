@@ -23,10 +23,11 @@ PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 require_node || exit 1
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-	echo "herdr-swarm: not a git repository — run prune from the repo workspace." >&2
-	exit 1
-}
+# Same ambient-cwd trap the fan-out hit: an action inherits the herdr server's
+# cwd, so the repo comes from the workspace context (lib.sh), not `git` here.
+REPO_ROOT="$(resolve_repo_root)" || exit 1
+SWARM_REPO="$REPO_ROOT"
+export SWARM_REPO
 
 # R13 intersection call: warn (never refuse) above the max tested version —
 # prune is pure git and must keep working there. Never fatal: an unreadable

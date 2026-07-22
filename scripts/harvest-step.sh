@@ -88,6 +88,11 @@ CTX="$(manifest_run_context "$DOC")" || {
 	exit 1
 }
 IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF FORK_SHA <<<"$CTX"
+# Pin the repo_git seam (lib.sh) to the MANIFEST's repo: every call site here
+# already passes `git -C "$REPO_ROOT"`, but preflight.sh helpers sourced above
+# resolve through SWARM_REPO, whose source-time default was cwd-based.
+SWARM_REPO="$REPO_ROOT"
+export SWARM_REPO
 # run_id is interpolated into the harvest worktree path ($(state_dir)/harvest-
 # $RUN_ID-s<slot>, fed straight to `git worktree add`/`remove`) and into the
 # backup ref namespace (refs/swarm-backups/$RUN_ID/<slot>). A run_id carrying

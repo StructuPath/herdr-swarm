@@ -91,10 +91,15 @@ test("truncated manifest → corrupt code; report_only_discovery lists live real
 	assert.match(r.stderr, /unparseable/);
 	// The degradation path destructive callers switch to: branches,
 	// worktrees, and this plugin's panes — from live sources, no manifest.
-	const d = runLib("report_only_discovery", freshEnv(), {
-		sources: ["scripts/preflight.sh"],
-		cwd: repo,
-	});
+	// SWARM_REPO is the caller contract for every preflight helper (repo_git).
+	const d = runLib(
+		'export SWARM_REPO="$(resolve_repo_root)" && report_only_discovery',
+		freshEnv(),
+		{
+			sources: ["scripts/preflight.sh"],
+			cwd: repo,
+		},
+	);
 	assert.equal(d.status, 0, d.stderr);
 	assert.match(d.stdout, /branch\tswarm\/r0\/s1/);
 	assert.match(d.stdout, /worktree\t[^\t\n]*hs-wt-[^\t\n]*\tswarm\/r0\/s1/);

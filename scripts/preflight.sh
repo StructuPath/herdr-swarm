@@ -18,6 +18,16 @@ if ! type state_dir >/dev/null 2>&1; then
 	. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 fi
 
+# CALLER CONTRACT: every git call below targets $SWARM_REPO through repo_git
+# (lib.sh) — never the ambient cwd — so the caller exports SWARM_REPO before
+# invoking any check. fanout-pane resolves it (resolve_repo_root); abort and
+# harvest-step take it from the manifest's repo_root. Resolving it HERE at
+# source time would be the tidier-looking choice and is deliberately not done:
+# sourcing this file must stay side-effect-free, because harvest-step refuses a
+# charset-escaping run_id BEFORE any git command runs and a discovery rev-parse
+# at load would break that guard. An unset SWARM_REPO fails loudly in repo_git;
+# an empty one is reported as PF_EC_NOT_REPO by preflight_check_repo.
+
 # Stable, distinct refusal codes — 10+ to stay clear of bash's generic 1/2
 # and the manifest codes (2 missing / 3 corrupt, which preflight propagates
 # as-is). The fan-out pane branches on these, so renumbering is a breaking
@@ -40,8 +50,10 @@ PF_EC_SPARSE=20
 # there is no way to tag the line itself.
 SWARM_TASK_FILE=".swarm-task.md"
 
+# Also the validation that SWARM_REPO itself is usable: it is resolved before
+# this runs (see above), and an empty value means resolution already failed.
 preflight_check_repo() {
-	if ! git rev-parse --git-dir >/dev/null 2>&1; then
+	if [ -z "${SWARM_REPO:-}" ] || ! repo_git rev-parse --git-dir >/dev/null 2>&1; then
 		echo "herdr-swarm: not a git repository — run fan-out from a repo workspace." >&2
 		return "$PF_EC_NOT_REPO"
 	fi
@@ -57,7 +69,7 @@ preflight_resolve_base() {
 	# chained symref to its final target (observed on git 2.55), which would
 	# silently skip the symref-base refusal below — the user would fan out
 	# from a branch name they never checked out.
-	if ! head_ref="$(git symbolic-ref -q --no-recurse HEAD)"; then
+	if ! head_ref="$(repo_git symbolic-ref -q --no-recurse HEAD)"; then
 		echo "herdr-swarm: detached HEAD — check out the branch to fan out from (base selection prompt lands with the fan-out pane)." >&2
 		return "$PF_EC_DETACHED"
 	fi
@@ -70,7 +82,7 @@ preflight_resolve_base() {
 		return "$PF_EC_DETACHED"
 		;;
 	esac
-	if ! git rev-parse -q --verify 'HEAD^{commit}' >/dev/null; then
+	if ! repo_git rev-parse -q --verify 'HEAD^{commit}' >/dev/null; then
 		echo "herdr-swarm: unborn HEAD ($head_ref has no commits) — make an initial commit first; there is no fork point to record." >&2
 		return "$PF_EC_UNBORN"
 	fi
@@ -78,7 +90,7 @@ preflight_resolve_base() {
 	# A base that is itself a symref (git symbolic-ref refs/heads/x …) breaks
 	# the harvest compare-and-swap: update-ref would move the *target*, not
 	# the name the manifest recorded — refuse now, not mid-merge (KTD).
-	if git symbolic-ref -q "refs/heads/$base" >/dev/null; then
+	if repo_git symbolic-ref -q "refs/heads/$base" >/dev/null; then
 		echo "herdr-swarm: base refs/heads/$base is a symbolic ref — fan out from a plain branch." >&2
 		return "$PF_EC_SYMREF_BASE"
 	fi
@@ -89,7 +101,7 @@ preflight_resolve_base() {
 # line each, parsed from the porcelain format (paths may contain spaces, so
 # positional awk fields would mangle them).
 _swarm_worktrees() {
-	git worktree list --porcelain 2>/dev/null | awk '
+	repo_git worktree list --porcelain 2>/dev/null | awk '
 		/^worktree /{p=substr($0,10)}
 		/^branch refs\/heads\/swarm\//{print p "\t" substr($0,19)}
 	' || true
@@ -103,11 +115,11 @@ _swarm_worktrees() {
 # harvest / delete / rename instead of guessing.
 preflight_check_detritus() {
 	local branches wts
-	git worktree prune 2>/dev/null || true
+	repo_git worktree prune 2>/dev/null || true
 	# Literal-prefix pattern, NOT 'refs/heads/swarm/*': for-each-ref's fnmatch
 	# star stops at '/', and swarm branches are two levels deep
 	# (swarm/<run-id>/<slot>) — the glob silently matches nothing.
-	branches="$(git for-each-ref --format='%(refname:short)' 'refs/heads/swarm' 2>/dev/null || true)"
+	branches="$(repo_git for-each-ref --format='%(refname:short)' 'refs/heads/swarm' 2>/dev/null || true)"
 	wts="$(_swarm_worktrees)"
 	if [ -n "$branches" ] || [ -n "$wts" ]; then
 		{
@@ -152,7 +164,7 @@ preflight_check_argv() {
 # every destructive path in harvest and abort.
 preflight_check_submodules() {
 	local top
-	top="$(git rev-parse --show-toplevel 2>/dev/null)" || top="."
+	top="$(repo_git rev-parse --show-toplevel 2>/dev/null)" || top="$SWARM_REPO"
 	if [ -f "$top/.gitmodules" ]; then
 		echo "herdr-swarm: this repo uses submodules (.gitmodules present) — unsupported in v1, fan-out refused." >&2
 		return "$PF_EC_SUBMODULES"
@@ -164,8 +176,8 @@ preflight_check_submodules() {
 # Distinct code so the pane records the note without string-matching.
 preflight_check_sparse() {
 	local sc_file
-	sc_file="$(git rev-parse --git-path info/sparse-checkout 2>/dev/null || true)"
-	if [ "$(git config --bool core.sparseCheckout 2>/dev/null)" = "true" ] ||
+	sc_file="$(repo_git_path info/sparse-checkout 2>/dev/null || true)"
+	if [ "$(repo_git config --bool core.sparseCheckout 2>/dev/null)" = "true" ] ||
 		{ [ -n "$sc_file" ] && [ -f "$sc_file" ]; }; then
 		echo "herdr-swarm: note: sparse checkout detected — in-user-tree merges will be refused at harvest." >&2
 		return "$PF_EC_SPARSE"
@@ -249,16 +261,16 @@ _manifest_set_exclude_flag() {
 
 # ensure_exclude_pattern: make the per-worktree task file invisible to git
 # status in every slot. info/exclude, not .gitignore — it must never leak
-# into the user's tree or commits; resolved via --git-path because .git is a
-# *file* in linked worktrees and the exclude file is shared repo-wide, so
-# one append covers all slots. Exact-line idempotence: re-runs and
+# into the user's tree or commits; resolved via repo_git_path (lib.sh) because
+# .git is a *file* in linked worktrees and the exclude file is shared repo-wide,
+# so one append covers all slots. Exact-line idempotence: re-runs and
 # multi-slot fan-outs never stack duplicates. The manifest flag is set
 # BEFORE the append (write-ahead KTD: the manifest over-approximates —
 # "flag set, line maybe absent" is safe because removal is idempotent, the
 # reverse would leave an untracked mutation).
 ensure_exclude_pattern() {
 	local ex
-	ex="$(git rev-parse --git-path info/exclude)" || return 1
+	ex="$(repo_git_path info/exclude)" || return 1
 	_manifest_set_exclude_flag true || return $?
 	mkdir -p "$(dirname "$ex")" || return 1
 	[ -f "$ex" ] || : >"$ex"
@@ -282,7 +294,7 @@ ensure_exclude_pattern() {
 # part that must not fail (mirror-image of ensure's ordering).
 remove_exclude_pattern() {
 	local ex tmp
-	ex="$(git rev-parse --git-path info/exclude)" || return 1
+	ex="$(repo_git_path info/exclude)" || return 1
 	if [ -f "$ex" ]; then
 		tmp="$ex.tmp.$$"
 		if ! awk -v p="$SWARM_TASK_FILE" '$0 != p' "$ex" >"$tmp"; then
@@ -310,7 +322,7 @@ remove_exclude_pattern() {
 # answer, not a failure.
 report_only_discovery() {
 	# Literal-prefix pattern — see preflight_check_detritus for why not '/*'.
-	git for-each-ref --format='branch	%(refname:short)' 'refs/heads/swarm' 2>/dev/null || true
+	repo_git for-each-ref --format='branch	%(refname:short)' 'refs/heads/swarm' 2>/dev/null || true
 	_swarm_worktrees | awk -F'\t' '{print "worktree\t" $1 "\t" $2}'
 	local panes=""
 	if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then

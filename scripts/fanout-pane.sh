@@ -236,8 +236,8 @@ force_delete_unmerged() {
 		echo "herdr-swarm: these leftover branches are NOT merged into HEAD — git refused to delete them. They hold committed work that is not in your base branch:"
 		while IFS= read -r b; do
 			[ -n "$b" ] || continue
-			tip="$(git rev-parse --short --verify "refs/heads/$b" 2>/dev/null || echo '?')"
-			subject="$(git log -1 --format=%s "refs/heads/$b" 2>/dev/null || true)"
+			tip="$(repo_git rev-parse --short --verify "refs/heads/$b" 2>/dev/null || echo '?')"
+			subject="$(repo_git log -1 --format=%s "refs/heads/$b" 2>/dev/null || true)"
 			printf '  %s  %s  %s\n' "$b" "$tip" "$subject"
 		done <<<"$names"
 	} >&2
@@ -250,7 +250,7 @@ force_delete_unmerged() {
 	fi
 	while IFS= read -r b; do
 		[ -n "$b" ] || continue
-		if git branch -D "$b" >/dev/null 2>&1; then
+		if repo_git branch -D "$b" >/dev/null 2>&1; then
 			echo "  force-deleted branch $b"
 		else
 			echo "herdr-swarm: could not delete branch $b (still checked out somewhere?)" >&2
@@ -267,7 +267,7 @@ delete_detritus() {
 		[ -n "$p" ] || continue
 		# No --force (R11): a dirty leftover refuses loudly here and then
 		# blocks the fan-out at the re-check below.
-		if git worktree remove "$p"; then
+		if repo_git worktree remove "$p"; then
 			echo "  removed worktree $p ($b)"
 		else
 			echo "herdr-swarm: kept $p — dirty or busy; clean it by hand (no --force, R11)." >&2
@@ -278,12 +278,12 @@ delete_detritus() {
 		# -d first, always: a merged leftover deletes silently on this pass and
 		# never reaches the second gate. Only branches git itself refuses are
 		# collected for the typed-confirmation path below.
-		if git branch -d "$b" >/dev/null 2>&1; then
+		if repo_git branch -d "$b" >/dev/null 2>&1; then
 			echo "  deleted branch $b"
 		else
 			unmerged="$unmerged$b"$'\n'
 		fi
-	done < <(git for-each-ref --format='%(refname:short)' 'refs/heads/swarm')
+	done < <(repo_git for-each-ref --format='%(refname:short)' 'refs/heads/swarm')
 	[ -n "$unmerged" ] || return 0
 	force_delete_unmerged "${unmerged%$'\n'}"
 }
@@ -295,12 +295,12 @@ rename_detritus() {
 	local b
 	while IFS= read -r b; do
 		[ -n "$b" ] || continue
-		if git branch -m "$b" "swarm-kept/${b#swarm/}"; then
+		if repo_git branch -m "$b" "swarm-kept/${b#swarm/}"; then
 			echo "  renamed $b -> swarm-kept/${b#swarm/}"
 		else
 			echo "herdr-swarm: could not rename branch $b" >&2
 		fi
-	done < <(git for-each-ref --format='%(refname:short)' 'refs/heads/swarm')
+	done < <(repo_git for-each-ref --format='%(refname:short)' 'refs/heads/swarm')
 }
 
 # --- Main flow ---------------------------------------------------------------
@@ -310,6 +310,14 @@ rename_detritus() {
 # active-run check and then serialize straight into a double run.
 acquire_lock "mutate-$(ws_id)" || exit 1
 trap 'release_lock "mutate-$(ws_id)"' EXIT
+
+# The repo every git call below targets, resolved from the herdr workspace
+# context and NOT from this process's cwd (a pane inherits the server's cwd,
+# which is routinely a different repo — lib.sh resolve_repo_root). Resolved
+# BEFORE preflight because preflight_check_repo is the validation that this
+# value is a real repository, and every later check runs against it.
+SWARM_REPO="$(resolve_repo_root 2>/dev/null || true)"
+export SWARM_REPO
 
 preflight_check_repo || fatal $?
 # Version before anything herdr-shaped: on 0.7.5 nothing may be created and
@@ -402,10 +410,13 @@ preflight_check_argv "${slot_argvs[@]}" || fatal $?
 # existing branch — spike (d6)).
 nonce="$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
 run_id="$(sanitize_slug "$(date +%Y%m%d-%H%M%S)-$nonce")" || fatal 1 "herdr-swarm: could not generate a run id."
-repo_root="$(git rev-parse --show-toplevel)" || fatal 1 "herdr-swarm: could not resolve the repo root."
+# repo_root is SWARM_REPO itself — the manifest must record the repo every
+# later mutation targets, never a rev-parse of whatever cwd this pane
+# inherited (that mismatch is exactly the bug this seam closes).
+repo_root="$SWARM_REPO"
 # Fork SHA recorded once, up front: every later diff and merge measures
 # against this, never the moving base tip (R5/R7).
-fork_sha="$(git rev-parse --verify "$base_ref^{commit}")" || fatal 1 "herdr-swarm: could not resolve $base_ref."
+fork_sha="$(repo_git rev-parse --verify "$base_ref^{commit}")" || fatal 1 "herdr-swarm: could not resolve $base_ref."
 
 if ! node -e '
 	const [run_id, repo_root, base_ref, fork_sha, created_at] = process.argv.slice(1);
