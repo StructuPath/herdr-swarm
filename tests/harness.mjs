@@ -13,6 +13,117 @@ export const repoRoot = path.resolve(
 	"..",
 );
 
+// Scripts under test make real commits (WIP, snapshot, merge, revert); the
+// harness env has GIT_CONFIG_GLOBAL=/dev/null, so identity must ride in
+// explicitly or every commit-producing path dies on "unable to auto-detect
+// email". Spread into freshEnv overrides by tests that shell out to git.
+export const gitIdent = {
+	GIT_AUTHOR_NAME: "hs-test",
+	GIT_AUTHOR_EMAIL: "hs@test.invalid",
+	GIT_COMMITTER_NAME: "hs-test",
+	GIT_COMMITTER_EMAIL: "hs@test.invalid",
+};
+
+// Module-scope (not per-harness): stateless — fixed identity env, no stub or
+// state dir involved — and needed by the shared fixtures below.
+function git(cwd, ...args) {
+	const r = spawnSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		env: {
+			PATH: "/usr/bin:/bin",
+			HOME: os.homedir(),
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_SYSTEM: "/dev/null",
+			...gitIdent,
+		},
+	});
+	if (r.status !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
+	}
+	return r;
+}
+
+// Stage + commit one file; returns the new HEAD SHA.
+export function commitIn(dir, name, content = "work\n", msg = `add ${name}`) {
+	fs.writeFileSync(path.join(dir, name), content);
+	git(dir, "add", name);
+	git(dir, "commit", "-q", "-m", msg);
+	return git(dir, "rev-parse", "HEAD").stdout.trim();
+}
+
+// Per-file is enough for run-id uniqueness: node --test gives each test file
+// its own process, so this counter never collides across files.
+let runSeq = 0;
+
+// A fanned-out-looking run built directly: real repo, real slot worktrees on
+// run-unique branches forked at the recorded SHA, manifest written the way
+// fanout-pane.sh writes it (task file present + excluded, like reality).
+// opts: { prefix (run-id prefix, e.g. "r-hv"), slots (default 1),
+//         status (slot status, default "running") }.
+export function makeFannedOutRun(h, opts = {}) {
+	const nslots = opts.slots ?? 1;
+	const repo = h.makeRepo();
+	const runId = `${opts.prefix ?? "r"}${++runSeq}`;
+	const fork = git(repo, "rev-parse", "HEAD").stdout.trim();
+	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-run-"));
+	fs.appendFileSync(path.join(repo, ".git/info/exclude"), ".swarm-task.md\n");
+	const slots = [];
+	for (let i = 1; i <= nslots; i++) {
+		const branch = `swarm/${runId}/s${i}`;
+		const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")), `s${i}`);
+		git(repo, "worktree", "add", "-q", "-b", branch, wt, fork);
+		fs.writeFileSync(path.join(wt, ".swarm-task.md"), "task\n");
+		slots.push({
+			slot: i,
+			label: `s${i}`,
+			branch,
+			path: wt,
+			workspace_id: `w${10 + i}`,
+			pane_id: `w${10 + i}:p1`,
+			terminal_id: `term_s${i}`,
+			agent_name: "claude",
+			self_created: true,
+			status: opts.status ?? "running",
+			backup_ref: null,
+			journal: null,
+		});
+	}
+	const manifest = {
+		run_id: runId,
+		repo_root: repo,
+		base_ref: "refs/heads/main",
+		fork_sha: fork,
+		created_at: "2026-07-22T15:00:00Z",
+		exclude_pattern_added: true,
+		slots,
+	};
+	fs.writeFileSync(
+		path.join(sdir, "run-w9.json"),
+		JSON.stringify(manifest, null, 2),
+	);
+	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir, ...gitIdent });
+	return {
+		repo,
+		runId,
+		fork,
+		sdir,
+		env,
+		wt: (i) => slots[i - 1].path,
+		branch: (i) => slots[i - 1].branch,
+		manifest: () =>
+			JSON.parse(fs.readFileSync(path.join(sdir, "run-w9.json"), "utf8")),
+		slotRow: (i) =>
+			JSON.parse(fs.readFileSync(path.join(sdir, "run-w9.json"), "utf8")).slots.find(
+				(s) => s.slot === i,
+			),
+		archived: () =>
+			JSON.parse(
+				fs.readFileSync(path.join(sdir, `archived-${runId}.json`), "utf8"),
+			),
+	};
+}
+
 // Canonical U3 manifest fixture: the FULL KTD schema, every field present —
 // schema drift then breaks tests loudly instead of silently narrowing what
 // they exercise. Slot 1 is the write-ahead shape (pending row written before
@@ -162,27 +273,6 @@ exit 0`,
 			git(dir, "commit", "-q", "-m", "seed");
 		}
 		return dir;
-	}
-
-	function git(cwd, ...args) {
-		const r = spawnSync("git", args, {
-			cwd,
-			encoding: "utf8",
-			env: {
-				PATH: "/usr/bin:/bin",
-				HOME: os.homedir(),
-				GIT_CONFIG_GLOBAL: "/dev/null",
-				GIT_CONFIG_SYSTEM: "/dev/null",
-				GIT_AUTHOR_NAME: "hs-test",
-				GIT_AUTHOR_EMAIL: "hs@test.invalid",
-				GIT_COMMITTER_NAME: "hs-test",
-				GIT_COMMITTER_EMAIL: "hs@test.invalid",
-			},
-		});
-		if (r.status !== 0) {
-			throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
-		}
-		return r;
 	}
 
 	return {

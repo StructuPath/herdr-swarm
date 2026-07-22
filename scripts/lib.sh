@@ -290,6 +290,87 @@ herdr_report_metadata() {
 	with_timeout 5 "$HERDR" pane report-metadata "$@"
 }
 
+# --- Singleton panes and pane linger -----------------------------------------
+
+# open_singleton_pane <kind> <entrypoint>: the shared launcher body of
+# status.sh and harvest.sh — serialize the open, no-op on a live pane, record
+# the new pane id. <kind> names both the lock ("<kind>-open-…") and the
+# pidfile ("<kind>-pane-…"); abort.sh sweeps by exactly those names, so the
+# naming is an interface, not a convention.
+open_singleton_pane() {
+	local kind="$1" entrypoint="$2" pidfile existing out pane_id
+	# Serialize concurrent invokes: pane open is not idempotent (sibling
+	# spike), so two racing actions would each open a pane. Same mkdir+PID
+	# lock every launcher uses; scoped per workspace like the pane itself.
+	# The lock name is deliberately NOT local: the EXIT trap fires after this
+	# function's locals are gone.
+	_open_lock="$kind-open-$(ws_id)"
+	acquire_lock "$_open_lock" || return 1
+	trap 'release_lock "$_open_lock"' EXIT
+	# Single-instance guard: recorded pane id + liveness. A recorded id whose
+	# pane died (herdr restart, user closed it) is a stale record — drop it
+	# and open fresh instead of silently doing nothing.
+	pidfile="$(state_dir)/$kind-pane-$(ws_id)"
+	existing=""
+	[ -f "$pidfile" ] && existing="$(cat "$pidfile")"
+	if pane_alive "$existing"; then
+		echo "herdr-swarm: $kind pane already open ($existing)."
+		return 0
+	fi
+	rm -f "$pidfile"
+	out="$(herdr_pane_open --entrypoint "$entrypoint" --placement split --direction right --focus)" || {
+		echo "herdr-swarm: failed to open the $kind pane" >&2
+		return 4
+	}
+	pane_id="$(parse_pane_id "$out")"
+	if [ -n "$pane_id" ]; then
+		# Recorded so the next invoke can find (and not duplicate) this pane,
+		# and so abort's manifest-tracked pane sweep can close it.
+		printf '%s\n' "$pane_id" >"$pidfile"
+	else
+		echo "herdr-swarm: warning: could not parse pane id from pane-open output" >&2
+		rm -f "$pidfile"
+	fi
+}
+
+# pane_linger: hold a pane's last message on screen — the pane closes with
+# its process, so an instant exit reads as a crash. Tests set
+# HERDR_SWARM_LINGER_SECS=0; garbage/zero skips the sleep instead of erroring
+# (the linger is a courtesy, never worth failing an exit path over).
+pane_linger() {
+	local secs="${HERDR_SWARM_LINGER_SECS:-600}"
+	case "$secs" in
+	'' | *[!0-9]* | 0) ;;
+	*) sleep "$secs" ;;
+	esac
+}
+
+# pane_fatal <message>: print + linger + exit 1 — every early pane-script
+# failure routes through here so the message stays readable.
+pane_fatal() {
+	echo "$1"
+	pane_linger
+	exit 1
+}
+
+# pane_require_node <pane-name>: the renderer is Node; a missing binary must
+# fail with a message naming this pane, not a cryptic exec error.
+pane_require_node() {
+	command -v node >/dev/null 2>&1 ||
+		pane_fatal "herdr-swarm: node not found on PATH (node >=20 is required for the $1)."
+}
+
+# pane_export_context <mode> <manifest-path>: the spawn-time env contract
+# between the pane scripts and bin/renderer.mjs (spawn-time env is the only
+# channel into the pane process — state-dir rule). Variable names and values
+# are load-bearing: the renderer and tests read exactly these.
+pane_export_context() {
+	export HERDR_SWARM_PANE_MODE="$1"
+	export HERDR_SWARM_MANIFEST="$2"
+	HERDR_SWARM_WS_ID="$(ws_id)"
+	export HERDR_SWARM_WS_ID
+}
+
 # --- Run manifest ------------------------------------------------------------
 # The backbone artifact (KTD): one JSON file per run, written ahead of every
 # mutation so abort can over-approximate and verify, never guess. Schema:
@@ -385,6 +466,32 @@ manifest_read() {
 		echo "herdr-swarm: manifest $mf is unparseable (corrupt); previous generation may be in $mf.bak" >&2
 		return "$MANIFEST_EC_CORRUPT"
 	fi
+}
+
+# manifest_run_context <doc>: the run-level fields every destructive caller
+# needs — run_id, repo_root, base_ref, fork_sha — printed as one \x1f-joined
+# line. Unit separator, not tab: tab is IFS *whitespace*, so an empty
+# nullable field would silently shift every later column (fork_sha may be
+# empty; abort ignores it). The emptiness/dir guard lives HERE (a manifest
+# without a usable run_id/repo_root must never feed an rm -rf-class caller),
+# but the refusal MESSAGE stays at each call site — abort and harvest word
+# their refusals differently on purpose.
+manifest_run_context() {
+	local out run_id repo_root rest
+	out="$(printf '%s' "$1" | node -e '
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			const doc = JSON.parse(d);
+			process.stdout.write(
+				[doc.run_id, doc.repo_root, doc.base_ref, doc.fork_sha].join("\x1f"));
+		});
+	')" || return 1
+	IFS=$'\x1f' read -r run_id repo_root rest <<<"$out"
+	: "$rest" # base_ref/fork_sha pass through unguarded; named to keep read honest
+	if [ -z "$run_id" ] || [ ! -d "$repo_root" ]; then
+		return 1
+	fi
+	printf '%s\n' "$out"
 }
 
 # manifest_update_slot <slot> <json-patch>: read-modify-write of one slot

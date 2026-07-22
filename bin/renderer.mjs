@@ -352,11 +352,18 @@ export class Renderer {
 			fork_sha: m.fork_sha,
 			repo_root: m.repo_root,
 		};
-		const agents = await this.herdr.agentList();
+		// Agent query and per-slot git facts gathered concurrently: one hung
+		// worktree must cost only its own timeout, not N× — the pane runs
+		// unattended for hours, and a serial poll would stall every slot behind
+		// the slowest one. Safe because agentList and gitFactsFor never throw.
+		const [agents, factsList] = await Promise.all([
+			this.herdr.agentList(),
+			Promise.all(m.slots.map((row) => this.gitFactsFor(m, row))),
+		]);
 		const gitFacts = {};
-		for (const row of m.slots) {
-			gitFacts[row.slot] = await this.gitFactsFor(m, row);
-		}
+		m.slots.forEach((row, i) => {
+			gitFacts[row.slot] = factsList[i];
+		});
 		this.rows = sortSlots(reconcileSlots(m.slots, agents, gitFacts));
 		this.banner = agents === null ? "agent list unavailable — states shown as unknown" : "";
 		this.paint();
@@ -696,6 +703,8 @@ export class HarvestRenderer {
 		const m = parsed.manifest;
 		this.runInfo = { run_id: m.run_id, base_ref: m.base_ref, repo_root: m.repo_root };
 		const rows = [];
+		// Sequential on purpose: every preview verb takes the per-repo mutation
+		// lock, so concurrency here would only contend on that lock.
 		for (const s of m.slots) {
 			const row = {
 				slot: s.slot,

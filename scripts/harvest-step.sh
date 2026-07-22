@@ -81,18 +81,13 @@ DOC="$(manifest_read)" || exit $?
 # shift every later field left — exactly the bug for nullable columns.
 US=$'\x1f'
 
-IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF FORK_SHA <<<"$(printf '%s' "$DOC" | node -e '
-	let d = "";
-	process.stdin.on("data", (c) => (d += c)).on("end", () => {
-		const doc = JSON.parse(d);
-		process.stdout.write(
-			[doc.run_id, doc.repo_root, doc.base_ref, doc.fork_sha].join("\x1f"));
-	});
-')"
-if [ -z "$RUN_ID" ] || [ ! -d "$REPO_ROOT" ]; then
+# Run context from the shared extractor (lib.sh): the guard is the
+# extractor's; the refusal wording is ours.
+CTX="$(manifest_run_context "$DOC")" || {
 	echo "herdr-swarm: manifest has no usable run_id/repo_root — cannot harvest." >&2
 	exit 1
-fi
+}
+IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF FORK_SHA <<<"$CTX"
 BASE_BRANCH="${BASE_REF#refs/heads/}"
 
 # read_slot <slot>: populate SLOT_* globals from the manifest row. Journal is

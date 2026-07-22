@@ -64,21 +64,17 @@ case "$rc" in
 esac
 
 # --- Run context -------------------------------------------------------------
-# Same \x1f field separator discipline as harvest-step.sh: tab is IFS
-# whitespace, so empty (nullable) fields would silently shift columns.
+# \x1f-separated fields from the shared extractor (see lib.sh for why tab
+# would silently shift nullable columns). The guard is the extractor's; the
+# refusal wording is ours.
 US=$'\x1f'
-IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF <<<"$(printf '%s' "$DOC" | node -e '
-	let d = "";
-	process.stdin.on("data", (c) => (d += c)).on("end", () => {
-		const doc = JSON.parse(d);
-		process.stdout.write([doc.run_id, doc.repo_root, doc.base_ref].join("\x1f"));
-	});
-')"
-if [ -z "$RUN_ID" ] || [ ! -d "$REPO_ROOT" ]; then
+CTX="$(manifest_run_context "$DOC")" || {
 	echo "herdr-swarm: manifest has no usable run_id/repo_root — abort refused." >&2
 	print_summary
 	exit 1
-fi
+}
+# Field 4 (fork_sha) is ignored: teardown never needs the fork point.
+IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF _ <<<"$CTX"
 # run_id is interpolated into state-dir paths (harvest-worktree glob, archive
 # name) — charset-restrict at the edge (ownership KTD: rm -rf-class inputs
 # never pass unvalidated).

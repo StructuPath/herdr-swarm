@@ -9,7 +9,12 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHarness, repoRoot } from "./harness.mjs";
+import {
+	commitIn,
+	createHarness,
+	makeFannedOutRun,
+	repoRoot,
+} from "./harness.mjs";
 
 const h = createHarness();
 h.writeHerdrStub();
@@ -28,86 +33,9 @@ const EC = {
 	DIRTY: 38,
 };
 
-// harvest-step.sh makes real commits (WIP, snapshot, merge); the harness env
-// has GIT_CONFIG_GLOBAL=/dev/null, so identity must ride in explicitly or
-// every commit-producing verb dies on "unable to auto-detect email".
-const gitIdent = {
-	GIT_AUTHOR_NAME: "hs-test",
-	GIT_AUTHOR_EMAIL: "hs@test.invalid",
-	GIT_COMMITTER_NAME: "hs-test",
-	GIT_COMMITTER_EMAIL: "hs@test.invalid",
-};
-
-let runSeq = 0;
-
-// A fanned-out-looking run built directly: real repo, real slot worktrees on
-// run-unique branches forked at the recorded SHA, manifest written the way
-// fanout-pane.sh writes it (task file present + excluded, like reality).
-function mkRun(opts = {}) {
-	const nslots = opts.slots ?? 1;
-	const repo = h.makeRepo();
-	const runId = `r-hv${++runSeq}`;
-	const fork = h.git(repo, "rev-parse", "HEAD").stdout.trim();
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-hv-"));
-	fs.appendFileSync(path.join(repo, ".git/info/exclude"), ".swarm-task.md\n");
-	const slots = [];
-	for (let i = 1; i <= nslots; i++) {
-		const branch = `swarm/${runId}/s${i}`;
-		const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")), `s${i}`);
-		h.git(repo, "worktree", "add", "-q", "-b", branch, wt, fork);
-		fs.writeFileSync(path.join(wt, ".swarm-task.md"), "task\n");
-		slots.push({
-			slot: i,
-			label: `s${i}`,
-			branch,
-			path: wt,
-			workspace_id: `w${10 + i}`,
-			pane_id: `w${10 + i}:p1`,
-			terminal_id: `term_s${i}`,
-			agent_name: "claude",
-			self_created: true,
-			status: opts.status ?? "running",
-			backup_ref: null,
-			journal: null,
-		});
-	}
-	const manifest = {
-		run_id: runId,
-		repo_root: repo,
-		base_ref: "refs/heads/main",
-		fork_sha: fork,
-		created_at: "2026-07-22T15:00:00Z",
-		exclude_pattern_added: true,
-		slots,
-	};
-	fs.writeFileSync(
-		path.join(sdir, "run-w9.json"),
-		JSON.stringify(manifest, null, 2),
-	);
-	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir, ...gitIdent });
-	return {
-		repo,
-		runId,
-		fork,
-		sdir,
-		env,
-		wt: (i) => slots[i - 1].path,
-		branch: (i) => slots[i - 1].branch,
-		manifest: () =>
-			JSON.parse(fs.readFileSync(path.join(sdir, "run-w9.json"), "utf8")),
-		slotRow: (i) =>
-			JSON.parse(fs.readFileSync(path.join(sdir, "run-w9.json"), "utf8")).slots.find(
-				(s) => s.slot === i,
-			),
-	};
-}
-
-function commitIn(dir, name, content = "work\n", msg = `add ${name}`) {
-	fs.writeFileSync(path.join(dir, name), content);
-	h.git(dir, "add", name);
-	h.git(dir, "commit", "-q", "-m", msg);
-	return h.git(dir, "rev-parse", "HEAD").stdout.trim();
-}
+// Shared fanned-out-run fixture (tests/harness.mjs); the prefix keeps this
+// file's run ids distinct from other suites'.
+const mkRun = (opts = {}) => makeFannedOutRun(h, { prefix: "r-hv", ...opts });
 
 // A commit minted with plumbing only — moves nothing checked out anywhere, so
 // tests can race the base ref under the verb's feet without touching a tree.

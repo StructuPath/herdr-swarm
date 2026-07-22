@@ -1,38 +1,29 @@
 #!/usr/bin/env bash
 # Harvest pane entrypoint: resolve session context once in bash, export it,
 # exec the zero-dep Node renderer in harvest mode. Mirrors status-pane.sh;
-# every early failure prints a friendly message and sleeps — a pane whose
+# every early failure routes through pane_fatal (lib.sh) — a pane whose
 # process exits immediately closes before the user can read anything, which
 # reads as a crash.
 set -uo pipefail
 
-linger() {
-	echo "$1"
-	sleep 600
-	exit 1
-}
-
 cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || {
+	# lib.sh (and pane_fatal with it) is unreachable without the plugin root,
+	# so this one failure lingers inline.
 	echo "herdr-swarm: cannot resolve the plugin root"
 	sleep 600
 	exit 1
 }
 . scripts/lib.sh
 
-command -v node >/dev/null 2>&1 ||
-	linger "herdr-swarm: node not found on PATH (node >=20 is required for the harvest pane)."
+pane_require_node "harvest pane"
 
 mf="$(manifest_path)"
 [ -f "$mf" ] ||
-	linger "herdr-swarm: no active swarm run for this workspace (no manifest at $mf) — nothing to harvest."
+	pane_fatal "herdr-swarm: no active swarm run for this workspace (no manifest at $mf) — nothing to harvest."
 
-# Spawn-time env is the only channel into the pane process (state-dir rule).
-# A corrupt manifest is NOT fatal here: the renderer treats corrupt as a
-# first-class display state, and every destructive verb re-reads and refuses
-# on corruption itself.
-ws="$(ws_id)"
-export HERDR_SWARM_PANE_MODE="harvest"
-export HERDR_SWARM_MANIFEST="$mf"
-export HERDR_SWARM_WS_ID="$ws"
+# Spawn-time env via the shared contract (state-dir rule). A corrupt manifest
+# is NOT fatal here: the renderer treats corrupt as a first-class display
+# state, and every destructive verb re-reads and refuses on corruption itself.
+pane_export_context harvest "$mf"
 
 exec node bin/renderer.mjs

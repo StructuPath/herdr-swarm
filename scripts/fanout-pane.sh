@@ -28,19 +28,9 @@ PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 require_herdr
 require_node || exit 1
 
-# Linger budget for error paths: the pane closes with this process, so
-# without a linger a fatal message would flash and vanish before the user
-# can read it. Tests set HERDR_SWARM_LINGER_SECS=0.
-LINGER="${HERDR_SWARM_LINGER_SECS:-600}"
-
-linger() {
-	# Garbage/zero in the override skips the sleep instead of erroring: the
-	# linger is a courtesy, never worth failing an exit path over.
-	case "$LINGER" in
-	'' | *[!0-9]* | 0) ;;
-	*) sleep "$LINGER" ;;
-	esac
-}
+# Error paths linger via pane_linger (lib.sh, HERDR_SWARM_LINGER_SECS): the
+# pane closes with this process, so without a linger a fatal message would
+# flash and vanish before the user can read it. Tests set the override to 0.
 
 fatal() {
 	# fatal <exit-code> [message…]. Lock released BEFORE the linger: a pane
@@ -50,7 +40,7 @@ fatal() {
 	shift || true
 	[ $# -gt 0 ] && echo "$*" >&2
 	release_lock "mutate-$(ws_id)"
-	linger
+	pane_linger
 	exit "$code"
 }
 
@@ -476,6 +466,6 @@ fi
 # exits. Lock released first — a lingering pane must never block abort.
 release_lock "mutate-$(ws_id)"
 if [ "$failed" -gt 0 ]; then
-	linger
+	pane_linger
 fi
 [ "$failed" -eq 0 ]
