@@ -373,6 +373,7 @@ mark_failed() {
 created=0
 started=0
 failed=0
+setup_failures=0
 for ((i = 1; i <= n; i++)); do
 	slug="s${i}-${preset_names[i]}" # preset name is sanitize_slug-validated
 	branch="swarm/$run_id/$slug"
@@ -417,6 +418,19 @@ for ((i = 1; i <= n; i++)); do
 		continue
 	fi
 
+	# Optional per-repo setup hook: fresh worktrees lack gitignored deps
+	# (.env, node_modules), the most likely "all my agents failed" cause.
+	# Failure warns but does not fail the slot — the agent may not need
+	# what setup provides, and the warning names the log for diagnosis.
+	setup_hook="${HERDR_PLUGIN_CONFIG_DIR:-}/setup.sh"
+	if [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "$setup_hook" ]; then
+		setup_log="$(state_dir)/setup-$run_id-s$i.log"
+		if ! (cd "$wt_path" && with_timeout "${HERDR_SWARM_SETUP_TIMEOUT:-300}" bash "$setup_hook") >"$setup_log" 2>&1; then
+			echo "herdr-swarm: WARNING slot $i setup.sh failed (see $setup_log) — starting agent anyway" >&2
+			setup_failures=$((setup_failures + 1))
+		fi
+	fi
+
 	read -ra argv_arr <<<"${slot_argvs[i]}"
 	agent_name="swarm-$run_id-$slug"
 	start_args=("$agent_name")
@@ -445,6 +459,9 @@ done
 
 echo
 echo "herdr-swarm: fan-out $run_id complete — created $created, started $started, failed $failed."
+if [ "$setup_failures" -gt 0 ]; then
+	echo "herdr-swarm: WARNING: setup.sh failed in $setup_failures worktree(s) — agents started anyway; logs in $(state_dir)." >&2
+fi
 if [ "$failed" -gt 0 ]; then
 	echo "herdr-swarm: WARNING: $failed slot(s) FAILED; successful slots were kept (R4). Manifest: $(manifest_path)" >&2
 fi

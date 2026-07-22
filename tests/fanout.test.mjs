@@ -411,3 +411,30 @@ test("detritus prompt: choosing delete clears the leftovers and the fan-out proc
 	assert.doesNotMatch(refs, /swarm\/r0\/s1/, "old branch gone");
 	assert.equal(readManifest().slots.length, 1, "new run created after cleanup");
 });
+
+// --- setup.sh hook (kept in v1 scope by explicit user decision) ---
+
+test("setup.sh hook runs in each worktree; failure warns but slots still start", () => {
+	// Success path: the hook drops a marker; every worktree must have it.
+	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
+	fs.writeFileSync(path.join(cfg, "setup.sh"), "echo ok > .setup-ran\n");
+	{
+		const { env, repo } = setup({ HERDR_PLUGIN_CONFIG_DIR: cfg });
+		const r = runPane(lines(["2", "", "", "Task", ".", "", ""]), env, repo);
+		assert.equal(r.status, 0, r.stderr);
+		for (const s of readManifest().slots) {
+			assert.equal(s.status, "running");
+			assert.ok(fs.existsSync(path.join(s.path, ".setup-ran")), `marker in ${s.path}`);
+		}
+		assert.doesNotMatch(r.stderr, /setup\.sh failed/);
+	}
+	// Failure path: hook exits 1 — loud warning, agents started anyway.
+	fs.writeFileSync(path.join(cfg, "setup.sh"), "exit 1\n");
+	{
+		const { env, repo } = setup({ HERDR_PLUGIN_CONFIG_DIR: cfg });
+		const r = runPane(lines(["1", "", "Task", ".", ""]), env, repo);
+		assert.equal(r.status, 0, r.stderr);
+		assert.match(r.stderr, /setup\.sh failed in 1 worktree/);
+		assert.equal(readManifest().slots[0].status, "running");
+	}
+});
