@@ -266,7 +266,7 @@ test("no raw herdr invocations outside lib.sh wrappers (scripts/ and bin/)", () 
 // --- scaffold stubs ---
 
 test("manifest-referenced action stubs exit 0 with a message, never a naked failure", () => {
-	for (const s of ["fanout.sh", "status.sh", "harvest.sh", "abort.sh", "prune.sh"]) {
+	for (const s of ["harvest.sh", "abort.sh", "prune.sh"]) {
 		const r = runScript(s);
 		assert.equal(r.status, 0, `${s}: ${r.stderr}`);
 		assert.match(r.stdout, /not implemented yet/, s);
