@@ -1,86 +1,16 @@
-import { test, before } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { createHarness, repoRoot } from "./harness.mjs";
 
-const repoRoot = path.resolve(
-	path.dirname(fileURLToPath(import.meta.url)),
-	"..",
-);
-
-let stubDir, stateDir, logFile;
-
-function writeStub(name, body) {
-	const p = path.join(stubDir, name);
-	fs.writeFileSync(p, `#!/usr/bin/env bash\n${body}`);
-	fs.chmodSync(p, 0o755);
-}
-
-function freshEnv(overrides = {}) {
-	fs.writeFileSync(logFile, "");
-	return {
-		PATH: `${stubDir}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
-		HOME: os.homedir(),
-		STUB_LOG: logFile,
-		HERDR_BIN_PATH: path.join(stubDir, "herdr"),
-		HERDR_PLUGIN_ROOT: repoRoot,
-		HERDR_PLUGIN_STATE_DIR: stateDir,
-		HERDR_WORKSPACE_ID: "w9",
-		...overrides,
-	};
-}
-
-function runScript(script, args = [], env = freshEnv()) {
-	return spawnSync("bash", [path.join(repoRoot, "scripts", script), ...args], {
-		env,
-		encoding: "utf8",
-	});
-}
-
-// Runs a snippet with lib.sh sourced — the unit under test is a bash
-// function, not a script, so tests drive functions directly.
-function runLib(snippet, env = freshEnv()) {
-	return spawnSync(
-		"bash",
-		["-c", `. "${repoRoot}/scripts/lib.sh" && ${snippet}`],
-		{ env, encoding: "utf8" },
-	);
-}
-
-const log = () => fs.readFileSync(logFile, "utf8");
-
-before(() => {
-	stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-stub-"));
-	stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-state-"));
-	logFile = path.join(stubDir, "calls.log");
-	writeStub(
-		"herdr",
-		`echo "herdr $@" >> "$STUB_LOG"
-if [ "$1" = "--version" ]; then echo "herdr \${STUB_HERDR_VERSION:-0.7.4}"; exit 0; fi
-if [ "$1" = "worktree" ] && [ "$2" = "create" ]; then
-  # Mirrors the real herdr 0.7.4 worktree_created result (api schema, protocol
-  # 16): workspace/tab/root_pane/worktree, worktree carries the real path.
-  echo '{"id":"cli:worktree:create","result":{"root_pane":{"agent_status":"unknown","pane_id":"w9:p1","tab_id":"w9:t1","workspace_id":"w9"},"tab":{"tab_id":"w9:t1","workspace_id":"w9"},"type":"worktree_created","workspace":{"active_tab_id":"w9:t1","agent_status":"unknown","focused":true,"label":"swarm/r1/s1","number":7,"pane_count":1,"tab_count":1,"workspace_id":"w9"},"worktree":{"branch":"swarm/r1/s1","is_bare":false,"is_detached":false,"is_linked_worktree":true,"is_prunable":false,"label":"swarm/r1/s1","open_workspace_id":"w9","path":"/tmp/herdr-worktrees/repo/swarm-r1-s1"}}}'
-  exit 0
-fi
-if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
-  # Mirrors the real 0.7.4 pane_list schema: plugin panes carry the manifest
-  # pane title as "label"; plain terminal panes have no label.
-  echo '{"id":"cli:pane:list","result":{"panes":[{"agent_status":"unknown","label":"Swarm Status","pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9"},{"agent":"claude","agent_status":"idle","pane_id":"w9:p4","tab_id":"w9:t1","terminal_title":"claude","workspace_id":"w9"}],"type":"pane_list"}}'
-  exit 0
-fi
-if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
-  # Mirrors the 0.7.4 agent_list shape captured in the U1 spike (baseline.txt).
-  echo '{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"idle","cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","focused":false,"foreground_cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","pane_id":"w9:p4","revision":3,"screen_detection_skipped":true,"tab_id":"w9:t1","terminal_id":"term_abc123","terminal_title":"claude","terminal_title_stripped":"claude","workspace_id":"w9"}],"type":"agent_list"}}'
-  exit 0
-fi
-if [ "$1" = "pane" ] && [ "$2" = "read" ]; then exit "\${STUB_PANE_ALIVE:-1}"; fi
-exit 0`,
-	);
-});
+// Shared harness (tests/harness.mjs) — the herdr stub mirrors real 0.7.4
+// JSON so wrapper tests exercise the true wire shapes.
+const h = createHarness();
+h.writeHerdrStub();
+const { stateDir, freshEnv, runScript, runLib, log } = h;
 
 // --- sanitize_slug ---
 

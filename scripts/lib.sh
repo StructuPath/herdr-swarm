@@ -289,3 +289,133 @@ herdr_workspace_close() {
 herdr_report_metadata() {
 	with_timeout 5 "$HERDR" pane report-metadata "$@"
 }
+
+# --- Run manifest ------------------------------------------------------------
+# The backbone artifact (KTD): one JSON file per run, written ahead of every
+# mutation so abort can over-approximate and verify, never guess. Schema:
+#   { run_id, repo_root, base_ref (fully-qualified refs/heads/<x>), fork_sha,
+#     created_at, exclude_pattern_added, slots: [ { slot, label, branch, path,
+#     workspace_id, pane_id, terminal_id, agent_name, self_created,
+#     status: pending|running|failed|settled|merged|skipped|archived,
+#     backup_ref, journal: {locus, expected_base_sha, merge_commit_sha} } ] }
+# path/ids are null until herdr returns them (write-ahead pending rows);
+# backup_ref/journal are null until a discard snapshot / merge intent exists.
+#
+# JSON work is inline node, not jq: node >=20 is already a plugin prereq
+# (package.json engines) while jq is not installed anywhere by default —
+# same choice the sibling's close.sh made for its pane sweep.
+
+# Distinct read codes so destructive callers can branch without
+# string-matching stderr: missing (2) means "no run" — a normal state —
+# while corrupt (3) means "unknown state": destructive callers must refuse
+# and degrade to report_only_discovery (preflight.sh).
+# shellcheck disable=SC2034  # consumed by sourcing scripts as well as here
+MANIFEST_EC_MISSING=2
+MANIFEST_EC_CORRUPT=3
+
+# node runs every manifest read/write; a missing binary must fail with its
+# own name, not surface as a cryptic downstream JSON error.
+require_node() {
+	if ! command -v node >/dev/null 2>&1; then
+		echo "herdr-swarm: node not found on PATH (node >=20 is required)." >&2
+		return 1
+	fi
+}
+
+manifest_path() {
+	printf '%s/run-%s.json\n' "$(state_dir)" "$(ws_id)"
+}
+
+# manifest_write: full manifest JSON on stdin → $(manifest_path). The order
+# is load-bearing: validate → .bak → temp+fsync → rename → dir fsync.
+# Validation first so a buggy writer can never replace a good manifest with
+# garbage; the .bak copy before the rename keeps the previous generation
+# recoverable; fsync before rename (then the directory) so a crash right
+# after "success" can't leave the zero-length file manifest_read calls
+# corrupt. The temp lives next to the target because rename(2) is only
+# atomic within one filesystem.
+manifest_write() {
+	local mf
+	mf="$(manifest_path)" || return 1
+	require_node || return 1
+	if [ -f "$mf" ]; then
+		cp -p "$mf" "$mf.bak" || return 1
+	fi
+	node -e '
+		const fs = require("fs"), path = require("path");
+		const dst = process.argv[1], tmp = dst + ".tmp." + process.pid;
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			JSON.parse(d); // throws => nonzero exit, nothing touched on disk
+			const fd = fs.openSync(tmp, "w");
+			fs.writeSync(fd, d);
+			fs.fsyncSync(fd);
+			fs.closeSync(fd);
+			fs.renameSync(tmp, dst);
+			// Persist the rename itself; best-effort (dir fsync is EINVAL on
+			// some filesystems, and the data is already safe by this point).
+			try {
+				const dfd = fs.openSync(path.dirname(dst), "r");
+				fs.fsyncSync(dfd);
+				fs.closeSync(dfd);
+			} catch {}
+		});
+	' "$mf"
+}
+
+# manifest_read: prints the manifest to stdout. 0 ok, MANIFEST_EC_MISSING no
+# manifest, MANIFEST_EC_CORRUPT empty/unparseable. node's own parse stack is
+# suppressed — our one-line message with the .bak pointer is the actionable
+# part.
+manifest_read() {
+	local mf
+	mf="$(manifest_path)" || return 1
+	[ -f "$mf" ] || return "$MANIFEST_EC_MISSING"
+	if [ ! -s "$mf" ]; then
+		echo "herdr-swarm: manifest $mf is zero-length (corrupt); previous generation may be in $mf.bak" >&2
+		return "$MANIFEST_EC_CORRUPT"
+	fi
+	require_node || return 1
+	if ! node -e '
+		const fs = require("fs");
+		const raw = fs.readFileSync(process.argv[1], "utf8");
+		JSON.parse(raw);
+		process.stdout.write(raw);
+	' "$mf" 2>/dev/null; then
+		echo "herdr-swarm: manifest $mf is unparseable (corrupt); previous generation may be in $mf.bak" >&2
+		return "$MANIFEST_EC_CORRUPT"
+	fi
+}
+
+# manifest_update_slot <slot> <json-patch>: read-modify-write of one slot
+# row (shallow merge). MUST be called with the mutation lock held — this
+# function deliberately does not take the lock itself, because callers batch
+# several updates inside one critical section and the mkdir lock is not
+# reentrant. The row must already exist: a typo'd slot number fails loudly
+# instead of inventing a row the reaper would then trust. Propagates
+# manifest_read's missing/corrupt codes so destructive callers refuse on a
+# corrupt manifest for free.
+manifest_update_slot() {
+	local slot="${1-}" patch="${2-}" doc updated
+	doc="$(manifest_read)" || return $?
+	updated="$(printf '%s' "$doc" | node -e '
+		const [slot, patch] = process.argv.slice(1);
+		let p;
+		try { p = JSON.parse(patch); } catch {
+			console.error("herdr-swarm: slot patch is not valid JSON: " + patch);
+			process.exit(1);
+		}
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			const doc = JSON.parse(d);
+			const row = (doc.slots || []).find((r) => String(r.slot) === slot);
+			if (!row) {
+				console.error("herdr-swarm: no slot " + slot + " in manifest");
+				process.exit(1);
+			}
+			Object.assign(row, p);
+			process.stdout.write(JSON.stringify(doc, null, 2));
+		});
+	' "$slot" "$patch")" || return 1
+	printf '%s' "$updated" | manifest_write
+}
