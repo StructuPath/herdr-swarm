@@ -6,11 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { createHarness, repoRoot } from "./harness.mjs";
 
-// Shared harness (tests/harness.mjs) — the herdr stub mirrors real 0.7.4
-// JSON so wrapper tests exercise the true wire shapes.
+// Shared harness (tests/harness.mjs) — the herdr stub mirrors real 0.7.4 and
+// 0.7.5 JSON so wrapper tests exercise the true wire shapes.
 const h = createHarness();
 h.writeHerdrStub();
-const { stateDir, freshEnv, runLib, log } = h;
+const { stateDir, freshEnv, runLib, log, writeStub, writeHerdrStub } = h;
 
 // --- sanitize_slug ---
 
@@ -115,14 +115,54 @@ test("version_gate accepts gated calls on 0.7.4", () => {
 	assert.equal(r.status, 0, r.stderr);
 });
 
-test("version_gate refuses gated calls on 0.7.5 with the version named", () => {
+// Fan-out runs on BOTH supported topologies now (issue #1), so the gate is a
+// floor rather than a pin: 0.7.5 passes on the pane path, and only versions
+// below 0.7.4 — where neither path exists — are refused.
+test("version_gate accepts gated calls on 0.7.5 (the pane path)", () => {
 	const r = runLib(
 		`version_gate gated`,
 		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
 	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.doesNotMatch(r.stderr, /warning/);
+});
+
+test("version_gate refuses gated calls below the 0.7.4 floor with the version named", () => {
+	const r = runLib(
+		`version_gate gated`,
+		freshEnv({ STUB_HERDR_VERSION: "0.7.3" }),
+	);
 	assert.notEqual(r.status, 0);
-	assert.match(r.stderr, /needs herdr 0\.7\.4/);
-	assert.match(r.stderr, /0\.7\.5/);
+	assert.match(r.stderr, /needs herdr 0\.7\.4 or newer/);
+	assert.match(r.stderr, /0\.7\.3/);
+});
+
+test("version_gate warns but never refuses gated calls above max tested", () => {
+	const r = runLib(
+		`version_gate gated`,
+		freshEnv({ STUB_HERDR_VERSION: "0.8.0" }),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stderr, /newer than tested/);
+});
+
+// Field-wise numeric compare: a string compare puts 0.7.10 below 0.7.9 and
+// would refuse a newer herdr as too old — the gate's worst failure mode.
+test("version_ge compares versions numerically, not lexically", () => {
+	const cases = [
+		["0.7.10", "0.7.9", 0],
+		["0.7.9", "0.7.10", 1],
+		["0.7.5", "0.7.5", 0],
+		["0.8.0", "0.7.4", 0],
+		["0.7.3", "0.7.4", 1],
+		["1.0", "0.9.9", 0],
+		// Pre-release suffixes are dropped, not compared — and must not crash.
+		["0.7.5-rc1", "0.7.5", 0],
+	];
+	for (const [a, b, want] of cases) {
+		const r = runLib(`version_ge ${a} ${b}`);
+		assert.equal(r.status, want, `version_ge ${a} ${b}: ${r.stderr}`);
+	}
 });
 
 test("version_gate passes intersection calls through on 0.7.5, no warning", () => {
@@ -190,14 +230,155 @@ test("herdr_agent_start passes through on 0.7.4 with the 0.7.4 argv shape", () =
 	);
 });
 
-test("herdr_agent_start refuses on 0.7.5 without invoking agent start", () => {
+// --split-from exists only for the 0.7.5 path; forwarding it would make
+// 0.7.4's own arg parser reject the start.
+test("herdr_agent_start drops --split-from on the 0.7.4 path", () => {
 	const r = runLib(
-		`herdr_agent_start slot1 --cwd /tmp/wt/s1 --workspace w9 -- claude`,
+		`herdr_agent_start slot1 --split-from w9:p1 --cwd /tmp/wt/s1 --no-focus -- claude`,
+	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /herdr agent start slot1 --cwd \/tmp\/wt\/s1 --no-focus -- claude/);
+	assert.doesNotMatch(log(), /--split-from/);
+});
+
+// --- the 0.7.5 pane path (issue #1) ---
+
+// The whole seam: same caller argv, same response shape, three herdr calls
+// instead of one — and `agent start` never runs, because 0.7.5's --kind is a
+// closed whitelist with no arbitrary-argv member (spike l).
+test("herdr_agent_start on 0.7.5 splits, runs, and reports — never calls agent start", () => {
+	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const r = runLib(
+		`herdr_agent_start swarm-r1-s1 --workspace w9 --split-from w9:p1 --cwd ${wt} --no-focus -- claude --model opus`,
+		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	const calls = log().split("\n").filter((l) => l.startsWith("herdr "));
+	const order = calls.filter((l) => /pane (split|run|report-agent)/.test(l));
+	assert.equal(order.length, 3, `expected 3 pane calls, got:\n${calls.join("\n")}`);
+	// Order is load-bearing: the pane must exist before argv runs in it, and
+	// the agent must not be advertised as working before its argv is running.
+	assert.match(order[0], new RegExp(`pane split w9:p1 --direction down --cwd ${wt} --no-focus`));
+	assert.match(order[1], /pane run w9:p7 claude --model opus/);
+	assert.match(
+		order[2],
+		/pane report-agent w9:p7 --source structupath\.swarm --agent swarm-r1-s1 --state working/,
+	);
+	// R2: no whitelisted-kind start is attempted, with any kind at all.
+	assert.doesNotMatch(log(), /agent start/);
+	assert.doesNotMatch(log(), /--kind/);
+	// Same output contract as 0.7.4 — the call site parses this identically.
+	const j = JSON.parse(r.stdout);
+	assert.equal(j.result.type, "agent_started");
+	assert.equal(j.result.agent.name, "swarm-r1-s1");
+	assert.equal(j.result.agent.pane_id, "w9:p7");
+	assert.equal(j.result.agent.terminal_id, "term_split7");
+	assert.equal(j.result.agent.workspace_id, "w9");
+});
+
+test("the 0.7.5 path refuses before splitting when the worktree cwd is missing", () => {
+	const env = freshEnv({ STUB_HERDR_VERSION: "0.7.5" });
+	// A split without the slot's worktree cwd inherits the herdr server's cwd
+	// (spike k) — the agent would run in the wrong repo entirely.
+	const noCwd = runLib(
+		`herdr_agent_start swarm-r1-s1 --split-from w9:p1 -- claude`,
+		env,
+	);
+	assert.notEqual(noCwd.status, 0);
+	assert.match(noCwd.stderr, /needs an existing --cwd/);
+	assert.doesNotMatch(log(), /pane split/);
+	// And without an anchor pane, `pane split` would split the user's own
+	// focused pane (it has no --workspace).
+	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const noAnchor = runLib(`herdr_agent_start swarm-r1-s1 --cwd ${wt} -- claude`, env);
+	assert.notEqual(noAnchor.status, 0);
+	assert.match(noAnchor.stderr, /needs --split-from/);
+	assert.doesNotMatch(log(), /pane split/);
+});
+
+test("the 0.7.5 path refuses an untranslatable flag instead of silently dropping it", () => {
+	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const r = runLib(
+		`herdr_agent_start swarm-r1-s1 --split-from w9:p1 --cwd ${wt} --timeout 5000 -- claude`,
 		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
 	);
 	assert.notEqual(r.status, 0);
-	assert.match(r.stderr, /needs herdr 0\.7\.4/);
-	assert.doesNotMatch(log(), /agent start/);
+	assert.match(r.stderr, /cannot translate '--timeout'/);
+	assert.doesNotMatch(log(), /pane split/);
+});
+
+test("the 0.7.5 path closes the pane it opened when pane run fails", () => {
+	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	// A pane the manifest never records is a pane no abort sweep can reap.
+	writeStub(
+		"herdr",
+		`echo "herdr $@" >> "$STUB_LOG"
+if [ "$1" = "--version" ]; then echo "herdr 0.7.5"; exit 0; fi
+if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
+  echo '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w9:p7","terminal_id":"term_split7","workspace_id":"w9"},"type":"pane_info"}}'
+  exit 0
+fi
+if [ "$1" = "pane" ] && [ "$2" = "run" ]; then exit 1; fi
+exit 0`,
+	);
+	const r = runLib(
+		`herdr_agent_start swarm-r1-s1 --split-from w9:p1 --cwd ${wt} -- claude`,
+		freshEnv(),
+	);
+	assert.notEqual(r.status, 0);
+	assert.match(r.stderr, /pane run failed/);
+	assert.match(log(), /pane close w9:p7/);
+	writeHerdrStub(); // restore the shared stub for later tests
+});
+
+// Agent state is advisory (harvest never gates on it), so a status-only call
+// failing must never destroy a slot that is already running its work.
+test("the 0.7.5 path warns but still succeeds when report-agent fails", () => {
+	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	writeStub(
+		"herdr",
+		`echo "herdr $@" >> "$STUB_LOG"
+if [ "$1" = "--version" ]; then echo "herdr 0.7.5"; exit 0; fi
+if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
+  echo '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w9:p7","terminal_id":"term_split7","workspace_id":"w9"},"type":"pane_info"}}'
+  exit 0
+fi
+if [ "$1" = "pane" ] && [ "$2" = "report-agent" ]; then exit 1; fi
+exit 0`,
+	);
+	const r = runLib(
+		`herdr_agent_start swarm-r1-s1 --split-from w9:p1 --cwd ${wt} -- claude`,
+		freshEnv(),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stderr, /could not report agent state/);
+	assert.equal(JSON.parse(r.stdout).result.agent.pane_id, "w9:p7");
+	writeHerdrStub();
+});
+
+// report_slot_agent_state is the harvest-preview hook. On 0.7.4 herdr detects
+// the agent natively, so a plugin report there would fight its own detection.
+test("report_slot_agent_state reports on 0.7.5+ and no-ops on 0.7.4", () => {
+	const on = runLib(
+		`report_slot_agent_state w9:p7 swarm-r1-s1 idle`,
+		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
+	);
+	assert.equal(on.status, 0, on.stderr);
+	assert.match(
+		log(),
+		/pane report-agent w9:p7 --source structupath\.swarm --agent swarm-r1-s1 --state idle/,
+	);
+	const off = runLib(`report_slot_agent_state w9:p7 swarm-r1-s1 idle`, freshEnv());
+	assert.equal(off.status, 0, off.stderr);
+	assert.doesNotMatch(log(), /report-agent/);
+	// A slot with no recorded pane (a pending row) is skipped, never reported
+	// against an empty pane id.
+	const none = runLib(
+		`report_slot_agent_state "" swarm-r1-s1 idle`,
+		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
+	);
+	assert.equal(none.status, 0, none.stderr);
+	assert.doesNotMatch(log(), /report-agent/);
 });
 
 test("herdr_agent_wait requires --timeout so no call site can wait forever", () => {

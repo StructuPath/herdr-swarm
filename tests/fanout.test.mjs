@@ -75,6 +75,29 @@ if [ "$1" = "agent" ] && [ "$2" = "start" ]; then
   printf '{"id":"cli:agent:start","result":{"agent":{"agent_status":"unknown","cwd":"%s","focused":false,"foreground_cwd":"%s","name":"%s","pane_id":"wD:p2","revision":0,"tab_id":"wD:t1","terminal_id":"term_%s","workspace_id":"wD"},"argv":["%s"],"type":"agent_started"}}\\n' "$cwd" "$cwd" "$name" "$name" "$*"
   exit 0
 fi
+if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
+  # 0.7.5 path. Snapshot like agent start does, keyed by the anchor pane +
+  # cwd, so write-ahead ordering is provable on this branch too. A unique
+  # pane id per split proves each slot got its OWN pane.
+  cwd=""
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) cwd="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  case "$cwd" in
+    *"\${STUB_FAIL_SPLIT_MATCH:-@@nomatch@@}"*)
+      echo '{"error":{"code":"pane_split_failed","message":"no such pane"},"id":"cli:pane:split"}'
+      exit 1 ;;
+  esac
+  n="$(cat "$HERDR_PLUGIN_STATE_DIR/split-seq" 2>/dev/null || echo 0)"
+  n=$((n + 1)); echo "$n" > "$HERDR_PLUGIN_STATE_DIR/split-seq"
+  [ -f "$mf" ] && cp "$mf" "$HERDR_PLUGIN_STATE_DIR/snap-split-$n.json"
+  printf '{"id":"cli:pane:split","result":{"pane":{"agent_status":"unknown","cwd":"%s","focused":false,"pane_id":"wD:p%s","revision":0,"tab_id":"wD:t1","terminal_id":"term_split%s","workspace_id":"wD"},"type":"pane_info"}}\\n' "$cwd" "$n" "$n"
+  exit 0
+fi
 if [ "$1" = "plugin" ] && [ "$2" = "pane" ] && [ "$3" = "open" ]; then
   echo '{"id":"cli:plugin:pane:open","result":{"plugin_pane":{"pane":{"pane_id":"w9:p9"}},"type":"plugin_pane"}}'
   exit 0
@@ -215,11 +238,20 @@ test("fanout.sh opens the fan-out pane through the wrapper on 0.7.4", () => {
 	assert.equal(fs.existsSync(path.join(stateDir, "lock-fanout-open")), false);
 });
 
-test("fanout.sh refuses on 0.7.5 before opening anything", () => {
+// Issue #1: fan-out now runs on 0.7.5 too (the pane path), so the action must
+// open the pane there instead of refusing on the version fresh installers run.
+test("fanout.sh opens the fan-out pane on 0.7.5 as well", () => {
 	const { env } = setup({ STUB_HERDR_VERSION: "0.7.5" });
 	const r = runScript("fanout.sh", [], env);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /plugin pane open --plugin structupath\.swarm --entrypoint fanout-pane/);
+});
+
+test("fanout.sh refuses below the 0.7.4 floor before opening anything", () => {
+	const { env } = setup({ STUB_HERDR_VERSION: "0.7.3" });
+	const r = runScript("fanout.sh", [], env);
 	assert.notEqual(r.status, 0);
-	assert.match(r.stderr, /needs herdr 0\.7\.4/);
+	assert.match(r.stderr, /needs herdr 0\.7\.4 or newer/);
 	assert.doesNotMatch(log(), /pane open/);
 });
 
@@ -356,12 +388,106 @@ test("an active run refuses fan-out with 'harvest or abort' before any create", 
 	assert.doesNotMatch(log(), /worktree create/);
 });
 
-test("stub 0.7.5 refuses fan-out in the pane before any create (R13)", () => {
-	const { repo, env } = setup({ STUB_HERDR_VERSION: "0.7.5" });
+test("stub 0.7.3 refuses fan-out in the pane before any create (R13)", () => {
+	const { repo, env } = setup({ STUB_HERDR_VERSION: "0.7.3" });
 	const r = runPane(lines(["1", "", "Nope", ".", ""]), env, repo);
 	assert.equal(r.status, 18, r.stderr); // PF_EC_VERSION
-	assert.match(r.stderr, /needs herdr 0\.7\.4/);
+	assert.match(r.stderr, /needs herdr 0\.7\.4 or newer/);
 	assert.doesNotMatch(log(), /worktree create/);
+});
+
+// --- fan-out pane on herdr 0.7.5 (issue #1) ----------------------------------
+
+// The end-to-end proof the issue asks for: an ARBITRARY (non-whitelisted)
+// command becomes a running slot on 0.7.5, so R2 survives the version that
+// deleted the arbitrary-argv `agent start`.
+test("stub 0.7.5: fan-out completes end-to-end with an arbitrary command as the slot agent", () => {
+	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
+	// Not one of herdr's ~14 integration kinds — exactly the case 0.7.5's
+	// --kind whitelist cannot express.
+	fs.writeFileSync(path.join(cfg, "presets.conf"), "custom|argv|my-agent --loop\n");
+	writeStub("my-agent", "exit 0");
+	const { repo, wtRoot, env } = setup({
+		STUB_HERDR_VERSION: "0.7.5",
+		HERDR_PLUGIN_CONFIG_DIR: cfg,
+	});
+	const r = runPane(lines(["2", "", "", "Do the thing", ".", "", ""]), env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /created 2, started 2, failed 0/);
+
+	const calls = log().split("\n").filter((l) => l.startsWith("herdr "));
+	// Not a single agent start on this path — and never a --kind.
+	assert.doesNotMatch(log(), /agent start/);
+	assert.doesNotMatch(log(), /--kind/);
+	assert.equal(calls.filter((l) => /worktree create/.test(l)).length, 2);
+	assert.equal(calls.filter((l) => /pane split/.test(l)).length, 2);
+	assert.equal(calls.filter((l) => /pane run/.test(l)).length, 2);
+	assert.equal(calls.filter((l) => /pane report-agent/.test(l)).length, 2);
+
+	const m = readManifest();
+	assert.equal(m.slots.length, 2);
+	for (const s of m.slots) {
+		assert.equal(s.status, "running");
+		assert.equal(s.branch, `swarm/${m.run_id}/s${s.slot}-custom`);
+		assert.ok(s.path.startsWith(wtRoot), `path from response: ${s.path}`);
+		// Ids come from the SPLIT response, and each slot got its own pane.
+		assert.match(s.pane_id, /^wD:p\d+$/);
+		assert.match(s.terminal_id, /^term_split\d+$/);
+		assert.equal(s.workspace_id, "wD");
+
+		// Per slot, the three calls happen in order, against THIS slot's
+		// worktree and THIS slot's pane: split (in the worktree) → run (the
+		// argv) → report-agent (working). A run before the split, or a split
+		// without the worktree cwd, puts the agent in the server's cwd.
+		const iSplit = calls.findIndex((l) => l.includes(`pane split`) && l.includes(`--cwd ${s.path} `));
+		assert.ok(iSplit >= 0, `split targeted ${s.path}:\n${calls.join("\n")}`);
+		assert.match(calls[iSplit], /--no-focus/);
+		const iRun = calls.findIndex((l) => l.startsWith(`herdr pane run ${s.pane_id} `));
+		const iRep = calls.findIndex((l) => l.startsWith(`herdr pane report-agent ${s.pane_id} `));
+		assert.ok(iSplit < iRun, "split before run");
+		assert.ok(iRun < iRep, "run before report-agent");
+		// The preset's argv reaches the pane verbatim.
+		assert.equal(calls[iRun], `herdr pane run ${s.pane_id} my-agent --loop`);
+		assert.equal(
+			calls[iRep],
+			`herdr pane report-agent ${s.pane_id} --source structupath.swarm --agent ${s.agent_name} --state working`,
+		);
+	}
+	// Same write-ahead contract as the 0.7.4 branch: the pending row with a
+	// recorded path was on disk before the pane that starts the agent existed.
+	const atSplit = JSON.parse(fs.readFileSync(path.join(stateDir, "snap-split-1.json"), "utf8"));
+	assert.equal(atSplit.slots[0].status, "pending");
+	assert.ok(atSplit.slots[0].path, "path recorded before the slot's pane was split");
+	// Real worktrees on real branches, same as 0.7.4.
+	for (const s of m.slots) {
+		assert.ok(fs.existsSync(path.join(s.path, ".swarm-task.md")), `task file in ${s.path}`);
+	}
+});
+
+// A slot failing on the 0.7.5 path must behave exactly like one failing on the
+// 0.7.4 path: keep the earlier slots, mark this one failed, keep going (R4).
+test("stub 0.7.5: a pane-split failure fails only its own slot", () => {
+	const { repo, env } = setup({
+		STUB_HERDR_VERSION: "0.7.5",
+		STUB_FAIL_SPLIT_MATCH: "s2-",
+	});
+	const r = runPane(lines(["3", "", "", "", "Task", ".", "", "", ""]), env, repo);
+	assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+	const m = readManifest();
+	assert.deepEqual(m.slots.map((s) => s.status), ["running", "failed", "running"]);
+	// The worktree WAS created before the start failed, so the failed slot
+	// keeps its recorded path — that is what makes it reapable by abort.
+	assert.ok(m.slots[1].path, "failed slot keeps its write-ahead path");
+	// Its ids are still the worktree ROOT pane's, written write-ahead by
+	// create — never a split pane's, because no split ever succeeded.
+	assert.equal(m.slots[1].pane_id, "wD:p1");
+	assert.equal(m.slots[1].terminal_id, "term_root");
+	assert.match(r.stdout, /created 3, started 2, failed 1/);
+	assert.match(r.stderr, /slot 2 FAILED/);
+	// No orphan: the failing slot never got a pane, so nothing was left to run
+	// argv in — and no report-agent advertised a slot that is not working.
+	assert.equal(log().split("\n").filter((l) => /pane run/.test(l)).length, 2);
+	assert.equal(log().split("\n").filter((l) => /pane report-agent/.test(l)).length, 2);
 });
 
 // --- fan-out pane: task file, overrides, presets, detritus --------------------

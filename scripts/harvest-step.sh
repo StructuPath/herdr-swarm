@@ -123,12 +123,26 @@ read_slot() {
 			process.stdout.write([
 				r.label ?? "", r.branch ?? "", r.path ?? "", r.status ?? "",
 				r.backup_ref ?? "", r.terminal_id ?? "", r.pane_id ?? "",
-				r.workspace_id ?? "", JSON.stringify(r.journal ?? null),
+				r.workspace_id ?? "", r.agent_name ?? "",
+				JSON.stringify(r.journal ?? null),
 			].join("\x1f"));
 		});
 	' "$slot")" || return 1
+	# Journal stays LAST: `read` gives the final variable everything that is
+	# left, so a field added after it would be swallowed into the JSON.
 	IFS="$US" read -r SLOT_LABEL SLOT_BRANCH SLOT_PATH SLOT_STATUS SLOT_BACKUP \
-		SLOT_TERMINAL SLOT_PANE SLOT_WS SLOT_JOURNAL <<<"$line"
+		SLOT_TERMINAL SLOT_PANE SLOT_WS SLOT_AGENT SLOT_JOURNAL <<<"$line"
+}
+
+# _preview_report_idle: mirror "this slot has stopped working" into its
+# plugin-reported agent state. Preview is the ONE place the plugin re-inspects
+# a live slot after fan-out, so it is the only non-daemon hook available — and
+# a 0.7.5 slot, being plugin-reported rather than natively detected, would
+# otherwise sit at "working" in `agent list` forever after it was harvested.
+# No-op on 0.7.4 (herdr's own detection owns state there) and best-effort
+# always: see report_slot_agent_state in lib.sh.
+_preview_report_idle() {
+	report_slot_agent_state "$SLOT_PANE" "$SLOT_AGENT" idle
 }
 
 # journal_field <json> <field> — empty string for null/absent.
@@ -291,6 +305,7 @@ do_preview() {
 	case "$SLOT_STATUS" in
 	merged | skipped | archived | failed)
 		printf 'state\t%s\n' "$SLOT_STATUS"
+		_preview_report_idle
 		return 0
 		;;
 	esac
@@ -322,6 +337,7 @@ do_preview() {
 		# the archivable band without a pointless "merge nothing" prompt.
 		printf 'state\tempty\n'
 		manifest_update_slot "$1" '{"status":"skipped"}' || return 1
+		_preview_report_idle
 		return 0
 	fi
 	if [ "$tip" != "$FORK_SHA" ] &&
@@ -330,6 +346,7 @@ do_preview() {
 		# re-merging into "Already up to date" (plan: externally-merged detect).
 		printf 'state\texternal_merged\n'
 		manifest_update_slot "$1" '{"status":"merged"}' || return 1
+		_preview_report_idle
 		return 0
 	fi
 	if [ "$n" -gt 0 ]; then

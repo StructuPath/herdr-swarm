@@ -145,10 +145,17 @@ with_timeout() {
 	return $?
 }
 
-# First pane_id in herdr JSON output. Whitespace-stripped first so compact
-# and pretty-printed responses both parse (pane ids never contain spaces).
+# parse_json_field <field> <json>: first "<field>":"<string>" in herdr JSON.
+# Whitespace-stripped first so compact and pretty-printed responses both parse
+# — which also means it can only read values that contain no whitespace (ids,
+# never a cwd path). grep, not node, because the herdr wrappers must stay
+# usable on the pane paths that run before require_node.
+parse_json_field() {
+	printf '%s' "$2" | tr -d ' \n\r\t' | grep -o "\"$1\":\"[^\"]*\"" | head -n1 | cut -d'"' -f4
+}
+
 parse_pane_id() {
-	printf '%s' "$1" | tr -d ' \n\r\t' | grep -o '"pane_id":"[^"]*"' | head -n1 | cut -d'"' -f4
+	parse_json_field pane_id "$1"
 }
 
 pane_alive() {
@@ -227,12 +234,39 @@ herdr_version() {
 	esac
 }
 
+# version_ge <a> <b>: true when dotted version a >= b. Field-wise NUMERIC
+# compare, deliberately not a string compare: lexically "0.7.10" sorts below
+# "0.7.9", which would refuse a newer herdr as too old — the exact failure
+# this gate exists to avoid. Trailing non-digits in a field (rc/beta suffixes)
+# are dropped rather than compared: ordering pre-releases is out of scope, and
+# a `[ -gt ]` on "5-rc1" would abort the gate with a syntax error.
+version_ge() {
+	local a="${1-}" b="${2-}" af bf
+	while [ -n "$a" ] || [ -n "$b" ]; do
+		af="${a%%.*}"
+		bf="${b%%.*}"
+		af="${af%%[!0-9]*}"
+		bf="${bf%%[!0-9]*}"
+		[ -n "$af" ] || af=0
+		[ -n "$bf" ] || bf=0
+		[ "$af" -gt "$bf" ] && return 0
+		[ "$af" -lt "$bf" ] && return 1
+		case "$a" in *.*) a="${a#*.}" ;; *) a="" ;; esac
+		case "$b" in *.*) b="${b#*.}" ;; *) b="" ;; esac
+	done
+	return 0
+}
+
 # version_gate <gated|intersection>
-# 'gated' guards the one call with no 0.7.4/0.7.5 intersection form
-# (agent start --cwd/--workspace; 0.7.5 replaced it with pane targeting):
-# only 0.7.4 passes, everything else refuses with the escape hatch named.
-# 'intersection' calls survive the 0.7.4→0.7.5 break: never refused, but a
-# version above the max tested gets a warning (behavior unverified there).
+# 'gated' guards fan-out, the only flow that CREATES herdr topology. It runs
+# on two different code paths — `agent start --cwd/--workspace` on 0.7.4, and
+# pane split + pane run + report-agent on 0.7.5+ (both live-verified;
+# spike-out/l-075-verified.txt) — so the gate is now a floor, not a pin:
+# below 0.7.4 neither path exists. herdr_agent_start picks the path.
+# 'intersection' calls survive the 0.7.4→0.7.5 break untouched and are never
+# refused. Both classes warn above the max tested version (R13): untested is
+# not the same as unsupported, and refusing would strand users on every herdr
+# release until this repo catches up.
 version_gate() {
 	local class="${1-}" v
 	v="$(herdr_version)" || {
@@ -241,27 +275,22 @@ version_gate() {
 	}
 	case "$class" in
 	gated)
-		case "$v" in
-		0.7.4) return 0 ;;
-		*)
-			echo "herdr-swarm: fan-out needs herdr 0.7.4 (agent start --cwd/--workspace); herdr $v has no compatible form. Harvest and cleanup of an existing run still work." >&2
+		if ! version_ge "$v" "0.7.4"; then
+			echo "herdr-swarm: fan-out needs herdr 0.7.4 or newer (no topology-creating form exists below it); herdr $v has no compatible form. Harvest and cleanup of an existing run still work." >&2
 			return 1
-			;;
-		esac
+		fi
 		;;
-	intersection)
-		case "$v" in
-		0.7.4 | 0.7.5) ;;
-		*) echo "herdr-swarm: warning: herdr $v is newer than tested ($HERDR_SWARM_MAX_TESTED); proceeding." >&2 ;;
-		esac
-		return 0
-		;;
+	intersection) ;;
 	*)
 		# Fail closed: a typo'd class must never silently pass a gated call.
 		echo "herdr-swarm: internal error: unknown version_gate class '$class'" >&2
 		return 1
 		;;
 	esac
+	if ! version_ge "$HERDR_SWARM_MAX_TESTED" "$v"; then
+		echo "herdr-swarm: warning: herdr $v is newer than tested ($HERDR_SWARM_MAX_TESTED); proceeding." >&2
+	fi
+	return 0
 }
 
 # --- Named herdr wrappers ----------------------------------------------------
@@ -297,12 +326,166 @@ herdr_worktree_list() {
 	with_timeout 10 "$HERDR" worktree list "$@" --json
 }
 
-# THE gated call: `agent start --cwd/--workspace` exists only on 0.7.4. The
-# 0.7.5 pane-targeting variant lands as a second branch inside this same
-# function (the seam the plan reserves) — never at a call site.
+# THE gated call, and THE seam: two herdr topologies behind one contract.
+#
+# Callers always pass the 0.7.4 argv shape — `<name> [--workspace WS]
+# [--split-from PANE] --cwd PATH [--no-focus] -- <argv…>` — and always get the
+# 0.7.4 agent-start JSON back, so no call site learns which path ran.
+#
+#   0.7.4: `agent start --cwd/--workspace` builds the topology itself.
+#   0.7.5+: that form is gone. `--kind` replaced it and is a CLOSED whitelist
+#           validated server-side ("unsupported interactive agent kind"), with
+#           no custom/shell/exec member — an arbitrary binary CANNOT be a
+#           tracked agent there (live-verified, spike-out/l-075-verified.txt).
+#           R2 (agent-agnostic slots) therefore cannot go through `agent start`
+#           at all, so we build the topology ourselves instead: split a pane in
+#           the worktree, run the slot's argv in it, report the agent state
+#           herdr can no longer detect for us.
 herdr_agent_start() {
+	local v
 	version_gate gated || return 1
-	with_timeout 15 "$HERDR" agent start "$@"
+	v="$(herdr_version)" || return 1
+	if version_ge "$v" "0.7.5"; then
+		_agent_start_via_pane "$@"
+	else
+		_agent_start_native "$@"
+	fi
+}
+
+# 0.7.4 path: verbatim passthrough, minus --split-from. The flag exists only
+# for the 0.7.5 path; forwarding it would make 0.7.4's own arg parser reject
+# the start, so it is dropped here rather than made conditional at the call
+# site (the call site must stay path-blind).
+_agent_start_native() {
+	local -a args=()
+	# A no-arg call is a caller bug; say so, because on macOS's bash 3.2
+	# "${args[@]}" of an EMPTY array under `set -u` dies as "unbound
+	# variable" — a message that names neither this function nor the mistake.
+	if [ $# -eq 0 ]; then
+		echo "herdr-swarm: internal error: herdr_agent_start called with no arguments" >&2
+		return 1
+	fi
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--split-from)
+			shift 2
+			;;
+		*)
+			args+=("$1")
+			shift
+			;;
+		esac
+	done
+	with_timeout 15 "$HERDR" agent start "${args[@]}"
+}
+
+# 0.7.5+ path: pane split (in the worktree) → pane run (the slot's argv) →
+# report-agent (so the slot is an agent to `agent list` and the status pane).
+# Emits a synthesized 0.7.4-shaped agent-start response — normalizing HERE,
+# not at the call site, is the whole point of the seam.
+_agent_start_via_pane() {
+	local name="${1-}" ws="" cwd="" from="" out pane term pws
+	local -a argv=()
+	shift || true
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--workspace)
+			ws="${2-}"
+			shift 2
+			;;
+		--cwd)
+			cwd="${2-}"
+			shift 2
+			;;
+		--split-from)
+			from="${2-}"
+			shift 2
+			;;
+		# `pane split` gets its own --no-focus below; the caller's copy is
+		# consumed here rather than forwarded blindly.
+		--no-focus) shift ;;
+		--)
+			shift
+			argv=("$@")
+			break
+			;;
+		*)
+			# Never drop an unknown flag: a caller-requested option silently
+			# discarded on 0.7.5 would start the slot with settings the user
+			# got on 0.7.4 and never got here — a difference nothing reports.
+			echo "herdr-swarm: internal error: herdr_agent_start cannot translate '$1' to the 0.7.5 pane path" >&2
+			return 1
+			;;
+		esac
+	done
+
+	# The agent label is interpolated into the JSON this function synthesizes
+	# and passed to herdr as --agent; callers build it from sanitize_slug'd
+	# parts, so anything else is a bug upstream, not input to escape.
+	case "$name" in
+	'' | *[!a-zA-Z0-9_-]*)
+		echo "herdr-swarm: internal error: agent name '$name' is not slug-safe" >&2
+		return 1
+		;;
+	esac
+	# --cwd is the whole reason this path exists: a split without it inherits
+	# the herdr server's cwd (spike (k)), so the agent would run in whatever
+	# repo the server happened to sit in instead of the slot's worktree.
+	if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+		echo "herdr-swarm: internal error: herdr_agent_start needs an existing --cwd (got '$cwd')" >&2
+		return 1
+	fi
+	# `pane split` has no --workspace (live-verified: it takes a PANE_ID and
+	# splits that pane's workspace). Without an explicit anchor it would split
+	# the FOCUSED pane — the user's own, in some unrelated workspace.
+	if [ -z "$from" ]; then
+		echo "herdr-swarm: internal error: herdr_agent_start needs --split-from <pane id> on herdr 0.7.5+" >&2
+		return 1
+	fi
+	if [ "${#argv[@]}" -eq 0 ]; then
+		echo "herdr-swarm: internal error: herdr_agent_start got no agent argv after '--'" >&2
+		return 1
+	fi
+
+	out="$(herdr_pane_split "$from" --direction down --cwd "$cwd" --no-focus)" || {
+		echo "herdr-swarm: pane split failed for $name" >&2
+		return 1
+	}
+	pane="$(parse_json_field pane_id "$out")"
+	term="$(parse_json_field terminal_id "$out")"
+	pws="$(parse_json_field workspace_id "$out")"
+	# The split's own workspace is authoritative (it inherits the anchor
+	# pane's); the caller's --workspace is only a fallback for a response
+	# that omitted the field.
+	[ -n "$pws" ] || pws="$ws"
+	if [ -z "$pane" ]; then
+		echo "herdr-swarm: pane-split response has no pane_id" >&2
+		return 1
+	fi
+
+	if ! herdr_pane_run "$pane" "${argv[@]}"; then
+		# Close the pane we just made: the caller records ids only from a
+		# SUCCESSFUL start, so an empty split left behind here is a pane no
+		# manifest row names and no abort sweep can reap.
+		herdr_pane_close "$pane" >/dev/null 2>&1 || true
+		echo "herdr-swarm: pane run failed for $name" >&2
+		return 1
+	fi
+
+	# Plugin-reported, because herdr cannot detect an arbitrary binary as an
+	# agent on 0.7.5. Best-effort: the slot IS running by now, and agent state
+	# is advisory everywhere in this plugin (harvest never gates on it), so
+	# failing the slot over a status-only call would destroy real work to
+	# protect a cosmetic.
+	herdr_report_agent "$pane" --agent "$name" --state working >/dev/null 2>&1 ||
+		echo "herdr-swarm: warning: could not report agent state for $name — the status pane will show it as unknown" >&2
+
+	# The 0.7.4 agent_started shape, rebuilt from what the split returned:
+	# this is the output contract every caller parses (name/pane/terminal/
+	# workspace). Ids come from herdr's own JSON and the name is slug-checked
+	# above, so no field here can carry a quote.
+	printf '{"id":"cli:pane:split","result":{"agent":{"name":"%s","pane_id":"%s","terminal_id":"%s","workspace_id":"%s"},"type":"agent_started"}}\n' \
+		"$name" "$pane" "$term" "$pws"
 }
 
 herdr_agent_list() {
@@ -351,6 +534,49 @@ herdr_workspace_close() {
 
 herdr_report_metadata() {
 	with_timeout 5 "$HERDR" pane report-metadata "$@"
+}
+
+# 15s: a split does real terminal setup — the same budget as the 0.7.4
+# `agent start` it stands in for.
+herdr_pane_split() {
+	with_timeout 15 "$HERDR" pane split "$@"
+}
+
+# `pane run <pane_id> <command>…` TYPES the command into the pane's SHELL —
+# live-verified on 0.7.5 (`pane run <id> echo '$HOME'` printed the expanded
+# home directory), so this is not an exec. argv elements are passed as
+# separate COMMAND arguments because that is the CLI's own signature; herdr
+# joins them with single spaces, which is exactly the whitespace-split argv
+# presets.sh already documents. A preset carrying shell metacharacters IS
+# interpreted here (unlike the 0.7.4 exec path) — README says so, and
+# presets.conf is user-owned config, the same trust level as the binary it
+# names.
+herdr_pane_run() {
+	with_timeout 10 "$HERDR" pane run "$@"
+}
+
+# --source is pinned to this plugin's id, like herdr_pane_open pins --plugin:
+# herdr keys reported agent rows by source, so a call site inventing its own
+# would orphan a row no later report of ours could ever update.
+herdr_report_agent() {
+	local pane="${1-}"
+	shift || true
+	with_timeout 5 "$HERDR" pane report-agent "$pane" --source "$PLUGIN_ID" "$@"
+}
+
+# report_slot_agent_state <pane_id> <agent label> <idle|working|blocked|unknown>
+# Correct a plugin-reported slot's agent state. NO-OP below 0.7.5: there herdr
+# detects the slot's agent natively, and a plugin report would fight that
+# detection rather than add to it. Best-effort by contract — agent state is
+# advisory everywhere in this plugin, so this must never fail a caller whose
+# real job is merging or archiving work.
+report_slot_agent_state() {
+	local pane="${1-}" label="${2-}" state="${3-}" v
+	[ -n "$pane" ] && [ -n "$label" ] && [ -n "$state" ] || return 0
+	v="$(herdr_version 2>/dev/null)" || return 0
+	version_ge "$v" "0.7.5" || return 0
+	herdr_report_agent "$pane" --agent "$label" --state "$state" >/dev/null 2>&1 || true
+	return 0
 }
 
 # --- Singleton panes and pane linger -----------------------------------------

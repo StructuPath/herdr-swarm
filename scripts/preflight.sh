@@ -211,9 +211,10 @@ preflight_check_active_run() {
 	return 0
 }
 
-# Fan-out needs the one gated call (`agent start --cwd/--workspace`, 0.7.4
-# only) — reuse the lib gate, remapped into the preflight code space so the
-# pane can tell "wrong herdr" from every other refusal.
+# Fan-out needs one of the two topology-creating paths (`agent start --cwd` on
+# 0.7.4, pane split + pane run + report-agent on 0.7.5+) — reuse the lib gate,
+# remapped into the preflight code space so the pane can tell "wrong herdr"
+# from every other refusal.
 preflight_check_version() {
 	version_gate gated || return "$PF_EC_VERSION"
 }

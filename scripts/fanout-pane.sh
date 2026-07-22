@@ -19,6 +19,9 @@
 # stay a superset of git/herdr reality at every instant):
 #   pending row (branch known, path null) → worktree create → record
 #   path/ids → task file → agent start (explicit --cwd) → row running.
+# "agent start" here means herdr_agent_start, which is `agent start --cwd` on
+# 0.7.4 and pane split + pane run + report-agent on 0.7.5+; this loop is
+# deliberately blind to which (lib.sh owns the version seam).
 set -uo pipefail
 
 PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -320,8 +323,8 @@ SWARM_REPO="$(resolve_repo_root 2>/dev/null || true)"
 export SWARM_REPO
 
 preflight_check_repo || fatal $?
-# Version before anything herdr-shaped: on 0.7.5 nothing may be created and
-# nothing else is worth prompting for (R13).
+# Version before anything herdr-shaped: below the 0.7.4 floor nothing may be
+# created and nothing else is worth prompting for (R13).
 preflight_check_version || fatal $?
 base_ref="$(preflight_resolve_base)" || fatal $?
 preflight_check_submodules || fatal $?
@@ -511,8 +514,15 @@ for ((i = 1; i <= n; i++)); do
 	agent_name="swarm-$run_id-$slug"
 	start_args=("$agent_name")
 	[ -n "$slot_ws" ] && start_args+=(--workspace "$slot_ws")
-	# --cwd is EXPLICIT and mandatory: --workspace alone does NOT put the
-	# agent in the worktree — it inherits the server's cwd (spike (k)).
+	# --split-from: the anchor the 0.7.5 path splits to build the slot's
+	# topology itself (`pane split` takes a PANE_ID and has no --workspace, so
+	# without an anchor it would split the user's focused pane). The worktree's
+	# own root pane is that anchor. The 0.7.4 branch drops the flag — which
+	# path runs is lib.sh's business, not this loop's.
+	[ -n "$root_pane_id" ] && start_args+=(--split-from "$root_pane_id")
+	# --cwd is EXPLICIT and mandatory on both paths: --workspace alone does
+	# NOT put the agent in the worktree — it inherits the server's cwd
+	# (spike (k)).
 	start_args+=(--cwd "$wt_path" --no-focus -- "${argv_arr[@]}")
 	if ! sout="$(herdr_agent_start "${start_args[@]}")"; then
 		mark_failed "$i" "agent start failed"

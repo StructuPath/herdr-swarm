@@ -383,6 +383,36 @@ test("preview: externally merged slot auto-marks merged; empty slot auto-skips; 
 	assert.doesNotMatch(r.stdout, /swarm-task/);
 });
 
+// A 0.7.5 slot is PLUGIN-reported, not natively detected, so nothing updates
+// its agent state on its own. Preview is the one hook the plugin already has:
+// when it concludes a slot has stopped working, it says so — otherwise every
+// harvested slot would sit at "working" in `agent list` forever. On 0.7.4
+// herdr's own detection owns state and the plugin must stay out of the way.
+test("preview reports a finished slot idle on 0.7.5, and never reports on 0.7.4", () => {
+	const run = mkRun({ slots: 2 });
+	// Slot 1: no commits, clean tree -> empty -> auto-skipped -> not working.
+	let r = step(run, "preview", [1], { STUB_HERDR_VERSION: "0.7.5" });
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /state\tempty/);
+	assert.match(
+		h.log(),
+		/pane report-agent w11:p1 --source structupath\.swarm --agent claude --state idle/,
+	);
+	// A slot still doing work is left alone — reporting idle on a live agent
+	// would be a lie the status pane then displays.
+	fs.writeFileSync(path.join(run.wt(2), "wip.txt"), "dirty\n");
+	const before = h.log();
+	r = step(run, "preview", [2], { STUB_HERDR_VERSION: "0.7.5" });
+	assert.match(r.stdout, /state\tdirty/);
+	assert.equal(h.log(), before, "no report for a slot that is still working");
+	// Same finished slot on 0.7.4: herdr detects the agent itself there. The
+	// stub log is cumulative for this run's env, so compare the DELTA.
+	const before074 = h.log();
+	const on074 = step(run, "preview", [1]);
+	assert.equal(on074.status, 0, on074.stderr);
+	assert.doesNotMatch(h.log().slice(before074.length), /report-agent/);
+});
+
 test("preview reports base_sha, locus, and the three-dot diffstat for a clean slot", () => {
 	const run = mkRun();
 	commitIn(run.wt(1), "feat.txt");

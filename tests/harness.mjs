@@ -256,6 +256,17 @@ if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
   echo '{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"idle","cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","focused":false,"foreground_cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","pane_id":"w9:p4","revision":3,"screen_detection_skipped":true,"tab_id":"w9:t1","terminal_id":"term_abc123","terminal_title":"claude","terminal_title_stripped":"claude","workspace_id":"w9"}],"type":"agent_list"}}'
   exit 0
 fi
+if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
+  # Mirrors the real 0.7.5 pane_info result captured live (spike pane-split-cwd
+  # + the 0.7.5 re-probe): ids the 0.7.5 fan-out path reads live in result.pane.
+  echo '{"id":"cli:pane:split","result":{"pane":{"agent_status":"unknown","focused":false,"pane_id":"w9:p7","revision":0,"tab_id":"w9:t1","terminal_id":"term_split7","workspace_id":"w9"},"type":"pane_info"}}'
+  exit 0
+fi
+if [ "$1" = "pane" ] && [ "$2" = "report-agent" ]; then
+  # Live-verified: report-agent prints NOTHING on success. The 0.7.5 path must
+  # therefore synthesize its own response, never parse one back.
+  exit 0
+fi
 if [ "$1" = "pane" ] && [ "$2" = "read" ]; then exit "\${STUB_PANE_ALIVE:-1}"; fi
 exit 0`,
 		);

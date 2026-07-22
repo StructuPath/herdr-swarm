@@ -13,9 +13,11 @@
 #
 # - `name` must survive sanitize_slug unchanged ([a-zA-Z0-9_-]): it becomes
 #   part of branch names and worktree paths, an rm -rf-class surface.
-# - `kind` is reserved for 0.7.5 forward-compat (the deferred pane-based
-#   agent start dispatches on integration kind there — plan U4); v1 accepts
-#   any non-empty value and always treats `args` as argv.
+# - `kind` is INERT. It was reserved for dispatching on herdr's integration
+#   kind on 0.7.5, but that turned out to be a closed whitelist with no
+#   arbitrary-argv member (spike l), so the 0.7.5 path builds slot topology
+#   itself (lib.sh herdr_agent_start) and `args` is always argv. Any non-empty
+#   value is accepted; the field stays so existing presets.conf keeps parsing.
 # - `args` is the agent argv, split on whitespace at spawn time — no shell
 #   quoting support (KISS v1); it may contain further `|` chars verbatim.
 # - Blank lines and lines whose first non-space char is `#` are ignored.

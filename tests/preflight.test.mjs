@@ -102,12 +102,14 @@ test("every preflight refusal has a distinct exit code and an actionable message
 			pre: () => fs.writeFileSync(manifestFile, sampleManifest()),
 		},
 		{
+			// 0.7.3, not 0.7.5: since issue #1 the gate is a FLOOR, and 0.7.5
+			// is a supported fan-out path (the pane path), not a refusal.
 			name: "unsupported herdr version",
 			fn: "preflight_check_version",
 			code: 18,
-			msg: /needs herdr 0\.7\.4/,
+			msg: /needs herdr 0\.7\.4 or newer/,
 			cwd: () => makeRepo(),
-			env: { STUB_HERDR_VERSION: "0.7.5" },
+			env: { STUB_HERDR_VERSION: "0.7.3" },
 		},
 		{
 			name: "slot cap exceeded",

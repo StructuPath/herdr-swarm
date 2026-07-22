@@ -9,12 +9,28 @@ at a time. Agents commit locally and never push; the orchestrator merges.
 
 ## Requirements
 
-- **herdr 0.7.4** — exactly, for fan-out: 0.7.5 replaced `agent start
-  --cwd/--workspace` with a pane-targeting form whose `--kind` whitelist has
-  no arbitrary-argv path, so fan-out refuses there with a clear message.
-  Harvest, abort, and prune of an *existing* run still work on 0.7.5 (they
-  are mostly git). Marketplace listing is deferred until an arbitrary-argv
-  start path exists on current herdr — see [Publishing](#publishing).
+- **herdr 0.7.4 or newer.** Fan-out works on both 0.7.4 and 0.7.5+, by two
+  different routes, because 0.7.5 replaced `agent start --cwd/--workspace`
+  with a pane-targeting form whose `--kind` is a closed whitelist with no
+  arbitrary-argv member:
+  - On **0.7.4**, `agent start --cwd` builds each slot and herdr detects the
+    agent natively, so slot state in the status pane is herdr's own.
+  - On **0.7.5+**, the plugin builds each slot itself — `pane split` into the
+    worktree, `pane run` for the slot's argv, `pane report-agent` to register
+    it — so slots run *any* command, but their state is **plugin-reported**:
+    `working` when the slot starts, `idle` once a harvest preview finds the
+    slot finished. Nothing polls in between, so a 0.7.5 slot that finishes on
+    its own still reads `working` until you open harvest. This is cosmetic:
+    committed work is harvestable regardless, and nothing in the plugin gates
+    on agent state.
+  - On **0.7.5+**, `pane run` hands the slot's argv to the pane's **shell**,
+    not to `exec` — a preset containing shell metacharacters is interpreted
+    there, unlike on 0.7.4. Presets are your own config, but keep them to a
+    plain command and its flags.
+
+  Harvest, abort, and prune of an existing run work on every supported
+  version (they are mostly git). Versions above the newest tested get a
+  warning, never a refusal.
 - **git >= 2.38** recommended (relies on `git worktree`, three-arg
   `git update-ref` compare-and-swap, and `git merge-base --is-ancestor`).
 - **Node.js >= 20** on your PATH (manifest handling and the pane renderers).
@@ -114,8 +130,11 @@ codex-fast|argv|codex --profile fast
 
 - `name` — letters, digits, `_`, `-` only (it becomes part of branch and
   worktree names).
-- `kind` — reserved for future 0.7.5 support (integration-kind dispatch); v1
-  accepts any non-empty value and always treats `args` as argv.
+- `kind` — inert. It was reserved for dispatching on herdr's integration kind
+  on 0.7.5, but that path turned out to be a closed whitelist with no
+  arbitrary-argv member, so the plugin builds slot topology itself instead and
+  always treats `args` as argv. Any non-empty value is accepted; the field
+  stays for config compatibility.
 - `args` — split on whitespace at spawn time; no shell quoting.
 - Missing or empty file yields two built-in defaults: `claude` and `codex`.
   A malformed line fails the whole catalog loudly rather than being skipped.
@@ -181,11 +200,10 @@ want a truly clean slate. Plugin logs:
 
 ## Publishing
 
-This repo deliberately does **not** carry the `herdr-plugin` marketplace topic
-yet: fan-out refuses on herdr 0.7.5 (the current latest stable), and listing a
-fan-out tool whose entry point refuses on the version fresh installers run
-would be a first-use dead end. The topic push waits until an arbitrary-argv
-agent-start path exists there. The repo is private for now; `herdr plugin link`
-against a local clone is the supported install path.
+This repo does not carry the `herdr-plugin` marketplace topic yet. The reason
+it was deferred is gone — fan-out no longer refuses on current stable — but
+adding the topic is a separate decision, not an automatic consequence. The
+repo is private for now; `herdr plugin link` against a local clone is the
+supported install path.
 
 MIT © StructuPath
