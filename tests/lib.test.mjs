@@ -263,6 +263,35 @@ test("no raw herdr invocations outside lib.sh wrappers (scripts/ and bin/)", () 
 	assert.deepEqual(offenders, [], "raw herdr invocations outside lib.sh");
 });
 
+// The pane titles in herdr-plugin.toml ARE the cleanup sweep labels (pane
+// list reports them as "label"), and preflight.sh re-declares them as a
+// hardcoded set for abort's corrupt-manifest sweep. A rename on one side
+// alone silently narrows the safety net to nothing, with no runtime error —
+// this test is the lockstep.
+test("preflight's pane-title sweep set matches the manifest's [[panes]] titles exactly", () => {
+	const toml = fs.readFileSync(path.join(repoRoot, "herdr-plugin.toml"), "utf8");
+	// [[panes]] blocks only: [[actions]] also has `title =` keys, and only the
+	// pane titles are sweep labels.
+	const paneTitles = toml
+		.split(/^\[\[/m)
+		.filter((block) => block.startsWith("panes]]"))
+		.map((block) => block.match(/^\s*title\s*=\s*"([^"]+)"/m))
+		.filter(Boolean)
+		.map((m) => m[1]);
+	assert.equal(paneTitles.length, 3, "manifest declares all three panes");
+
+	const pf = fs.readFileSync(path.join(repoRoot, "scripts", "preflight.sh"), "utf8");
+	const set = pf.match(/const titles = new Set\(\[([^\]]*)\]\)/);
+	assert.ok(set, "preflight.sh still declares a hardcoded pane-title set");
+	const swept = [...set[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+
+	assert.deepEqual(
+		[...swept].sort(),
+		[...paneTitles].sort(),
+		"preflight.sh sweep titles drifted from herdr-plugin.toml [[panes]] titles",
+	);
+});
+
 test("every script the manifest references exists on disk", () => {
 	const toml = fs.readFileSync(path.join(repoRoot, "herdr-plugin.toml"), "utf8");
 	const refs = [...toml.matchAll(/"scripts\/([^"]+)"/g)].map((m) => m[1]);

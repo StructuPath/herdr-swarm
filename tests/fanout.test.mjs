@@ -412,6 +412,92 @@ test("detritus prompt: choosing delete clears the leftovers and the fan-out proc
 	assert.equal(readManifest().slots.length, 1, "new run created after cleanup");
 });
 
+// A leftover branch git refuses to delete holds committed agent work that is
+// in no other ref — the abort→re-fanout path must not reach `-D` on the same
+// single keystroke that clears merged leftovers.
+function seedUnmergedLeftover(repo, branch = "swarm/r0/s1") {
+	git(repo, "checkout", "-q", "-b", branch);
+	fs.writeFileSync(path.join(repo, "agent-work.txt"), "committed agent work\n");
+	git(repo, "add", "agent-work.txt");
+	git(repo, "commit", "-q", "-m", "agent work nobody else has");
+	const tip = git(repo, "rev-parse", "--short", "HEAD").stdout.trim();
+	git(repo, "checkout", "-q", "main");
+	return { branch, tip };
+}
+
+const branchRefs = (repo) =>
+	git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout;
+
+test("detritus delete: an UNMERGED leftover is not deleted without the second typed confirmation", () => {
+	const { repo, env } = setup();
+	const { branch, tip } = seedUnmergedLeftover(repo);
+	// "d" then anything-but-the-word: the flow must keep the branch, and the
+	// re-check then blocks the fan-out entirely.
+	const r = runPane(lines(["d", "yes", "1", "", "Task", ".", ""]), env, repo);
+	assert.equal(r.status, 14, `${r.stdout}\n${r.stderr}`); // PF_EC_DETRITUS
+	assert.match(branchRefs(repo), /swarm\/r0\/s1/, "unmerged branch survives");
+	// The refusal must be informed: tip sha, subject, and the non-destructive
+	// routes are all on screen before the prompt.
+	assert.match(r.stderr, /NOT merged into HEAD/);
+	assert.ok(r.stderr.includes(tip), "tip sha shown");
+	assert.match(r.stderr, /agent work nobody else has/, "commit subject shown");
+	assert.match(r.stderr, /Harvest/);
+	assert.match(r.stderr, /swarm-kept\//);
+	assert.match(r.stderr, /nothing was force-deleted/);
+	assert.equal(fs.existsSync(manifestFile), false, "no run was created");
+	assert.doesNotMatch(log(), /worktree create/);
+	void branch;
+});
+
+test("detritus delete: the typed confirmation force-deletes the unmerged leftover and the fan-out proceeds", () => {
+	const { repo, env } = setup();
+	seedUnmergedLeftover(repo);
+	const r = runPane(
+		lines(["d", "delete-unmerged", "1", "", "Task", ".", ""]),
+		env,
+		repo,
+	);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /force-deleted branch swarm\/r0\/s1/);
+	assert.doesNotMatch(branchRefs(repo), /swarm\/r0\/s1/, "old branch gone");
+	assert.equal(readManifest().slots.length, 1, "new run created after cleanup");
+});
+
+test("detritus delete: a MERGED leftover still goes on the first pass, no second prompt", () => {
+	const { repo, env } = setup();
+	// Branch at HEAD => merged => `git branch -d` accepts it.
+	git(repo, "branch", "swarm/r0/merged");
+	// Input carries NO confirmation line: if the flow prompted for one, the
+	// slot count would be consumed by it and the run would not come out right.
+	const r = runPane(lines(["d", "1", "", "Task", ".", ""]), env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /deleted branch swarm\/r0\/merged/);
+	assert.doesNotMatch(r.stdout, /force-deleted/, "no -D path was taken");
+	assert.doesNotMatch(r.stderr, /NOT merged into HEAD/, "no second gate shown");
+	assert.doesNotMatch(branchRefs(repo), /swarm\/r0\/merged/);
+	assert.equal(readManifest().slots.length, 1);
+});
+
+test("detritus delete: an archived run recording the branch is named as the harvest route", () => {
+	const { repo, env } = setup();
+	seedUnmergedLeftover(repo);
+	fs.writeFileSync(
+		path.join(stateDir, "archived-r0.json"),
+		JSON.stringify({
+			run_id: "r0",
+			repo_root: repo,
+			base_ref: "refs/heads/main",
+			fork_sha: "a".repeat(40),
+			created_at: "2026-07-22T15:00:00Z",
+			exclude_pattern_added: false,
+			slots: [{ slot: 1, label: "s1", branch: "swarm/r0/s1", status: "archived" }],
+		}),
+	);
+	const r = runPane(lines(["d", "n", "1", "", "Task", ".", ""]), env, repo);
+	assert.equal(r.status, 14, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stderr, /run r0 .* still records: swarm\/r0\/s1/);
+});
+
 // --- setup.sh hook (kept in v1 scope by explicit user decision) ---
 
 test("setup.sh hook runs in each worktree; failure warns but slots still start", () => {

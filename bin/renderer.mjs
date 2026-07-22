@@ -69,6 +69,11 @@ export function parseManifest(text) {
 	return { ok: true, manifest: doc };
 }
 
+// Statuses that mean "this slot is settled history". Their worktree is
+// legitimately gone (harvest removes it), so a missing worktree/branch must
+// not override them — see reconcileSlots.
+const TERMINAL_STATUSES = new Set(["archived", "merged", "skipped", "failed"]);
+
 // reconcileSlots — the R6 core: manifest rows × live `agent list` × git facts
 // -> displayed rows. The manifest's "running" is only a claim; display trusts
 // the live agent when one answers and degrades to "unknown" when none does
@@ -85,7 +90,14 @@ export function reconcileSlots(manifestSlots, agents, gitFacts) {
 	return (manifestSlots || []).map((row) => {
 		const facts = (gitFacts && gitFacts[row.slot]) || {};
 		let state;
-		if (facts.worktreeMissing || facts.branchMissing) {
+		if (TERMINAL_STATUSES.has(row.status)) {
+			// Terminal statuses outrank git facts: harvest DELETES the worktree
+			// (and archive may drop the branch) as the last step of merging,
+			// archiving, or skipping — so "the worktree is gone" is the expected
+			// end state there, not a fault. Checking git first rendered every
+			// harvested slot as "missing" (P2 display bug).
+			state = row.status;
+		} else if (facts.worktreeMissing || facts.branchMissing) {
 			state = "missing";
 		} else if (row.status === "running") {
 			// Match by terminal_id first (stable across pane moves), pane_id as
@@ -192,7 +204,9 @@ export function renderStatus(rows, cols = 80) {
 	if (rows.length === 0) lines.push("  (no slots in this run)");
 	for (const r of rows) {
 		const counts = `${r.committed ?? "-"}/${r.uncommitted ?? "-"}`;
-		const line = ` ${pad(r.slot, 3)}${pad(r.state, 9)}${pad(counts, 8)}${pad(
+		// state comes from herdr's agent_status — externally controlled text on
+		// the same footing as a branch name, so it sanitizes like one.
+		const line = ` ${pad(r.slot, 3)}${pad(sanitizeText(r.state ?? ""), 9)}${pad(counts, 8)}${pad(
 			sanitizeText(r.label ?? ""),
 			14,
 		)}${pad(sanitizeText(r.branch ?? ""), 28)}${sanitizeText(r.path ?? "-")}`.slice(
@@ -371,7 +385,9 @@ export class Renderer {
 
 	screen() {
 		const cols = process.stdout.columns || 80;
-		const short = (s) => (s ? String(s).slice(0, 10) : "?");
+		// Sanitize BEFORE truncating: slicing first can leave a half-stripped
+		// escape, and the SHA comes from the manifest like every other field.
+		const short = (s) => (s ? sanitizeText(String(s)).slice(0, 10) : "?");
 		const title = this.runInfo
 			? ` herdr-swarm status  run:${sanitizeText(String(this.runInfo.run_id))}  base:${sanitizeText(
 					String(this.runInfo.base_ref || "").replace(/^refs\/heads\//, ""),
@@ -571,9 +587,25 @@ export function renderHarvest(model, cols = 80) {
 		case "resume": {
 			const o = ph.offers[ph.idx];
 			lines.push(
-				` RESUME: slot ${o.slot} has a completed but un-swapped merge commit ${String(o.sha).slice(0, 10)}.`,
+				` RESUME: slot ${o.slot} has a completed but un-swapped merge commit ${sanitizeText(String(o.sha)).slice(0, 10)}.`,
 			);
 			lines.push(`${ESC}[2m [y]complete the swap  [n]leave it journaled${ESC}[0m`);
+			break;
+		}
+		case "stale": {
+			// A journaled merge intent with NO merge commit: nothing to complete,
+			// so resume can't help. Until this phase existed the only key that
+			// clears it (abort-merge) was bound inside the conflict phase, which
+			// a pane restart threw away — sequencer_scan then refused every
+			// later merge with no way out.
+			const slot = ph.slots[ph.idx];
+			lines.push(
+				` STALE MERGE: slot ${slot} has a journaled merge intent with no merge commit.`,
+			);
+			lines.push(
+				` Until it is cleared, harvest refuses every merge in this repo.`,
+			);
+			lines.push(`${ESC}[2m [a]bort the stale merge  [n]leave it${ESC}[0m`);
 			break;
 		}
 		case "dirty":
@@ -618,10 +650,17 @@ export function renderHarvest(model, cols = 80) {
 			for (const f of ph.files ?? []) lines.push(`   ${sanitizeText(f)}`);
 			lines.push(`${ESC}[2m [y]archive anyway  [n]keep the worktree${ESC}[0m`);
 			break;
-		default:
+		default: {
+			// Any row still carrying a journal wedges every merge (sequencer_scan
+			// / the merge verb's own refusal), so the escape hatch has to be
+			// reachable from the resting phase — not only from conflict.
+			const j = (model.rows ?? []).find((r) => r.journal);
 			lines.push(
-				`${ESC}[2m 1-9:select slot (merge/prompt)  r:re-preview  q:quit${ESC}[0m`,
+				`${ESC}[2m 1-9:select slot (merge/prompt)  r:re-preview${
+					j ? `  a:abort stale merge (slot ${j.slot})` : ""
+				}  q:quit${ESC}[0m`,
 			);
+		}
 	}
 	return lines.join("\n");
 }
@@ -638,10 +677,20 @@ export class HarvestRenderer {
 			"scripts",
 			"harvest-step.sh",
 		);
+		// Every other spawn in this file is bounded; this one is the ONLY one
+		// that also masks SIGINT (see run()), so an unbounded verb — a hung git
+		// call, a repo hook that waits on a tty — freezes the pane with no
+		// Ctrl-C escape. Generous by default: destructive verbs legitimately
+		// take a while on a large repo. Overridable for slow repos and tests.
+		this.stepTimeoutMs = Math.max(
+			250,
+			Number(env.HERDR_SWARM_STEP_TIMEOUT_MS) || 120_000,
+		);
 		this.rows = [];
 		this.runInfo = null;
 		this.banner = "";
 		this.phase = { name: "list" };
+		this.staleSlots = []; // resume_stale queue, drained by enterStalePhase()
 		this.busy = false; // a destructive verb is in flight — input masked
 		this.lastScreen = null;
 		this.write = (s) => process.stdout.write(s);
@@ -658,23 +707,46 @@ export class HarvestRenderer {
 				execFile(
 					"bash",
 					[this.stepScript, verb, ...args.map(String)],
-					{ env: { ...this.env, ...extraEnv }, maxBuffer: 16 * 1024 * 1024 },
+					{
+						env: { ...this.env, ...extraEnv },
+						maxBuffer: 16 * 1024 * 1024,
+						timeout: this.stepTimeoutMs,
+						// SIGTERM, not SIGKILL: harvest-step.sh's trap must still get
+						// to release the per-repo mutation lock on the way out.
+						killSignal: "SIGTERM",
+					},
 					(err, stdout, stderr) =>
 						resolve({
 							code: err ? (typeof err.code === "number" ? err.code : 1) : 0,
+							// Node flags a timeout kill as `killed`; the exit code is
+							// null there, so without this flag a timeout is
+							// indistinguishable from an ordinary failure.
+							timedOut: Boolean(err?.killed),
 							stdout: stdout ?? "",
 							stderr: stderr ?? "",
 						}),
 				);
 			});
+			r.verb = verb;
 			r.out = parseStepOutput(r.stdout);
+			// Banner set here (not only at the call sites): some callers consume
+			// the result as a typed preview and never reach lastErrLine, and the
+			// user must always learn why the pane went quiet.
+			if (r.timedOut) this.banner = this.timeoutBanner(verb);
 			return r;
 		} finally {
 			this.busy = false;
 		}
 	}
 
+	timeoutBanner(verb) {
+		return `harvest step '${verb}' timed out after ${this.stepTimeoutMs}ms and was killed — check for a hung git hook or lock, then retry (HERDR_SWARM_STEP_TIMEOUT_MS raises the limit)`;
+	}
+
 	lastErrLine(res) {
+		// A killed child usually writes nothing to stderr, so the generic
+		// "step failed (code)" line would hide the real cause.
+		if (res.timedOut) return this.timeoutBanner(res.verb ?? "step");
 		const ls = String(res.stderr || "")
 			.split("\n")
 			.filter((l) => l.trim() !== "");
@@ -711,6 +783,10 @@ export class HarvestRenderer {
 				label: s.label,
 				branch: s.branch,
 				status: s.status,
+				// A non-null journal means an unfinished merge intent. Carried onto
+				// the row so the list phase can offer abort-merge without a resume
+				// scan — otherwise a stale journal is only reachable at pane start.
+				journal: s.journal ?? null,
 				preview: null,
 			};
 			// Archived slots are settled history — no verb call, no row noise.
@@ -725,6 +801,26 @@ export class HarvestRenderer {
 	async reload() {
 		await this.refresh();
 		this.paint();
+	}
+
+	// Stale journals are queued behind the resume offers so a pane start that
+	// has both surfaces both. Returns true when the phase was entered.
+	enterStalePhase() {
+		const slots = this.staleSlots ?? [];
+		if (!slots.length) return false;
+		this.staleSlots = [];
+		this.phase = { name: "stale", slots, idx: 0 };
+		return true;
+	}
+
+	// End of the resume queue: hand off to the stale queue before resting.
+	async afterResume() {
+		if (this.enterStalePhase()) {
+			this.paint();
+			return;
+		}
+		this.phase = { name: "list" };
+		await this.reload();
 	}
 
 	async doMerge(slot) {
@@ -796,7 +892,17 @@ export class HarvestRenderer {
 			} else {
 				await this.doMerge(slot);
 			}
-		} else if (p.state === "merged" || p.state === "skipped" || p.state === "failed") {
+		} else if (
+			// "empty" (auto-skipped: nothing past the fork) and "external_merged"
+			// (the user merged it themselves) are terminal too — the preview verb
+			// already wrote skipped/merged to the manifest. Omitting them left the
+			// only route to archiving those slots a manual re-preview.
+			p.state === "merged" ||
+			p.state === "skipped" ||
+			p.state === "failed" ||
+			p.state === "empty" ||
+			p.state === "external_merged"
+		) {
 			await this.doArchive(slot);
 			await this.reload();
 		} else {
@@ -899,6 +1005,23 @@ export class HarvestRenderer {
 					this.phase = { ...ph, idx: ph.idx + 1 };
 					this.paint();
 				} else {
+					await this.afterResume();
+				}
+				break;
+			}
+			case "stale": {
+				const slot = ph.slots[ph.idx];
+				if (ch === "a" || ch === "A") {
+					const r = await this.step("abort-merge", [slot]);
+					this.banner =
+						r.code === 0
+							? `slot ${slot} stale merge aborted`
+							: this.lastErrLine(r);
+				}
+				if (ph.idx + 1 < ph.slots.length) {
+					this.phase = { ...ph, idx: ph.idx + 1 };
+					this.paint();
+				} else {
 					this.phase = { name: "list" };
 					await this.reload();
 				}
@@ -966,6 +1089,17 @@ export class HarvestRenderer {
 				else if (ch === "r") {
 					this.banner = "";
 					await this.reload();
+				} else if (ch === "a") {
+					// Lowest journaled slot first; repeat to clear the next one.
+					const row = this.rows.find((r) => r.journal);
+					if (row) {
+						const r = await this.step("abort-merge", [row.slot]);
+						this.banner =
+							r.code === 0
+								? `slot ${row.slot} merge aborted`
+								: this.lastErrLine(r);
+						await this.reload();
+					}
 				}
 		}
 	}
@@ -1038,6 +1172,10 @@ export class HarvestRenderer {
 			slot: Number(slot),
 			sha,
 		}));
+		// resume_stale rows have a journal but no merge commit — resume can do
+		// nothing with them, yet leaving them journaled makes every subsequent
+		// merge refuse. Queued behind the offers so both get surfaced.
+		this.staleSlots = (r.out.resume_stale ?? []).map(([slot]) => Number(slot));
 		const dangling = r.out.resume_dangling ?? [];
 		if (dangling.length) {
 			this.banner = `DANGLING merge commit(s): ${dangling
@@ -1045,6 +1183,7 @@ export class HarvestRenderer {
 				.join("; ")}`;
 		}
 		if (offers.length) this.phase = { name: "resume", offers, idx: 0 };
+		else this.enterStalePhase();
 		await this.refresh();
 		this.paint();
 		// The pane lives until the user quits; headless (tests, pane without a

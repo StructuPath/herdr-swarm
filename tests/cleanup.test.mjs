@@ -70,15 +70,93 @@ test("dirty slot worktree is KEPT and reported — never prompted, never forced"
 	const r = mkRun();
 	fs.writeFileSync(path.join(r.wt(1), "junk.txt"), "uncommitted\n");
 	const a = run(r, "abort.sh");
-	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
+	// Distinct nonzero code: work was kept, so this is NOT a clean teardown.
+	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
 	assert.equal(fs.existsSync(r.wt(1)), true, "dirty worktree survives");
 	assert.match(a.stderr, /KEPT/);
 	assert.match(a.stderr, /uncommitted work/);
 	assert.match(a.stdout, /kept 1/);
 	assert.ok(branchExists(r.repo, r.branch(1)), "branch untouched (R10)");
-	// The manifest is archived either way; the kept slot keeps its status so
-	// the recovery record says what was left behind.
-	assert.equal(r.archived().slots[0].status, "running");
+});
+
+// The recovery route abort prints is Harvest, and Harvest reads the LIVE
+// manifest — archiving it would strand exactly the work abort just chose to
+// protect.
+test("abort that KEPT a dirty slot leaves the run ACTIVE: manifest stays live and the kept path is named", () => {
+	const r = mkRun();
+	fs.writeFileSync(path.join(r.wt(1), "junk.txt"), "uncommitted\n");
+	const a = run(r, "abort.sh");
+	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
+	assert.equal(
+		fs.existsSync(path.join(r.sdir, "run-w9.json")),
+		true,
+		"live manifest NOT archived — Harvest can still reach the kept worktree",
+	);
+	assert.equal(
+		fs.existsSync(path.join(r.sdir, `archived-${r.runId}.json`)),
+		false,
+		"nothing was archived",
+	);
+	assert.match(a.stdout, /stays ACTIVE/);
+	assert.ok(a.stdout.includes(r.wt(1)), "the kept worktree is listed by path");
+	assert.equal(r.slotRow(1).status, "running", "kept slot is not marked archived");
+});
+
+// The exclude file is shared repo-wide: dropping the pattern while a kept
+// worktree still holds .swarm-task.md would expose it to git status there.
+test("abort that KEPT a slot also keeps the .swarm-task.md exclude pattern", () => {
+	const r = mkRun();
+	fs.writeFileSync(path.join(r.wt(1), "junk.txt"), "uncommitted\n");
+	const a = run(r, "abort.sh");
+	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
+	const lines = fs
+		.readFileSync(path.join(r.repo, ".git/info/exclude"), "utf8")
+		.split("\n");
+	assert.ok(lines.includes(".swarm-task.md"), "pattern survives a kept-work abort");
+	assert.equal(
+		spawnSync("git", ["-C", r.wt(1), "status", "--porcelain"], { encoding: "utf8" })
+			.stdout.includes(".swarm-task.md"),
+		false,
+		"task file still invisible to git status in the kept worktree",
+	);
+});
+
+// The harvest pane holds no mutation lock while the user resolves conflicts
+// (minutes), so a `merge --abort` here would hard-reset live work.
+test("harvest worktree with unmerged paths is a LIVE conflict: kept untouched, never merge --aborted", () => {
+	const r = mkRun();
+	// Build a real conflict: base and slot branch both touch the same file.
+	commitIn(r.repo, "conflict.txt", "base side\n");
+	commitIn(r.wt(1), "conflict.txt", "slot side\n");
+	const hwt = path.join(r.sdir, `harvest-${r.runId}-s1`);
+	h.git(r.repo, "worktree", "add", "-q", "--detach", hwt, "main");
+	const m = spawnSync("git", ["-C", hwt, "merge", "--no-ff", "-m", "swarm merge", r.branch(1)], {
+		encoding: "utf8",
+		env: { PATH: "/usr/bin:/bin", HOME: os.homedir(), ...gitIdent },
+	});
+	assert.notEqual(m.status, 0, "fixture must actually conflict");
+	assert.notEqual(
+		spawnSync("git", ["-C", hwt, "ls-files", "-u"], { encoding: "utf8" }).stdout.trim(),
+		"",
+		"fixture must leave unmerged index entries",
+	);
+	editManifest(r, (doc) => {
+		doc.slots[0].journal = {
+			locus: "detached",
+			expected_base_sha: r.fork,
+			merge_commit_sha: null,
+			worktree: hwt,
+		};
+	});
+	const a = run(r, "abort.sh");
+	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
+	assert.equal(fs.existsSync(hwt), true, "conflicted harvest worktree survives");
+	assert.notEqual(
+		spawnSync("git", ["-C", hwt, "ls-files", "-u"], { encoding: "utf8" }).stdout.trim(),
+		"",
+		"the in-flight conflict resolution was NOT reset",
+	);
+	assert.match(a.stderr, /LIVE conflict/);
 });
 
 test("crash abort (manifest present, herdr agents gone) completes, reaps both slots, spares foreign refs", () => {
@@ -142,7 +220,7 @@ test("harvest worktree holding an un-swapped merge commit is reported loudly, ne
 		};
 	});
 	const a = run(r, "abort.sh");
-	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
+	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`); // kept work => ACTIVE
 	assert.equal(fs.existsSync(hwt), true, "worktree with the dangling commit survives");
 	assert.match(a.stderr, /UN-SWAPPED/);
 	assert.ok(a.stderr.includes(msha), "dangling SHA named in the report");
@@ -240,6 +318,18 @@ exit 0`,
 	assert.match(h.log(), /workspace close w11/);
 });
 
+// R13: intersection calls warn above the max tested version and are NEVER
+// refused — cleanup of an existing run is mostly git and must survive herdr
+// churn. The gate was implemented but unreachable until abort called it.
+test("abort on an untested herdr (0.8.0) warns about the version and still completes", () => {
+	const r = mkRun();
+	const a = run(r, "abort.sh", { STUB_HERDR_VERSION: "0.8.0" });
+	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
+	assert.match(a.stderr, /newer than tested/);
+	assert.equal(fs.existsSync(r.wt(1)), false, "the run was still torn down");
+	assert.match(a.stdout, /abort summary/);
+});
+
 test("no active run: abort no-ops with a message and still prints the summary", () => {
 	const repo = h.makeRepo();
 	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cl-"));
@@ -333,7 +423,10 @@ test("prune with confirm deletes merged branch and backup ref; unmerged and fore
 	addBranch(p, "feature-x"); // merged, but NOT swarm-namespaced: invisible to prune
 	writeArchived(p, "rp2", ["swarm/rp2/s1", "swarm/rp2/s2"]);
 	h.git(p.repo, "update-ref", "refs/swarm-backups/rp2/1", p.fork);
-	const r = run(p, "prune.sh", { HERDR_SWARM_PRUNE_CONFIRM: "yes" });
+	const r = run(p, "prune.sh", {
+		HERDR_SWARM_PRUNE_CONFIRM: "yes",
+		HERDR_SWARM_PRUNE_BACKUPS: "yes",
+	});
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 	assert.equal(branchExists(p.repo, "swarm/rp2/s1"), false, "merged branch deleted");
 	assert.ok(branchExists(p.repo, "swarm/rp2/s2"), "unmerged branch kept");
@@ -343,9 +436,61 @@ test("prune with confirm deletes merged branch and backup ref; unmerged and fore
 	assert.equal(
 		h.git(p.repo, "for-each-ref", "refs/swarm-backups").stdout.trim(),
 		"",
-		"backup ref deleted under confirm",
+		"backup ref deleted under the dedicated backups flag",
 	);
 	assert.match(r.stdout, /prune summary/);
+});
+
+// Backup refs are the last copy of discarded work: the branch gate must not
+// double as their gate.
+test("PRUNE_CONFIRM alone lists backup refs but never deletes one", () => {
+	const p = mkPruneRepo();
+	addBranch(p, "swarm/rp6/s1");
+	writeArchived(p, "rp6", ["swarm/rp6/s1"]);
+	h.git(p.repo, "update-ref", "refs/swarm-backups/rp6/1", p.fork);
+	const r = run(p, "prune.sh", { HERDR_SWARM_PRUNE_CONFIRM: "yes" });
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.equal(branchExists(p.repo, "swarm/rp6/s1"), false, "the branch gate still works");
+	assert.match(r.stdout, /backup\s+refs\/swarm-backups\/rp6\/1/, "listed");
+	assert.equal(r.stdout.includes("deleted  refs/swarm-backups"), false, "never deleted");
+	assert.ok(
+		h.git(p.repo, "for-each-ref", "refs/swarm-backups").stdout.includes("rp6/1"),
+		"backup ref survives PRUNE_CONFIRM",
+	);
+	assert.match(r.stdout, /HERDR_SWARM_PRUNE_BACKUPS/, "the real flag is named");
+});
+
+test("PRUNE_BACKUPS deletes archived-run snapshots but never the ACTIVE run's", () => {
+	const p = mkPruneRepo();
+	addBranch(p, "swarm/rp7/s1");
+	writeArchived(p, "rp7", ["swarm/rp7/s1"]);
+	h.git(p.repo, "update-ref", "refs/swarm-backups/rp7/1", p.fork);
+	// A LIVE manifest for a different run: its snapshots are the only undo an
+	// in-flight harvest has, so no flag may reach them.
+	const active = "rp7live";
+	fs.writeFileSync(
+		path.join(p.sdir, "run-w9.json"),
+		JSON.stringify({
+			run_id: active,
+			repo_root: p.repo,
+			base_ref: "refs/heads/main",
+			fork_sha: p.fork,
+			created_at: "2026-07-22T15:00:00Z",
+			exclude_pattern_added: false,
+			slots: [],
+		}, null, 2),
+	);
+	h.git(p.repo, "update-ref", `refs/swarm-backups/${active}/1`, p.fork);
+	const r = run(p, "prune.sh", {
+		HERDR_SWARM_PRUNE_CONFIRM: "yes",
+		HERDR_SWARM_PRUNE_BACKUPS: "yes",
+	});
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	const refs = h.git(p.repo, "for-each-ref", "refs/swarm-backups").stdout;
+	assert.equal(refs.includes("rp7/1"), false, "archived-run snapshot deleted");
+	assert.ok(refs.includes(`${active}/1`), "ACTIVE run's snapshot survives");
+	assert.match(r.stdout, /ACTIVE RUN — kept/);
+	assert.match(r.stdout, /active-run kept 1/);
 });
 
 test("ancestry is judged against the recorded base even with another branch checked out; -d refusal is reported, never -D", () => {

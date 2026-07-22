@@ -28,10 +28,32 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
 	exit 1
 }
 
+# R13 intersection call: warn (never refuse) above the max tested version —
+# prune is pure git and must keep working there. Never fatal: an unreadable
+# herdr version must not block branch hygiene.
+version_gate intersection || true
+
 confirm=0
 [ "${HERDR_SWARM_PRUNE_CONFIRM:-}" = "yes" ] && confirm=1
 ack_reverted=0
 [ "${HERDR_SWARM_PRUNE_ACK_REVERTED:-}" = "yes" ] && ack_reverted=1
+# Backup refs get their OWN gate. PRUNE_CONFIRM is a branch gate, and a branch
+# is recoverable from the merge it was merged into; a discard snapshot is the
+# LAST copy of work that exists nowhere else, so one flag must never authorize
+# both. Deleting a snapshot is unrecoverable — it deserves its own keystroke.
+prune_backups=0
+[ "${HERDR_SWARM_PRUNE_BACKUPS:-}" = "yes" ] && prune_backups=1
+
+# The live run's snapshots are never deletable at all — not even under
+# PRUNE_BACKUPS: harvest may still be running and its discards are the only
+# undo the active run has. A missing/corrupt manifest yields an empty id, so
+# the guard simply does not fire (nothing claims to be active).
+ACTIVE_RUN_ID="$(manifest_read 2>/dev/null | node -e '
+	let d = "";
+	process.stdin.on("data", (c) => (d += c)).on("end", () => {
+		try { process.stdout.write(String(JSON.parse(d).run_id || "")); } catch {}
+	});
+' 2>/dev/null || true)"
 
 # Same per-repo mutation lock as fan-out/harvest/abort: branch deletion must
 # never interleave with a merge in flight (destructive-surface KTD).
@@ -84,6 +106,7 @@ merge_commit_of() {
 }
 
 n_merged=0 n_deleted=0 n_unmerged=0 n_skipped=0 n_refs=0 n_refs_deleted=0 n_manifests=0
+n_refs_active=0
 
 # --- (a) swarm/* branches ----------------------------------------------------
 # Literal-prefix pattern, not 'refs/heads/swarm/*' — for-each-ref's fnmatch
@@ -138,13 +161,21 @@ done <<<"$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' 'refs/he
 
 # --- (b) backup refs ---------------------------------------------------------
 # Discard snapshots (refs/swarm-backups/<run>/<slot>) are listed always and
-# deleted only under confirm — they are the last copy of discarded work, and
-# no timed GC ever touches them (R12).
+# deleted only under the dedicated HERDR_SWARM_PRUNE_BACKUPS gate — they are
+# the last copy of discarded work, and no timed GC ever touches them (R12).
 while IFS= read -r ref; do
 	[ -n "$ref" ] || continue
 	n_refs=$((n_refs + 1))
+	# Run id is the path component after the namespace: refs/swarm-backups/<run>/<slot>.
+	ref_run="${ref#refs/swarm-backups/}"
+	ref_run="${ref_run%%/*}"
+	if [ -n "$ACTIVE_RUN_ID" ] && [ "$ref_run" = "$ACTIVE_RUN_ID" ]; then
+		echo "backup   $ref [ACTIVE RUN — kept; abort or harvest the run first]"
+		n_refs_active=$((n_refs_active + 1))
+		continue
+	fi
 	echo "backup   $ref"
-	if [ "$confirm" -eq 1 ]; then
+	if [ "$prune_backups" -eq 1 ]; then
 		if git -C "$REPO_ROOT" update-ref -d "$ref" 2>/dev/null; then
 			echo "deleted  $ref"
 			n_refs_deleted=$((n_refs_deleted + 1))
@@ -161,7 +192,10 @@ done
 echo "archived manifests: $n_manifests (recovery records — prune never deletes them)"
 
 if [ "$confirm" -eq 0 ]; then
-	echo "herdr-swarm: DRY RUN — nothing was deleted. Set HERDR_SWARM_PRUNE_CONFIRM=yes to delete the listed merged branches and backup refs."
+	echo "herdr-swarm: DRY RUN — nothing was deleted. Set HERDR_SWARM_PRUNE_CONFIRM=yes to delete the listed merged branches."
 fi
-echo "herdr-swarm: prune summary — merged $n_merged (deleted $n_deleted), unmerged kept $n_unmerged, skipped $n_skipped, backup refs $n_refs (deleted $n_refs_deleted), archived manifests $n_manifests."
+if [ "$prune_backups" -eq 0 ] && [ "$n_refs" -gt 0 ]; then
+	echo "herdr-swarm: backup refs were LISTED ONLY — set HERDR_SWARM_PRUNE_BACKUPS=yes to delete them (they are the last copy of discarded work)."
+fi
+echo "herdr-swarm: prune summary — merged $n_merged (deleted $n_deleted), unmerged kept $n_unmerged, skipped $n_skipped, backup refs $n_refs (deleted $n_refs_deleted, active-run kept $n_refs_active), archived manifests $n_manifests."
 exit 0

@@ -17,7 +17,25 @@ PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 require_node || exit 1
 
+# R13 intersection call: above the max tested version this warns and proceeds
+# — abort is mostly git and must keep working on a herdr this plugin has not
+# been exercised against. Never fatal (|| true): a herdr whose version cannot
+# even be read must not strand a run the user is trying to abandon.
+version_gate intersection || true
+
+# Distinct nonzero exit for "aborted, but work was deliberately KEPT": the run
+# is still ACTIVE and the caller must not treat this as a clean teardown.
+ABORT_EC_KEPT=4
+
 closed=0 removed=0 kept=0 gone=0 branches_remaining=0
+# Human-readable inventory of everything KEPT — printed with the ACTIVE-run
+# notice below, because the summary counter alone does not say WHERE the work
+# survived.
+kept_paths=""
+note_kept() {
+	kept=$((kept + 1))
+	kept_paths="$kept_paths  $1"$'\n'
+}
 
 # Always printed — success, refusal, corrupt, nothing-to-do (R11: cleanup
 # always reports what was closed/removed/kept; sibling close.sh convention).
@@ -159,7 +177,7 @@ reap_slot_worktree() {
 		# Dirty is KEPT, never prompted (no TTY) and never forced (R11); the
 		# commit/skip/discard flow belongs to harvest (R9), not abort.
 		echo "herdr-swarm: slot $slot KEPT — uncommitted work in $wt (its agent, if alive, is still running; use Harvest to commit-WIP/skip/discard, then abort again)." >&2
-		kept=$((kept + 1))
+		note_kept "slot $slot worktree $wt (uncommitted work)"
 		return 0
 	fi
 	if [ -n "$wsid" ]; then
@@ -182,7 +200,7 @@ reap_slot_worktree() {
 			fi
 		else
 			echo "herdr-swarm: slot $slot KEPT — git worktree remove refused for $wt (never --force, R11); inspect by hand." >&2
-			kept=$((kept + 1))
+			note_kept "slot $slot worktree $wt (removal refused)"
 			return 0
 		fi
 	fi
@@ -192,6 +210,14 @@ reap_slot_worktree() {
 }
 
 handled_hwts=" " # journaled harvest worktrees, so the leftover glob below skips them
+
+# A harvest worktree with unmerged index entries is a LIVE conflict-resolution
+# session: the harvest pane holds no mutation lock while the user edits
+# conflicted files (that can take minutes), so `git merge --abort` here would
+# hard-reset work in progress. Unmerged paths present => hands off entirely.
+harvest_wt_in_conflict() {
+	[ -n "$(git -C "$1" ls-files -u 2>/dev/null)" ]
+}
 reap_harvest_worktree() {
 	local slot="$1" jmsha="$2" jwt="$3" cur
 	[ -n "$jwt" ] || return 0
@@ -202,7 +228,14 @@ reap_harvest_worktree() {
 		# commit is that commit's only obvious anchor — report the SHA loudly
 		# and keep it (plan risk: never silently unreachable, never auto-deleted).
 		echo "herdr-swarm: slot $slot has UN-SWAPPED merge commit $jmsha in $jwt — KEPT for recovery (reopen Harvest to resume the swap, or recover by hand)." >&2
-		kept=$((kept + 1))
+		note_kept "harvest worktree $jwt (un-swapped merge commit $jmsha)"
+		return 0
+	fi
+	if [ -d "$jwt" ] && harvest_wt_in_conflict "$jwt"; then
+		# Checked BEFORE the journal is cleared: the conflict resolution the
+		# user is in the middle of still belongs to that journaled merge.
+		echo "herdr-swarm: slot $slot has a LIVE conflict resolution in $jwt (unmerged paths present) — KEPT untouched; finish or abandon it in Harvest." >&2
+		note_kept "harvest worktree $jwt (live conflict resolution)"
 		return 0
 	fi
 	if [ -n "$jmsha" ]; then
@@ -221,7 +254,7 @@ reap_harvest_worktree() {
 			echo "herdr-swarm: removed harvest worktree $jwt."
 		else
 			echo "herdr-swarm: KEPT harvest worktree $jwt (removal refused; inspect by hand)." >&2
-			kept=$((kept + 1))
+			note_kept "harvest worktree $jwt (removal refused)"
 		fi
 	fi
 }
@@ -246,7 +279,15 @@ for d in "$(state_dir)"/harvest-"$RUN_ID"-s*; do
 	head_sha="$(git -C "$d" rev-parse --verify HEAD 2>/dev/null || true)"
 	if [ -n "$head_sha" ] && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$head_sha" "$BASE_REF" 2>/dev/null; then
 		echo "herdr-swarm: KEPT leftover harvest worktree $d — its HEAD $head_sha is not on $BASE_REF (possible un-swapped merge commit)." >&2
-		kept=$((kept + 1))
+		note_kept "leftover harvest worktree $d (HEAD $head_sha not on $BASE_REF)"
+		continue
+	fi
+	# Same live-conflict hazard as the journaled path: a mid-conflict merge
+	# leaves HEAD at base (no merge commit yet), so the ancestry guard above
+	# passes and only the unmerged-index check catches it.
+	if harvest_wt_in_conflict "$d"; then
+		echo "herdr-swarm: KEPT leftover harvest worktree $d — LIVE conflict resolution in progress (unmerged paths present)." >&2
+		note_kept "leftover harvest worktree $d (live conflict resolution)"
 		continue
 	fi
 	git -C "$d" merge --abort >/dev/null 2>&1 || true
@@ -255,7 +296,7 @@ for d in "$(state_dir)"/harvest-"$RUN_ID"-s*; do
 		echo "herdr-swarm: removed leftover harvest worktree $d."
 	else
 		echo "herdr-swarm: KEPT leftover harvest worktree $d (removal refused)." >&2
-		kept=$((kept + 1))
+		note_kept "leftover harvest worktree $d (removal refused)"
 	fi
 done
 
@@ -269,10 +310,19 @@ if [ -n "$ugit" ] && [ -e "$ugit/MERGE_HEAD" ]; then
 fi
 
 # --- (6) Exclude pattern -----------------------------------------------------
+# Only when NOTHING was kept: a kept worktree still holds its $SWARM_TASK_FILE,
+# and the exclude file is shared repo-wide — dropping the pattern would make
+# that file visible to `git status` in the kept worktree and committable into
+# history. The pattern is idempotent to re-add and removed by the next clean
+# abort, so leaving it is the cheap side of the trade.
 # Bare git in remove_exclude_pattern resolves --git-path from cwd; subshell cd
 # keeps abort's own cwd (and any caller assumptions) untouched.
-(cd "$REPO_ROOT" && remove_exclude_pattern) ||
-	echo "herdr-swarm: warning: could not remove the $SWARM_TASK_FILE exclude pattern." >&2
+if [ "$kept" -eq 0 ]; then
+	(cd "$REPO_ROOT" && remove_exclude_pattern) ||
+		echo "herdr-swarm: warning: could not remove the $SWARM_TASK_FILE exclude pattern." >&2
+else
+	echo "herdr-swarm: kept the $SWARM_TASK_FILE exclude pattern — kept worktrees still contain that file, and un-excluding it would expose it to git status."
+fi
 
 # --- (3) Branch inventory: list-only, never deleted (R10) --------------------
 # Includes branches leaked by errored creates (spike (d): a failed create can
@@ -285,6 +335,19 @@ if [ -n "$blist" ]; then
 fi
 
 # --- (7) Archive the manifest ------------------------------------------------
+# Archiving is for a run that is FINISHED. Anything KEPT above is live work,
+# and the recovery route abort itself prints — Harvest — reads the LIVE
+# manifest at $(manifest_path); archiving it would leave the kept worktrees
+# unreachable through the tool that is supposed to rescue them. So when
+# kept > 0 the manifest stays exactly where it is and the run stays ACTIVE.
+if [ "$kept" -gt 0 ]; then
+	echo "herdr-swarm: run $RUN_ID stays ACTIVE — $kept item(s) were KEPT and the manifest is NOT archived, so Harvest can still reach them:"
+	printf '%s' "$kept_paths"
+	echo "herdr-swarm: resolve them (Harvest: commit-WIP / skip / discard, or finish the merge), then run Abort again to finish teardown."
+	print_summary
+	exit "$ABORT_EC_KEPT"
+fi
+
 # Rename, never delete: the archived manifest is the recovery record (and
 # prune's source for recorded base refs). The .bak follows its manifest.
 mf="$(manifest_path)"

@@ -7,6 +7,8 @@
 # Every prompt reads line-wise from STDIN — deliberately, so tests can drive
 # the whole flow by scripting stdin. Protocol, in order:
 #   1. only if leftover swarm detritus exists: one choice line (d / r / q)
+#   1b. only if [d] was chosen AND some leftover branch is unmerged: one
+#      second confirmation line — the literal word "delete-unmerged"
 #   2. slot count N (re-prompted until the cap check passes)
 #   3. per slot 1..N: preset name (empty line = default = first preset)
 #   4. shared task prompt: free lines, terminated by a lone "." line
@@ -186,8 +188,78 @@ append_slot_row() {
 # Both walk the same live sources preflight_check_detritus scanned; the
 # literal 'refs/heads/swarm' prefix (not a glob) is explained in preflight.sh.
 
+# The second-gate word for force-deleting unmerged leftovers. A literal
+# typed word, not y/n: it cannot be hit by a stray keystroke or by a scripted
+# stdin stream that was written for the old one-answer protocol.
+DETRITUS_FORCE_WORD="delete-unmerged"
+
+# _archived_runs_for_branches: branch names on stdin → one stderr line per
+# ARCHIVED run that still records any of them. Deleting such a branch throws
+# away work the tool can otherwise still reach, so the recovery route is
+# named before the destructive prompt, never after it.
+_archived_runs_for_branches() {
+	local names f
+	names="$(cat)"
+	for f in "$(state_dir)"/archived-*.json; do
+		[ -f "$f" ] || continue
+		printf '%s' "$names" | node -e '
+			const fs = require("fs");
+			let d = "";
+			process.stdin.on("data", (c) => (d += c)).on("end", () => {
+				const want = new Set(d.split("\n").filter(Boolean));
+				let doc;
+				try { doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
+				catch { return; }
+				const hit = (doc.slots || [])
+					.filter((s) => s.branch && want.has(s.branch))
+					.map((s) => s.branch);
+				if (hit.length) {
+					console.error("  run " + doc.run_id + " (" + process.argv[1] +
+						") still records: " + hit.join(", "));
+				}
+			});
+		' "$f"
+	done
+}
+
+# force_delete_unmerged <newline-separated branches>: the ONLY path to
+# `git branch -D` in this plugin. Everything else deletes with -d and reports
+# refusals (prune.sh does exactly that), because a branch git refuses to
+# delete holds committed agent work that exists nowhere else — the case the
+# whole harvest flow exists to protect. The user's earlier [d] answer was a
+# choice about detritus in general, made before this branch was known to be
+# unmerged, so it is not informed consent for -D: show the tips, name the
+# non-destructive routes, and require a second typed word.
+force_delete_unmerged() {
+	local names="$1" b tip subject reply
+	{
+		echo "herdr-swarm: these leftover branches are NOT merged into HEAD — git refused to delete them. They hold committed work that is not in your base branch:"
+		while IFS= read -r b; do
+			[ -n "$b" ] || continue
+			tip="$(git rev-parse --short --verify "refs/heads/$b" 2>/dev/null || echo '?')"
+			subject="$(git log -1 --format=%s "refs/heads/$b" 2>/dev/null || true)"
+			printf '  %s  %s  %s\n' "$b" "$tip" "$subject"
+		done <<<"$names"
+	} >&2
+	printf '%s' "$names" | _archived_runs_for_branches
+	echo "herdr-swarm: non-destructive routes: run Harvest on that run to merge the work back, or answer [r] instead to rename these under swarm-kept/." >&2
+	prompt_line reply "Type '$DETRITUS_FORCE_WORD' to force-delete the branches listed above, anything else to keep them: "
+	if [ "$reply" != "$DETRITUS_FORCE_WORD" ]; then
+		echo "herdr-swarm: kept — nothing was force-deleted." >&2
+		return 0
+	fi
+	while IFS= read -r b; do
+		[ -n "$b" ] || continue
+		if git branch -D "$b" >/dev/null 2>&1; then
+			echo "  force-deleted branch $b"
+		else
+			echo "herdr-swarm: could not delete branch $b (still checked out somewhere?)" >&2
+		fi
+	done <<<"$names"
+}
+
 delete_detritus() {
-	local p b
+	local p b unmerged=""
 	# Worktrees first: a branch checked out in a worktree cannot be deleted.
 	# _swarm_worktrees is preflight.sh's helper — shared on purpose so the
 	# prompt acts on exactly the inventory the check reported.
@@ -203,14 +275,17 @@ delete_detritus() {
 	done < <(_swarm_worktrees)
 	while IFS= read -r b; do
 		[ -n "$b" ] || continue
-		# -D, not -d: leftovers are unmerged by definition and the user just
-		# chose deletion explicitly; -d would refuse every one of them.
-		if git branch -D "$b" >/dev/null 2>&1; then
+		# -d first, always: a merged leftover deletes silently on this pass and
+		# never reaches the second gate. Only branches git itself refuses are
+		# collected for the typed-confirmation path below.
+		if git branch -d "$b" >/dev/null 2>&1; then
 			echo "  deleted branch $b"
 		else
-			echo "herdr-swarm: could not delete branch $b (still checked out somewhere?)" >&2
+			unmerged="$unmerged$b"$'\n'
 		fi
 	done < <(git for-each-ref --format='%(refname:short)' 'refs/heads/swarm')
+	[ -n "$unmerged" ] || return 0
+	force_delete_unmerged "${unmerged%$'\n'}"
 }
 
 rename_detritus() {

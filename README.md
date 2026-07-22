@@ -75,10 +75,18 @@ add your own, see below):
    are never deleted by abort.
 5. **Prune** (`structupath.swarm.prune`) — dry-run listing of fully-merged
    `swarm/*` branches, discard-snapshot backup refs, and archived run
-   manifests. Deleting requires `HERDR_SWARM_PRUNE_CONFIRM=yes` in the
-   action's environment (a zero-TTY action's only confirmation channel);
-   merged-then-reverted branches additionally require
-   `HERDR_SWARM_PRUNE_ACK_REVERTED=yes`.
+   manifests. Deletion is gated per resource class, because the classes are
+   not equally recoverable (a zero-TTY action's only confirmation channel is
+   its environment):
+   - `HERDR_SWARM_PRUNE_CONFIRM=yes` — delete the listed fully-merged
+     `swarm/*` branches. This flag never touches backup refs.
+   - `HERDR_SWARM_PRUNE_ACK_REVERTED=yes` — additionally required for a
+     branch flagged merged-then-reverted.
+   - `HERDR_SWARM_PRUNE_BACKUPS=yes` — delete `refs/swarm-backups/*` discard
+     snapshots. Separate on purpose: a merged branch is recoverable from the
+     merge it landed in, but a snapshot is the *last* copy of discarded work.
+     Snapshots belonging to the **active run** are never deleted, even with
+     this flag — abort or harvest the run first.
 
 ### Keybinding
 

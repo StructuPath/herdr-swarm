@@ -9,5 +9,6 @@ cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 . scripts/lib.sh
 
 require_herdr
+version_gate intersection || true # R13: warn above max tested, never refuse
 
 open_singleton_pane harvest harvest-pane

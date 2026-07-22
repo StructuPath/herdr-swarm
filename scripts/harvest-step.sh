@@ -88,6 +88,17 @@ CTX="$(manifest_run_context "$DOC")" || {
 	exit 1
 }
 IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF FORK_SHA <<<"$CTX"
+# run_id is interpolated into the harvest worktree path ($(state_dir)/harvest-
+# $RUN_ID-s<slot>, fed straight to `git worktree add`/`remove`) and into the
+# backup ref namespace (refs/swarm-backups/$RUN_ID/<slot>). A run_id carrying
+# '../' or a slash would escape the state dir into an rm -rf-class removal of
+# a foreign path, or mint refs outside the plugin's namespace — charset-
+# restrict at the edge, before ANY git call, exactly as abort.sh does
+# (ownership KTD). Same guard, harvest's own refusal wording.
+if ! RUN_ID_SAFE="$(sanitize_slug "$RUN_ID")" || [ "$RUN_ID_SAFE" != "$RUN_ID" ]; then
+	echo "herdr-swarm: manifest run_id '$RUN_ID' fails the path charset — harvest refused." >&2
+	exit 1
+fi
 BASE_BRANCH="${BASE_REF#refs/heads/}"
 
 # read_slot <slot>: populate SLOT_* globals from the manifest row. Journal is
@@ -233,6 +244,21 @@ swap_base() {
 		return "$HS_EC_SWAP"
 	fi
 	manifest_update_slot "$slot" '{"status":"merged","journal":null}'
+	# Ownership guard (belt-and-braces against the user-tree-locus journal):
+	# journal.worktree holds the USER's checkout for the user-tree locus, and
+	# `git worktree remove` DOES delete a base checked out in a linked worktree
+	# (only a MAIN working tree is refused) — so the removal below is a user-
+	# data-loss hazard for any path that is not plugin-owned. Callers already
+	# gate on locus = detached; this is the second lock on the same door.
+	if [ -n "$hwt" ]; then
+		case "$hwt" in
+		"$(state_dir)"/harvest-*) ;;
+		*)
+			echo "herdr-swarm: refusing to remove $hwt — not a plugin-owned harvest worktree (kept untouched)." >&2
+			hwt=""
+			;;
+		esac
+	fi
 	if [ -n "$hwt" ] && [ -d "$hwt" ]; then
 		# Clean after a committed merge, so no --force is needed; a refusal
 		# here is bookkeeping noise, not data loss — report, never force.
@@ -374,7 +400,11 @@ do_discard() {
 		echo "herdr-swarm: slot $1 worktree is gone ($SLOT_PATH)" >&2
 		return "$HS_EC_REFUSED"
 	}
-	git -C "$SLOT_PATH" checkout -- . || return 1
+	# reset --hard, not `checkout -- .`: checkout restores the working tree FROM
+	# the index, so STAGED changes survive it. The verb then reports "discarded"
+	# while the slot is still dirty, and every later archive fails HS_EC_DIRTY
+	# with no way out. reset --hard drops index and worktree together.
+	git -C "$SLOT_PATH" reset --hard HEAD >/dev/null || return 1
 	# -fd, deliberately not -fdx: ignored files stay (they are outside every
 	# safety net — plan risk — so we never delete them here either).
 	git -C "$SLOT_PATH" clean -fd || return 1
@@ -512,10 +542,19 @@ do_resume() {
 	if [ "$action" = "complete" ]; then
 		require_slot_arg "$target" || return 1
 		read_slot "$target" || return 1
-		local expected msha hwt
+		local expected msha hwt jlocus
 		expected="$(journal_field "$SLOT_JOURNAL" expected_base_sha)"
 		msha="$(journal_field "$SLOT_JOURNAL" merge_commit_sha)"
 		hwt="$(journal_field "$SLOT_JOURNAL" worktree)"
+		jlocus="$(journal_field "$SLOT_JOURNAL" locus)"
+		# Only the detached locus owns a plugin worktree; the user-tree locus
+		# journals the USER's own checkout, which must NEVER reach swap_base's
+		# removal tail (abort.sh:235 encodes the same rule). Base having since
+		# been checked out elsewhere makes that tail reachable, and git deletes
+		# a linked-worktree checkout without complaint — user work, gone.
+		if [ "$jlocus" != "detached" ]; then
+			hwt=""
+		fi
 		if [ -z "$msha" ]; then
 			echo "herdr-swarm: slot $target has no journaled merge commit — nothing to complete (abort-merge clears stale intents)." >&2
 			return "$HS_EC_REFUSED"
@@ -535,7 +574,11 @@ do_resume() {
 			# The swap itself landed before the crash; only bookkeeping is
 			# missing — finish it.
 			manifest_update_slot "$slot" '{"status":"merged","journal":null}' || true
-			if [ -n "$hwt" ] && [ -d "$hwt" ]; then
+			# locus gate (abort.sh:235's rule): only the detached locus journals
+			# a plugin-owned worktree. The user-tree locus journals the USER's
+			# checkout, and `git worktree remove` deletes a LINKED-worktree
+			# checkout of the base — removing it here would destroy user work.
+			if [ "$locus" = "detached" ] && [ -n "$hwt" ] && [ -d "$hwt" ]; then
 				git -C "$REPO_ROOT" worktree remove "$hwt" 2>/dev/null ||
 					echo "herdr-swarm: note: kept harvest worktree $hwt" >&2
 			fi
@@ -630,11 +673,16 @@ do_archive() {
 	else
 		# No workspace recorded (herdr state lost): plain git removal, same
 		# no-force policy — dirty refusals route to the uncommitted-work flow.
-		if ! git -C "$REPO_ROOT" worktree remove "$SLOT_PATH" 2>&1; then
+		# Capture, never `2>&1` bare: this verb's stdout IS the machine-readable
+		# "key<TAB>value" protocol parseStepOutput consumes, so git's stderr
+		# leaking there corrupts the parse — and the error text is lost besides.
+		out="$(git -C "$REPO_ROOT" worktree remove "$SLOT_PATH" 2>&1)" || rc=$?
+		if [ "$rc" -ne 0 ]; then
 			if [ -n "$(git -C "$SLOT_PATH" status --porcelain 2>/dev/null)" ]; then
 				echo "herdr-swarm: slot $1 worktree has uncommitted work — commit-WIP, skip, or discard it first." >&2
 				return "$HS_EC_DIRTY"
 			fi
+			printf '%s\n' "$out" >&2
 			return 1
 		fi
 	fi
@@ -669,6 +717,20 @@ do_abort_merge() {
 			return "$HS_EC_REFUSED"
 		fi
 		if [ -d "$wt" ]; then
+			# An empty journal sha does NOT prove there is no merge commit: a
+			# crash between the merge commit's rev-parse and its journal_set
+			# leaves a real, un-swapped merge commit in a worktree the journal
+			# never learned about. Removing it makes that commit unreachable —
+			# the same hazard abort.sh:243-251 guards, with the same test:
+			# a HEAD that is not an ancestor of base is possibly un-swapped
+			# work, so keep it and report the SHA (never silently unreachable).
+			local head_sha
+			head_sha="$(git -C "$wt" rev-parse --verify HEAD 2>/dev/null || true)"
+			if [ -n "$head_sha" ] &&
+				! git -C "$REPO_ROOT" merge-base --is-ancestor "$head_sha" "$BASE_REF" 2>/dev/null; then
+				echo "herdr-swarm: slot $1 worktree $wt has HEAD $head_sha, which is NOT on $BASE_BRANCH — possibly an un-swapped merge commit the journal lost (crash before the SHA was recorded). KEPT for recovery; abort refused." >&2
+				return "$HS_EC_REFUSED"
+			fi
 			# May or may not be mid-merge (a crash before the merge started
 			# leaves a clean worktree) — abort is best-effort by design.
 			git -C "$wt" merge --abort 2>/dev/null || true

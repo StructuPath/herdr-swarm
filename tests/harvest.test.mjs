@@ -653,6 +653,227 @@ test("verbs refuse on a corrupt manifest with the typed corrupt code", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Code-review fixes. Each test below pins a failure mode that shipped in the
+// first cut of harvest-step.sh; they are grouped here rather than woven in so
+// the guard they exercise is obvious from the neighbourhood.
+// ---------------------------------------------------------------------------
+
+// Shallow-merge a patch into one slot row of the run manifest — used to build
+// journal shapes a crash leaves behind but the happy path never writes.
+function patchSlot(run, slot, patch) {
+	const p = path.join(run.sdir, "run-w9.json");
+	const doc = JSON.parse(fs.readFileSync(p, "utf8"));
+	Object.assign(
+		doc.slots.find((s) => s.slot === slot),
+		patch,
+	);
+	fs.writeFileSync(p, JSON.stringify(doc, null, 2));
+}
+
+// The user's base checkout in a LINKED worktree — deliberately NOT the main
+// working tree. git refuses to `worktree remove` a main working tree, so the
+// main-tree fixture would pass these tests for the wrong reason; a linked
+// checkout is the case git will happily delete, and the case real users hit
+// (worktree-per-feature workflows). Returns its path; the tree is left CLEAN
+// so a removal would genuinely succeed if the guard were missing.
+function linkedBaseCheckout(run) {
+	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
+	const dir = path.join(
+		fs.mkdtempSync(path.join(os.tmpdir(), "hs-userwt-")),
+		"base",
+	);
+	h.git(run.repo, "worktree", "add", "-q", dir, "main");
+	return dir;
+}
+
+test("resume scan never removes a user-tree-locus journal's worktree — that is the USER's checkout", () => {
+	const run = mkRun();
+	const userWt = linkedBaseCheckout(run);
+	// A user-tree merge landed, then the process died before the manifest was
+	// settled: base == the merge commit, so the scan takes its resume_completed
+	// branch — the branch that fed journal.worktree to `git worktree remove`.
+	const msha = commitIn(userWt, "user.txt", "user work\n", "user-tree merge");
+	patchSlot(run, 1, {
+		journal: {
+			locus: "user-tree",
+			expected_base_sha: run.fork,
+			merge_commit_sha: msha,
+			worktree: userWt,
+		},
+	});
+	const r = step(run, "resume");
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, new RegExp(`resume_completed\t1\t${msha}`));
+	assert.ok(fs.existsSync(userWt), "the user's checkout still exists");
+	assert.equal(
+		fs.readFileSync(path.join(userWt, "user.txt"), "utf8"),
+		"user work\n",
+		"the user's files are intact",
+	);
+	assert.ok(
+		h.git(run.repo, "worktree", "list").stdout.includes(userWt),
+		"still a registered worktree — nothing was reaped",
+	);
+	assert.equal(run.slotRow(1).status, "merged", "bookkeeping still settled");
+});
+
+test("resume complete never hands the user's checkout to swap_base's removal tail", () => {
+	const run = mkRun();
+	const userWt = linkedBaseCheckout(run);
+	// Plumbing-only stand-in for the merge commit a user-tree merge had made
+	// before the crash (nothing checked out moves).
+	const msha = bareCommitOn(run.repo, run.fork, "user-tree merge");
+	patchSlot(run, 1, {
+		journal: {
+			locus: "user-tree",
+			expected_base_sha: run.fork,
+			merge_commit_sha: msha,
+			worktree: userWt,
+		},
+	});
+	// The user has since moved that worktree off base. THAT is what makes the
+	// removal tail reachable: swap_base's millisecond guard only bails while
+	// base is still checked out somewhere.
+	h.git(userWt, "checkout", "-q", "-b", "sidework");
+	const r = step(run, "resume", ["complete", 1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.equal(
+		h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(),
+		msha,
+		"the swap itself still completed",
+	);
+	assert.ok(fs.existsSync(userWt), "the user's checkout survived the swap");
+	assert.ok(fs.existsSync(path.join(userWt, "README.md")), "its files are intact");
+});
+
+test("swap_base refuses any journaled worktree outside the plugin's harvest- namespace", () => {
+	const run = mkRun();
+	const userWt = linkedBaseCheckout(run);
+	const msha = bareCommitOn(run.repo, run.fork);
+	// Locus says 'detached' but the path is the user's tree — a bad write, a
+	// schema change, or a future caller. The ownership check is the second
+	// lock on the same door as the locus gate.
+	patchSlot(run, 1, {
+		journal: {
+			locus: "detached",
+			expected_base_sha: run.fork,
+			merge_commit_sha: msha,
+			worktree: userWt,
+		},
+	});
+	h.git(userWt, "checkout", "-q", "-b", "sidework");
+	const r = step(run, "resume", ["complete", 1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stderr, /refusing to remove/, "the refusal is reported");
+	assert.ok(fs.existsSync(userWt), "foreign worktree kept");
+});
+
+test("abort-merge keeps a harvest worktree whose HEAD is off base (merge commit the journal never recorded)", () => {
+	const run = mkRun();
+	commitIn(run.wt(1), "feat.txt");
+	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
+	let r = step(run, "merge", [1, run.fork], {
+		HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+	});
+	assert.equal(r.status, 99);
+	const hwt = run.slotRow(1).journal.worktree;
+	const msha = run.slotRow(1).journal.merge_commit_sha;
+	// Narrow the crash window by one step: between the merge commit's rev-parse
+	// and its journal_set. Identical disk state, journal without the sha — so
+	// an unguarded abort would remove the only anchor for a real merge commit.
+	patchSlot(run, 1, {
+		journal: {
+			locus: "detached",
+			expected_base_sha: run.fork,
+			merge_commit_sha: null,
+			worktree: hwt,
+		},
+	});
+	r = step(run, "abort-merge", [1]);
+	assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
+	assert.ok(fs.existsSync(hwt), "worktree holding the merge commit is kept");
+	assert.match(r.stderr, new RegExp(msha), "the recoverable SHA is reported");
+	assert.equal(
+		spawnSync("git", ["-C", run.repo, "cat-file", "-e", `${msha}^{commit}`]).status,
+		0,
+		"the merge commit is still reachable",
+	);
+	assert.ok(run.slotRow(1).journal, "journal kept — the state stays surfaced");
+});
+
+test("a manifest run_id that escapes the path charset is refused before any git runs", () => {
+	const run = mkRun();
+	const p = path.join(run.sdir, "run-w9.json");
+	const doc = JSON.parse(fs.readFileSync(p, "utf8"));
+	// run_id reaches $(state_dir)/harvest-$RUN_ID-s<slot> and
+	// refs/swarm-backups/$RUN_ID/<slot>; '../' would escape both.
+	doc.run_id = "../../escape";
+	fs.writeFileSync(p, JSON.stringify(doc, null, 2));
+	// Log-and-passthrough git stub: the guard must fire before ANY git call.
+	h.writeStub("git", 'echo "git $@" >> "$STUB_LOG"\nexec /usr/bin/git "$@"');
+	try {
+		const r = step(run, "preview", [1]);
+		assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+		assert.match(r.stderr, /fails the path charset/);
+		assert.equal(h.log().trim(), "", "no git ran at all");
+	} finally {
+		fs.rmSync(path.join(h.stubDir, "git"), { force: true });
+	}
+});
+
+test("discard clears STAGED changes too, so the slot can afterwards be archived", () => {
+	h.writeHerdrStub();
+	const run = mkRun({ status: "merged" });
+	// No workspace recorded -> archive takes the plain-git removal path, which
+	// really refuses a dirty tree (rather than a stub saying it did).
+	patchSlot(run, 1, { workspace_id: null });
+	fs.writeFileSync(path.join(run.wt(1), "README.md"), "edited\n"); // tracked
+	fs.writeFileSync(path.join(run.wt(1), "staged.txt"), "staged\n"); // untracked
+	h.git(run.wt(1), "add", "-A"); // both now STAGED — what checkout -- . left behind
+	assert.equal(step(run, "snapshot", [1]).status, 0);
+	let r = step(run, "discard", [1], { HERDR_SWARM_CONFIRM: run.branch(1) });
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.equal(
+		h.git(run.wt(1), "status", "--porcelain").stdout,
+		"",
+		"index and working tree both clean — 'discarded' is the truth",
+	);
+	assert.ok(
+		fs.existsSync(path.join(run.wt(1), ".swarm-task.md")),
+		"clean -fd (not -fdx) still spares ignored/excluded files",
+	);
+	const sha = run.slotRow(1).backup_ref;
+	// The consequence the old checkout-only discard made unreachable: a
+	// staged-but-uncommitted leftover failed HS_EC_DIRTY forever.
+	r = step(run, "archive", [1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.equal(run.slotRow(1).status, "archived");
+	assert.equal(
+		h.git(run.repo, "show", `${sha}:staged.txt`).stdout,
+		"staged\n",
+		"staged work is still recoverable from the snapshot",
+	);
+});
+
+test("archive's git-removal failure keeps stdout protocol-clean and reports the error on stderr", () => {
+	h.writeHerdrStub();
+	const run = mkRun({ status: "merged" });
+	// No workspace recorded (herdr state lost) -> plain git removal; a plain
+	// directory makes that removal fail for a NON-dirty reason.
+	const notAWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "hs-notwt-"));
+	patchSlot(run, 1, { workspace_id: null, path: notAWorktree });
+	const r = step(run, "archive", [1]);
+	assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+	assert.equal(
+		r.stdout,
+		"",
+		"git noise on stdout would corrupt the key<TAB>value protocol",
+	);
+	assert.match(r.stderr, /not a working tree/i, "the error text survives");
+	assert.equal(run.slotRow(1).status, "merged", "nothing archived");
+});
+
+// ---------------------------------------------------------------------------
 // Renderer harvest mode (bin/renderer.mjs): UI + state machine + orchestration
 // only — the audit test below IS the destructive-surface invariant.
 // ---------------------------------------------------------------------------

@@ -10,7 +10,9 @@ import path from "node:path";
 import { createHarness, repoRoot, sampleManifest } from "./harness.mjs";
 import {
 	diffRange,
+	HarvestRenderer,
 	manifestPath,
+	renderHarvest,
 	mkHerdr,
 	parseDiffStat,
 	parseManifest,
@@ -128,18 +130,24 @@ test("reconcile: deleted branch renders missing", () => {
 
 test("reconcile: terminal manifest states pass through untouched even when agents are unqueryable", () => {
 	const base = slots()[1];
-	const rows = reconcileSlots(
-		["failed", "settled", "merged", "skipped", "archived"].map((status, i) => ({
-			...base,
-			slot: i + 1,
-			status,
-		})),
-		null,
-		{},
-	);
+	const statuses = ["failed", "settled", "merged", "skipped", "archived"];
+	const mk = (status, i) => ({ ...base, slot: i + 1, status });
 	assert.deepEqual(
-		rows.map((r) => r.state),
-		["failed", "settled", "merged", "skipped", "archived"],
+		reconcileSlots(statuses.map(mk), null, {}).map((r) => r.state),
+		statuses,
+	);
+	// Harvest DELETES the worktree as the last step of merging/archiving/
+	// skipping, so a gone worktree is the expected end state for these rows —
+	// checking git facts first rendered every harvested slot as "missing".
+	// (An empty gitFacts is exactly what used to hide this.)
+	const gone = {};
+	statuses.forEach((_, i) => {
+		gone[i + 1] = { worktreeMissing: true, branchMissing: true };
+	});
+	assert.deepEqual(
+		reconcileSlots(statuses.map(mk), null, gone).map((r) => r.state),
+		["failed", "missing", "merged", "skipped", "archived"],
+		"terminal statuses outrank git facts; non-terminal 'settled' still goes missing",
 	);
 });
 
@@ -594,4 +602,153 @@ test("status-pane.sh execs the renderer with the resolved context (end to end)",
 	// The renderer painted the status screen: context resolution + exec work.
 	assert.match(r.stdout, /herdr-swarm status/);
 	assert.match(r.stdout, /run:r-20260722-abc1/);
+});
+
+// --- harvest-renderer fixes: bounded verbs, stale-journal recovery,
+// --- terminal-state archiving, and agent-supplied text sanitizing.
+// (Kept here rather than in harvest.test.mjs so the destructive-verb suite
+// there stays about harvest-step.sh itself.)
+
+// A HarvestRenderer with painting silenced and step() replaced by a recorder —
+// the state machine is what these assert on, never a real destructive verb.
+const mkHarvest = (env = h.freshEnv()) => {
+	const r = new HarvestRenderer(env);
+	r.paint = () => {};
+	r.write = () => {};
+	r.refresh = async () => {};
+	r.calls = [];
+	r.step = async (verb, args = []) => {
+		r.calls.push([verb, ...args]);
+		return { code: 0, verb, stdout: "", stderr: "", out: {} };
+	};
+	return r;
+};
+
+test("harvest step is bounded: a hung verb is killed, busy clears, banner explains", async () => {
+	// Unbounded, this verb would hold `busy` forever — and busy masks every
+	// key INCLUDING ^C (run()'s SIGINT handler), so the pane becomes a brick.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-slow-"));
+	const script = path.join(dir, "slow-step.sh");
+	fs.writeFileSync(script, "#!/usr/bin/env bash\nsleep 30\n");
+	fs.chmodSync(script, 0o755);
+	const r = new HarvestRenderer(
+		h.freshEnv({ HERDR_SWARM_STEP_TIMEOUT_MS: "400" }),
+	);
+	r.paint = () => {};
+	r.write = () => {};
+	r.stepScript = script;
+	const t0 = Date.now();
+	const res = await r.step("merge", [1]);
+	assert.ok(Date.now() - t0 < 15_000, "the verb was killed, not waited out");
+	assert.equal(res.timedOut, true);
+	assert.notEqual(res.code, 0, "a timeout is a failure, not a silent success");
+	assert.equal(r.busy, false, "busy must clear or the pane masks every key");
+	assert.match(r.banner, /timed out/, "the user learns why the pane went quiet");
+	assert.match(r.lastErrLine(res), /timed out/);
+	assert.match(r.lastErrLine(res), /merge/, "the stuck verb is named");
+	// Destructive verbs legitimately take a while: the default stays generous.
+	assert.equal(new HarvestRenderer({}).stepTimeoutMs, 120_000);
+});
+
+test("stale journal: the list phase offers abort-merge and 'a' dispatches it", async () => {
+	// After conflict -> [b]ack -> pane restart, abort-merge used to be bound
+	// only inside the conflict phase: harvest wedged with no key to clear it.
+	const row = {
+		slot: 1,
+		label: "s1",
+		branch: "swarm/r1/s1",
+		status: "running",
+		journal: { locus: "detached", expected_base_sha: "abc" },
+		preview: { state: "clean", dirty: 0 },
+	};
+	const view = renderHarvest({ phase: { name: "list" }, rows: [row] }, 120);
+	assert.match(view, /a:abort stale merge \(slot 1\)/);
+	assert.doesNotMatch(
+		renderHarvest({ phase: { name: "list" }, rows: [{ ...row, journal: null }] }, 120),
+		/abort stale merge/,
+		"no journal, no destructive affordance",
+	);
+	const r = mkHarvest();
+	r.rows = [row];
+	await r.onKey("a");
+	assert.deepEqual(r.calls, [["abort-merge", 1]], "routed through step(), not raw git");
+});
+
+test("resume_stale becomes a stale phase whose 'a' clears the wedged journal", async () => {
+	const r = mkHarvest();
+	r.staleSlots = [2, 3];
+	assert.equal(r.enterStalePhase(), true);
+	assert.equal(r.phase.name, "stale");
+	const view = renderHarvest({ phase: r.phase, rows: [] }, 120);
+	assert.match(view, /STALE MERGE: slot 2/);
+	assert.match(view, /\[a\]bort the stale merge/);
+	await r.onKey("a");
+	assert.deepEqual(r.calls, [["abort-merge", 2]]);
+	assert.equal(r.phase.idx, 1, "the queue advances to the next stale slot");
+	await r.onKey("n"); // leave slot 3 journaled
+	assert.deepEqual(r.calls, [["abort-merge", 2]], "'n' must not mutate");
+	assert.equal(r.phase.name, "list", "the queue drains back to the resting phase");
+	assert.equal(r.enterStalePhase(), false, "queue consumed exactly once");
+});
+
+test("the resume queue hands off to the stale queue instead of dropping it", async () => {
+	const r = mkHarvest();
+	r.staleSlots = [4];
+	r.phase = { name: "resume", offers: [{ slot: 1, sha: "abc" }], idx: 0 };
+	await r.onKey("n"); // decline the offer; last offer in the queue
+	assert.equal(r.phase.name, "stale");
+	assert.deepEqual(r.phase.slots, [4]);
+});
+
+test("terminal preview states — empty and external_merged included — archive", async () => {
+	// The preview verb already wrote skipped/merged to the manifest for these
+	// two; without them the only route to archiving was a manual re-preview.
+	for (const state of ["merged", "skipped", "failed", "empty", "external_merged"]) {
+		const r = mkHarvest();
+		r.rows = [
+			{ slot: 1, label: "s1", branch: "b", status: "merged", preview: { state, dirty: 0 } },
+		];
+		await r.selectSlot(1);
+		assert.deepEqual(r.calls, [["archive", 1]], `'${state}' must route to archive`);
+	}
+	// Anything genuinely non-terminal still refuses to act.
+	const r = mkHarvest();
+	r.rows = [{ slot: 1, label: "s1", branch: "b", status: "running", preview: { state: "missing" } }];
+	await r.selectSlot(1);
+	assert.deepEqual(r.calls, [], "an unknown state must never trigger a verb");
+	assert.match(r.banner, /nothing to do here/);
+});
+
+test("agent-supplied state text cannot smuggle escapes into any rendered view", () => {
+	// r.state originates in herdr's agent_status — externally controlled, on
+	// the same footing as a branch name.
+	const hostile = "idle\x1b]0;PWNED\x07";
+	const out = renderStatus(
+		[{ slot: 1, label: "x", branch: "b", path: "/p", state: hostile }],
+		200,
+	);
+	assert.ok(!out.includes("\x1b"), `escape survived renderStatus:\n${out}`);
+	assert.ok(!out.includes("\x07"));
+	assert.match(out, /idle/, "the legible part still renders");
+	// fork_sha rides the title line the same way (sanitize BEFORE truncating,
+	// or a slice can leave a half-stripped sequence behind).
+	const r = quiet(mkRenderer(h.freshEnv()));
+	r.runInfo = {
+		run_id: "r1",
+		base_ref: "refs/heads/main",
+		fork_sha: "\x1b]0;pwn\x07abc123",
+	};
+	const title = r.screen().split("\n")[0];
+	assert.ok(!title.includes("\x1b]"), `escape survived the title:\n${title}`);
+	assert.ok(!title.includes("\x07"));
+	// …and so does the resume offer's merge-commit SHA.
+	const resume = renderHarvest(
+		{
+			phase: { name: "resume", offers: [{ slot: 1, sha: "\x1b]0;pwn\x07dead" }], idx: 0 },
+			rows: [],
+		},
+		120,
+	);
+	assert.ok(!resume.includes("\x1b]"), `escape survived the resume view:\n${resume}`);
+	assert.ok(!resume.includes("\x07"));
 });
