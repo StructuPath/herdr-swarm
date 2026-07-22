@@ -120,6 +120,9 @@ unchanged.
 | `HERDR_SWARM_DETRITUS` | `delete` \| `rename` \| `abort` — the leftover-branch prompt |
 | `HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes` | the typed `delete-unmerged` second confirmation |
 
+Invoke the fan-out **pane script directly**, not the plugin action — see the
+caveat below:
+
 ```sh
 printf 'Add retry-with-backoff to the HTTP client.\nKeep the public API unchanged.\n' > /tmp/brief.md
 
@@ -127,8 +130,17 @@ HERDR_SWARM_SLOTS=3 \
 HERDR_SWARM_PRESETS=claude,claude,codex \
 HERDR_SWARM_TASK_FILE=/tmp/brief.md \
 HERDR_SWARM_DETRITUS=rename \
-  herdr plugin action run structupath.swarm.fanout
+HERDR_WORKSPACE_ID=<the repo workspace's id> \
+  bash "$(herdr plugin list --json | jq -r '.plugins[]|select(.id=="structupath.swarm").root')/scripts/fanout-pane.sh"
 ```
+
+> **`herdr plugin action invoke` will not work for this.** Herdr's *server*
+> spawns plugin panes, so a pane never inherits the environment of whoever
+> triggered the action — verified against 0.7.5: with all the variables above
+> exported, an action-invoked pane still printed `How many agents?`. `invoke`
+> also has no `--workspace` flag; it always uses the focused workspace's
+> context. Scripted runs therefore call the pane script directly and pass
+> `HERDR_WORKSPACE_ID` themselves. Interactive runs use the action normally.
 
 Notes:
 
@@ -149,11 +161,13 @@ Notes:
 
 ### Can an agent drive the whole plugin?
 
-Yes — all four mutating capabilities are scriptable:
+Yes — all four mutating capabilities are scriptable, all by calling the
+scripts directly rather than through `herdr plugin action invoke` (which
+forwards no environment):
 
 | Capability | Scriptable path |
 |---|---|
-| Fan out | the variables above (zero-TTY) |
+| Fan out | `scripts/fanout-pane.sh` with the variables above (zero-TTY) |
 | Harvest | `scripts/harvest-step.sh <verb>` — a verb CLI with typed exit codes and `key<TAB>value` stdout |
 | Abort | `scripts/abort.sh` — a zero-TTY action, env-gated |
 | Prune | `scripts/prune.sh` — a zero-TTY action, dry run by default, env-gated per resource class |
