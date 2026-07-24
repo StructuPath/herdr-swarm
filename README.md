@@ -7,6 +7,10 @@ actually *changes* (committed and uncommitted counts, not just terminal
 output), and a review-first harvest pane merges the work back to base one slot
 at a time. Agents commit locally and never push; the orchestrator merges.
 
+**Docs:** the [StructuPath Herdr Plugins wiki](https://github.com/StructuPath/herdr-browser/wiki)
+is the practical guide to this plugin and its three siblings (Browser, Guard,
+Conductor).
+
 ## Requirements
 
 - **herdr 0.7.4 or newer.** Fan-out works on both 0.7.4 and 0.7.5+, by two
