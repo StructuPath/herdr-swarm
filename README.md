@@ -268,10 +268,9 @@ want a truly clean slate. Plugin logs:
 
 ## Publishing
 
-This repo does not carry the `herdr-plugin` marketplace topic yet. The reason
-it was deferred is gone — fan-out no longer refuses on current stable — but
-adding the topic is a separate decision, not an automatic consequence. The
-repo is private for now; `herdr plugin link` against a local clone is the
-supported install path.
+Public and marketplace-listed: the repo carries the `herdr-plugin` topic, so it
+auto-lists on the Herdr marketplace. Install with `herdr plugin install
+StructuPath/herdr-swarm`, or `herdr plugin link` a local clone for dev (disk edits
+stay live).
 
 MIT © StructuPath
