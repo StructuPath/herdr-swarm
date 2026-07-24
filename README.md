@@ -7,6 +7,8 @@ actually *changes* (committed and uncommitted counts, not just terminal
 output), and a review-first harvest pane merges the work back to base one slot
 at a time. Agents commit locally and never push; the orchestrator merges.
 
+![herdr-swarm demo: fan out 3 agents, harvest the winner](assets/herdr-swarm-demo.gif)
+
 **Docs:** the [StructuPath Herdr Plugins wiki](https://github.com/StructuPath/herdr-browser/wiki)
 is the practical guide to this plugin and its three siblings (Browser, Guard,
 Conductor).
