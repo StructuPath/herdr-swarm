@@ -139,7 +139,9 @@ export function validateRepository(root) {
 			continue;
 		}
 		if (escapesRepository(repositoryRoot, realTarget)) {
-			errors.push(`${label} entrypoint resolves outside the repository: ${entrypoint}`);
+			errors.push(
+				`${label} entrypoint resolves outside the repository: ${entrypoint}`,
+			);
 			continue;
 		}
 

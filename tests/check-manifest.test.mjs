@@ -60,13 +60,17 @@ test("manifest validation reports missing and non-executable entrypoints", (t) =
 	const { repository } = fixture(t);
 	fs.rmSync(path.join(repository, "scripts", "open.sh"));
 	let errors = validateRepository(repository).errors;
-	assert.ok(errors.some((error) => error.includes("entrypoint does not exist")));
+	assert.ok(
+		errors.some((error) => error.includes("entrypoint does not exist")),
+	);
 
 	fs.writeFileSync(path.join(repository, "scripts", "open.sh"), "#!/bin/sh\n", {
 		mode: 0o644,
 	});
 	errors = validateRepository(repository).errors;
-	assert.ok(errors.some((error) => error.includes("entrypoint is not executable")));
+	assert.ok(
+		errors.some((error) => error.includes("entrypoint is not executable")),
+	);
 });
 
 test("manifest validation rejects entrypoints outside the repository", (t) => {
