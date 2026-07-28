@@ -589,14 +589,8 @@ test("swap and resume use exact ignored preview/apply before removing a harvest 
 	});
 	assert.equal(result.status, 99);
 	const hwt = run.slotRow(1).journal.worktree;
-	fs.appendFileSync(
-		path.join(run.repo, ".git/info/exclude"),
-		"hook-output.log\n",
-	);
-	fs.writeFileSync(
-		path.join(hwt, "hook-output.log"),
-		"ignored hook artifact\n",
-	);
+	fs.appendFileSync(path.join(run.repo, ".git/info/exclude"), "hook-output.log\n");
+	fs.writeFileSync(path.join(hwt, "hook-output.log"), "ignored hook artifact\n");
 
 	result = step(run, "resume", ["complete", 1]);
 	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
@@ -612,9 +606,7 @@ test("swap and resume use exact ignored preview/apply before removing a harvest 
 	assert.equal(run.slotRow(1).journal, null);
 	const used = fs
 		.readdirSync(run.sdir)
-		.filter(
-			(name) => name.startsWith("cleanup-used-") && name.endsWith(".json"),
-		);
+		.filter((name) => name.startsWith("cleanup-used-") && name.endsWith(".json"));
 	assert.equal(used.length, 1, "approval was durably consumed exactly once");
 });
 
@@ -639,13 +631,7 @@ test("harvest removal refuses every exact identity mismatch", () => {
 		const row = run.slotRow(1);
 		const journal = structuredClone(row.journal);
 		const hwt = journal.worktree;
-		h.git(
-			run.repo,
-			"update-ref",
-			"refs/heads/main",
-			journal.merge_commit_sha,
-			run.fork,
-		);
+		h.git(run.repo, "update-ref", "refs/heads/main", journal.merge_commit_sha, run.fork);
 		if (field === "registration") {
 			h.git(hwt, "checkout", "-q", "-b", `foreign-${run.runId}`);
 		} else if (field === "symlink") {
@@ -658,16 +644,8 @@ test("harvest removal refuses every exact identity mismatch", () => {
 			patchSlot(run, 1, { journal });
 		}
 		result = step(run, "abort-merge", [1]);
-		assert.equal(
-			result.status,
-			EC.REFUSED,
-			`${field}: ${result.stdout}\n${result.stderr}`,
-		);
-		assert.match(
-			result.stderr,
-			/identity|resource|symlink|registration/i,
-			field,
-		);
+		assert.equal(result.status, EC.REFUSED, `${field}: ${result.stdout}\n${result.stderr}`);
+		assert.match(result.stderr, /identity|resource|symlink|registration/i, field);
 		assert.ok(fs.existsSync(hwt), `${field}: zero removal`);
 	}
 });
@@ -877,10 +855,7 @@ function linkedBaseCheckout(run) {
 function foreignHarvestWorktree(run, slot = 1, sha = run.fork) {
 	const dir = path.join(run.sdir, `harvest-${run.runId}-s${slot}`);
 	h.git(run.repo, "worktree", "add", "-q", "--detach", dir, sha);
-	fs.appendFileSync(
-		path.join(run.repo, ".git/info/exclude"),
-		"precious.secret\n",
-	);
+	fs.appendFileSync(path.join(run.repo, ".git/info/exclude"), "precious.secret\n");
 	fs.writeFileSync(path.join(dir, "precious.secret"), "foreign ignored data\n");
 	return dir;
 }
@@ -899,10 +874,7 @@ test("abort-merge refuses a same-prefix foreign detached worktree and its ignore
 	const result = step(run, "abort-merge", [1]);
 	assert.equal(result.status, EC.REFUSED, `${result.stdout}\n${result.stderr}`);
 	assert.match(result.stderr, /resource identity failed/);
-	assert.equal(
-		fs.readFileSync(path.join(foreign, "precious.secret"), "utf8"),
-		"foreign ignored data\n",
-	);
+	assert.equal(fs.readFileSync(path.join(foreign, "precious.secret"), "utf8"), "foreign ignored data\n");
 	assert.match(h.git(run.repo, "worktree", "list").stdout, new RegExp(foreign));
 });
 
@@ -923,10 +895,7 @@ test("resume scan refuses same-prefix foreign harvest cleanup after the base lan
 	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 	assert.match(result.stderr, /cleanup was refused/);
 	assert.ok(fs.existsSync(path.join(foreign, "precious.secret")));
-	assert.ok(
-		run.slotRow(1).journal,
-		"failed cleanup retains exact recovery journal",
-	);
+	assert.ok(run.slotRow(1).journal, "failed cleanup retains exact recovery journal");
 });
 
 test("Abort journal cleanup and leftover sweep both quarantine same-prefix foreign worktrees", () => {
@@ -950,10 +919,7 @@ test("Abort journal cleanup and leftover sweep both quarantine same-prefix forei
 		);
 		assert.equal(result.status, 4, `${result.stdout}\n${result.stderr}`);
 		assert.ok(fs.existsSync(path.join(foreign, "precious.secret")));
-		assert.match(
-			result.stderr,
-			journaled ? /identity FAILED/ : /no exact live resource journal/,
-		);
+		assert.match(result.stderr, journaled ? /identity FAILED/ : /no exact live resource journal/);
 	}
 });
 
@@ -1038,11 +1004,7 @@ test("swap_base refuses a journal lacking exact harvest resource identity before
 	h.git(userWt, "checkout", "-q", "-b", "sidework");
 	const r = step(run, "resume", ["complete", 1]);
 	assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
-	assert.match(
-		r.stderr,
-		/identity failed before base swap/,
-		"the refusal is reported",
-	);
+	assert.match(r.stderr, /identity failed before base swap/, "the refusal is reported");
 	assert.equal(
 		h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(),
 		run.fork,

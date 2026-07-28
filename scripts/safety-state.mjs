@@ -15,9 +15,7 @@ function git(repo, args, encoding = "utf8") {
 		maxBuffer: 64 * 1024 * 1024,
 	});
 	if (result.error) {
-		throw new Error(
-			`git ${args.join(" ")} could not run for ${repo}: ${result.error.message}`,
-		);
+		throw new Error(`git ${args.join(" ")} could not run for ${repo}: ${result.error.message}`);
 	}
 	if (result.status !== 0) {
 		throw new Error(
@@ -154,11 +152,7 @@ function scan(stateDir, repo) {
 			// it disable an unrelated repository forever. Live generations and
 			// keyed records remain fail-closed because they may belong here.
 			if (isArchive && doc.repo_key == null) {
-				quarantined.push({
-					path: file,
-					run_id: doc.run_id,
-					reason: error.message,
-				});
+				quarantined.push({ path: file, run_id: doc.run_id, reason: error.message });
 				continue;
 			}
 			errors.push(`${file}: ${error.message}`);
@@ -176,10 +170,7 @@ function scan(stateDir, repo) {
 			run_id: doc.run_id,
 			workspace_id: isArchive
 				? null
-				: path
-						.basename(file)
-						.replace(/^run-/, "")
-						.replace(/\.json$/, ""),
+				: path.basename(file).replace(/^run-/, "").replace(/\.json$/, ""),
 			exclude_pattern_added: doc.exclude_pattern_added === true,
 		};
 		if (isArchive) archived.push(item);
@@ -232,11 +223,9 @@ function worktreeRegistrations(repo) {
 		if (field.startsWith("worktree ")) {
 			if (current) rows.push(current);
 			current = { path: field.slice(9), detached: false };
-		} else if (current && field.startsWith("HEAD "))
-			current.head = field.slice(5);
+		} else if (current && field.startsWith("HEAD ")) current.head = field.slice(5);
 		else if (current && field === "detached") current.detached = true;
-		else if (current && field.startsWith("branch "))
-			current.branch = field.slice(7);
+		else if (current && field.startsWith("branch ")) current.branch = field.slice(7);
 	}
 	if (current) rows.push(current);
 	return rows;
@@ -255,15 +244,7 @@ function parseHarvestJournal(raw) {
 	return { journal, resource };
 }
 
-function harvestBinding(
-	stateDir,
-	repo,
-	runId,
-	slot,
-	worktree,
-	journalRaw,
-	manifestFile,
-) {
+function harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manifestFile) {
 	if (!isSafeId(runId) || !/^[1-9][0-9]*$/.test(slot))
 		throw new Error("harvest resource run/slot binding is invalid");
 	const { journal, resource } = parseHarvestJournal(journalRaw);
@@ -292,9 +273,7 @@ function harvestBinding(
 		throw new Error("harvest resource must be a real directory, not a symlink");
 	const physical = fs.realpathSync(worktree);
 	if (physical !== expected)
-		throw new Error(
-			`harvest resource path is not the exact generation path ${expected}`,
-		);
+		throw new Error(`harvest resource path is not the exact generation path ${expected}`);
 	const worktreeIdentity = repoIdentity(physical);
 	if (
 		worktreeIdentity.repo_key !== identity.repo_key ||
@@ -326,13 +305,8 @@ function harvestBinding(
 	if (manifest.run_id !== runId)
 		throw new Error("live manifest run does not match harvest resource");
 	const owner = manifest.slots.find((row) => String(row.slot) === slot);
-	if (
-		!owner ||
-		JSON.stringify(owner.journal ?? null) !== JSON.stringify(journal)
-	)
-		throw new Error(
-			"harvest journal changed or is not owned by the exact slot",
-		);
+	if (!owner || JSON.stringify(owner.journal ?? null) !== JSON.stringify(journal))
+		throw new Error("harvest journal changed or is not owned by the exact slot");
 	const duplicates = manifest.slots.filter((row) => {
 		const other = row.journal?.resource;
 		return (
@@ -376,8 +350,7 @@ function canonicalInventory(repo, binding) {
 		if (output[i] !== 0) continue;
 		const item = output.subarray(start, i);
 		start = i + 1;
-		if (item.length === 0 || item.equals(Buffer.from(".swarm-task.md")))
-			continue;
+		if (item.length === 0 || item.equals(Buffer.from(".swarm-task.md"))) continue;
 		paths.push(Buffer.from(item));
 	}
 	paths.sort(Buffer.compare);
@@ -428,8 +401,7 @@ try {
 			);
 			break;
 		case "verify-harvest": {
-			const [stateDir, repo, runId, slot, worktree, journalRaw, manifestFile] =
-				args;
+			const [stateDir, repo, runId, slot, worktree, journalRaw, manifestFile] = args;
 			process.stdout.write(
 				`${JSON.stringify(harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manifestFile))}\n`,
 			);
@@ -442,8 +414,7 @@ try {
 		}
 		case "inventory": {
 			const [repo, bindingRaw, operationId] = args;
-			if (!isSafeId(operationId))
-				fail("cleanup inventory operation_id is invalid");
+			if (!isSafeId(operationId)) fail("cleanup inventory operation_id is invalid");
 			const binding = JSON.parse(bindingRaw);
 			const identity = repoIdentity(repo);
 			if (
@@ -478,8 +449,7 @@ try {
 				if (String(approval[key] ?? "") !== String(inventory[key] ?? ""))
 					fail(`cleanup approval ${key} mismatch`, 2);
 			}
-			if (approval.approved !== true)
-				fail("cleanup approval is not approved", 2);
+			if (approval.approved !== true) fail("cleanup approval is not approved", 2);
 			if (!isSafeId(approval.operation_id))
 				fail("cleanup approval operation_id is unsafe", 2);
 			const used = path.join(
