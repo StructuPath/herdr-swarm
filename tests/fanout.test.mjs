@@ -7,7 +7,17 @@ import path from "node:path";
 import { createHarness, repoRoot, sampleManifest } from "./harness.mjs";
 
 const h = createHarness();
-const { stubDir, stateDir, writeStub, freshEnv, runScript, runLib, log, makeRepo, git } = h;
+const {
+	stubDir,
+	stateDir,
+	writeStub,
+	freshEnv,
+	runScript,
+	runLib,
+	log,
+	makeRepo,
+	git,
+} = h;
 
 const manifestFile = path.join(stateDir, "run-w9.json");
 const paneScript = path.join(repoRoot, "scripts", "fanout-pane.sh");
@@ -205,7 +215,9 @@ function runPresets(snippet, env) {
 }
 
 test("presets: missing config yields the two built-in defaults", () => {
-	const env = freshEnv({ HERDR_PLUGIN_CONFIG_DIR: path.join(os.tmpdir(), "hs-no-such-cfg") });
+	const env = freshEnv({
+		HERDR_PLUGIN_CONFIG_DIR: path.join(os.tmpdir(), "hs-no-such-cfg"),
+	});
 	const l = runPresets("presets_list", env);
 	assert.equal(l.status, 0, l.stderr);
 	assert.equal(l.stdout, "claude\tclaude\ncodex\tcodex\n");
@@ -232,7 +244,10 @@ test("presets: config file parsed — comments/blanks skipped, kind carried, arg
 
 test("presets: an invalid name fails the whole catalog loudly, never skips", () => {
 	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
-	fs.writeFileSync(path.join(cfg, "presets.conf"), "ok|argv|echo hi\nbad name|argv|echo boom\n");
+	fs.writeFileSync(
+		path.join(cfg, "presets.conf"),
+		"ok|argv|echo hi\nbad name|argv|echo boom\n",
+	);
 	const env = freshEnv({ HERDR_PLUGIN_CONFIG_DIR: cfg });
 	const l = runPresets("presets_list", env);
 	assert.notEqual(l.status, 0);
@@ -245,7 +260,9 @@ test("presets: an invalid name fails the whole catalog loudly, never skips", () 
 });
 
 test("presets: unknown and hostile preset names are refused", () => {
-	const env = freshEnv({ HERDR_PLUGIN_CONFIG_DIR: path.join(os.tmpdir(), "hs-no-such-cfg") });
+	const env = freshEnv({
+		HERDR_PLUGIN_CONFIG_DIR: path.join(os.tmpdir(), "hs-no-such-cfg"),
+	});
 	const u = runPresets("preset_argv nope", env);
 	assert.notEqual(u.status, 0);
 	assert.match(u.stderr, /unknown preset 'nope'/);
@@ -254,7 +271,12 @@ test("presets: unknown and hostile preset names are refused", () => {
 	// accidental match ("../claude" must not become "claude").
 	const hostile = spawnSync(
 		"bash",
-		["-c", `. "${repoRoot}/scripts/presets.sh" && preset_argv "$1"`, "--", "../claude"],
+		[
+			"-c",
+			`. "${repoRoot}/scripts/presets.sh" && preset_argv "$1"`,
+			"--",
+			"../claude",
+		],
 		{ env, encoding: "utf8" },
 	);
 	assert.notEqual(hostile.status, 0);
@@ -281,7 +303,10 @@ test("fanout.sh opens the fan-out pane on 0.7.5 as well", () => {
 	const { env } = setup({ STUB_HERDR_VERSION: "0.7.5" });
 	const r = runScript("fanout.sh", [], env);
 	assert.equal(r.status, 0, r.stderr);
-	assert.match(log(), /plugin pane open --plugin structupath\.swarm --entrypoint fanout-pane/);
+	assert.match(
+		log(),
+		/plugin pane open --plugin structupath\.swarm --entrypoint fanout-pane/,
+	);
 });
 
 test("fanout.sh refuses below the 0.7.4 floor before opening anything", () => {
@@ -297,13 +322,28 @@ test("fanout.sh refuses below the 0.7.4 floor before opening anything", () => {
 test("N=3 fans out exactly 3 creates + 3 starts on distinct run-unique branches", () => {
 	const { repo, wtRoot, env } = setup();
 	const r = runPane(
-		lines(["3", "", "", "", "Build the widget", "Second line", ".", "", "", ""]),
+		lines([
+			"3",
+			"",
+			"",
+			"",
+			"Build the widget",
+			"Second line",
+			".",
+			"",
+			"",
+			"",
+		]),
 		env,
 		repo,
 	);
 	assert.equal(r.status, 0, r.stderr);
-	const creates = log().split("\n").filter((l) => /worktree create/.test(l));
-	const starts = log().split("\n").filter((l) => /agent start/.test(l));
+	const creates = log()
+		.split("\n")
+		.filter((l) => /worktree create/.test(l));
+	const starts = log()
+		.split("\n")
+		.filter((l) => /agent start/.test(l));
 	assert.equal(creates.length, 3);
 	assert.equal(starts.length, 3);
 	// Spike (k): --workspace alone leaves the agent in the server's cwd, so
@@ -312,18 +352,28 @@ test("N=3 fans out exactly 3 creates + 3 starts on distinct run-unique branches"
 	const m = readManifest();
 	assert.match(m.run_id, /^\d{8}-\d{6}-[0-9a-f]{4}$/, "timestamp+nonce run id");
 	assert.equal(m.slots.length, 3);
-	assert.equal(new Set(m.slots.map((s) => s.branch)).size, 3, "branches distinct");
+	assert.equal(
+		new Set(m.slots.map((s) => s.branch)).size,
+		3,
+		"branches distinct",
+	);
 	for (const s of m.slots) {
 		assert.equal(s.status, "running");
 		assert.equal(s.branch, `swarm/${m.run_id}/s${s.slot}-claude`);
-		assert.ok(s.path && s.path.startsWith(wtRoot), `path from response: ${s.path}`);
+		assert.ok(
+			s.path && s.path.startsWith(wtRoot),
+			`path from response: ${s.path}`,
+		);
 		// Running rows carry the ids the START returned, not the root pane's.
 		assert.equal(s.pane_id, "wD:p2");
 		assert.match(s.terminal_id, /^term_swarm-/);
 		assert.match(s.agent_name, /^swarm-/);
 		assert.equal(s.workspace_id, "wD");
 	}
-	assert.match(log(), /plugin pane open --plugin structupath\.swarm --entrypoint status-pane/);
+	assert.match(
+		log(),
+		/plugin pane open --plugin structupath\.swarm --entrypoint status-pane/,
+	);
 	assert.match(r.stdout, /created 3, started 3, failed 0/);
 });
 
@@ -337,7 +387,10 @@ test("write-ahead ordering: pending row before create, path before start, runnin
 		// Snapshot the stub took INSIDE `worktree create`: the pending row was
 		// already on disk, path still null — the manifest led the mutation.
 		const atCreate = JSON.parse(
-			fs.readFileSync(path.join(stateDir, `snap-create-${s.branch.replace(/\//g, "-")}.json`), "utf8"),
+			fs.readFileSync(
+				path.join(stateDir, `snap-create-${s.branch.replace(/\//g, "-")}.json`),
+				"utf8",
+			),
 		);
 		const rowC = atCreate.slots.find((x) => x.branch === s.branch);
 		assert.ok(rowC, `pending row on disk before create of ${s.branch}`);
@@ -346,7 +399,10 @@ test("write-ahead ordering: pending row before create, path before start, runnin
 		// Snapshot inside `agent start`: path recorded, but running only after
 		// the start returns its ids.
 		const atStart = JSON.parse(
-			fs.readFileSync(path.join(stateDir, `snap-start-${s.agent_name}.json`), "utf8"),
+			fs.readFileSync(
+				path.join(stateDir, `snap-start-${s.agent_name}.json`),
+				"utf8",
+			),
 		);
 		const rowS = atStart.slots.find((x) => x.branch === s.branch);
 		assert.ok(rowS.path, "path recorded before agent start");
@@ -372,8 +428,18 @@ test("slot 2 create failure keeps slots 1 and 3 running and reports loudly (R4)"
 		["running", "failed", "running"],
 	);
 	assert.equal(m.slots[1].path, null, "failed slot never got a path");
-	assert.equal(log().split("\n").filter((l) => /worktree create/.test(l)).length, 3);
-	assert.equal(log().split("\n").filter((l) => /agent start/.test(l)).length, 2);
+	assert.equal(
+		log()
+			.split("\n")
+			.filter((l) => /worktree create/.test(l)).length,
+		3,
+	);
+	assert.equal(
+		log()
+			.split("\n")
+			.filter((l) => /agent start/.test(l)).length,
+		2,
+	);
 	assert.match(r.stdout, /created 2, started 2, failed 1/);
 	assert.match(r.stderr, /slot 2 FAILED/);
 	assert.match(r.stderr, /WARNING: 1 slot\(s\) FAILED/);
@@ -384,7 +450,11 @@ test("kill between create-return and path-record leaves a pending-null-path row,
 	const r = await spawnPane(lines(["1", "", "Kill test", ".", ""]), env, repo, {
 		detached: true,
 	});
-	assert.equal(r.signal, "SIGKILL", `expected the stub to kill the pane: ${r.stderr}`);
+	assert.equal(
+		r.signal,
+		"SIGKILL",
+		`expected the stub to kill the pane: ${r.stderr}`,
+	);
 	const m = readManifest();
 	assert.equal(m.slots.length, 1);
 	// The write-ahead row survived the crash exactly as written: pending,
@@ -442,17 +512,26 @@ test("stub 0.7.5: fan-out completes end-to-end with an arbitrary command as the 
 	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
 	// Not one of herdr's ~14 integration kinds — exactly the case 0.7.5's
 	// --kind whitelist cannot express.
-	fs.writeFileSync(path.join(cfg, "presets.conf"), "custom|argv|my-agent --loop\n");
+	fs.writeFileSync(
+		path.join(cfg, "presets.conf"),
+		"custom|argv|my-agent --loop\n",
+	);
 	writeStub("my-agent", "exit 0");
 	const { repo, wtRoot, env } = setup({
 		STUB_HERDR_VERSION: "0.7.5",
 		HERDR_PLUGIN_CONFIG_DIR: cfg,
 	});
-	const r = runPane(lines(["2", "", "", "Do the thing", ".", "", ""]), env, repo);
+	const r = runPane(
+		lines(["2", "", "", "Do the thing", ".", "", ""]),
+		env,
+		repo,
+	);
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stdout, /created 2, started 2, failed 0/);
 
-	const calls = log().split("\n").filter((l) => l.startsWith("herdr "));
+	const calls = log()
+		.split("\n")
+		.filter((l) => l.startsWith("herdr "));
 	// Not a single agent start on this path — and never a --kind.
 	assert.doesNotMatch(log(), /agent start/);
 	assert.doesNotMatch(log(), /--kind/);
@@ -476,11 +555,17 @@ test("stub 0.7.5: fan-out completes end-to-end with an arbitrary command as the 
 		// worktree and THIS slot's pane: split (in the worktree) → run (the
 		// argv) → report-agent (working). A run before the split, or a split
 		// without the worktree cwd, puts the agent in the server's cwd.
-		const iSplit = calls.findIndex((l) => l.includes(`pane split`) && l.includes(`--cwd ${s.path} `));
+		const iSplit = calls.findIndex(
+			(l) => l.includes(`pane split`) && l.includes(`--cwd ${s.path} `),
+		);
 		assert.ok(iSplit >= 0, `split targeted ${s.path}:\n${calls.join("\n")}`);
 		assert.match(calls[iSplit], /--no-focus/);
-		const iRun = calls.findIndex((l) => l.startsWith(`herdr pane run ${s.pane_id} `));
-		const iRep = calls.findIndex((l) => l.startsWith(`herdr pane report-agent ${s.pane_id} `));
+		const iRun = calls.findIndex((l) =>
+			l.startsWith(`herdr pane run ${s.pane_id} `),
+		);
+		const iRep = calls.findIndex((l) =>
+			l.startsWith(`herdr pane report-agent ${s.pane_id} `),
+		);
 		assert.ok(iSplit < iRun, "split before run");
 		assert.ok(iRun < iRep, "run before report-agent");
 		// The preset's argv reaches the pane verbatim.
@@ -492,12 +577,20 @@ test("stub 0.7.5: fan-out completes end-to-end with an arbitrary command as the 
 	}
 	// Same write-ahead contract as the 0.7.4 branch: the pending row with a
 	// recorded path was on disk before the pane that starts the agent existed.
-	const atSplit = JSON.parse(fs.readFileSync(path.join(stateDir, "snap-split-1.json"), "utf8"));
+	const atSplit = JSON.parse(
+		fs.readFileSync(path.join(stateDir, "snap-split-1.json"), "utf8"),
+	);
 	assert.equal(atSplit.slots[0].status, "pending");
-	assert.ok(atSplit.slots[0].path, "path recorded before the slot's pane was split");
+	assert.ok(
+		atSplit.slots[0].path,
+		"path recorded before the slot's pane was split",
+	);
 	// Real worktrees on real branches, same as 0.7.4.
 	for (const s of m.slots) {
-		assert.ok(fs.existsSync(path.join(s.path, ".swarm-task.md")), `task file in ${s.path}`);
+		assert.ok(
+			fs.existsSync(path.join(s.path, ".swarm-task.md")),
+			`task file in ${s.path}`,
+		);
 	}
 });
 
@@ -508,10 +601,17 @@ test("stub 0.7.5: a pane-split failure fails only its own slot", () => {
 		STUB_HERDR_VERSION: "0.7.5",
 		STUB_FAIL_SPLIT_MATCH: "s2-",
 	});
-	const r = runPane(lines(["3", "", "", "", "Task", ".", "", "", ""]), env, repo);
+	const r = runPane(
+		lines(["3", "", "", "", "Task", ".", "", "", ""]),
+		env,
+		repo,
+	);
 	assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
 	const m = readManifest();
-	assert.deepEqual(m.slots.map((s) => s.status), ["running", "failed", "running"]);
+	assert.deepEqual(
+		m.slots.map((s) => s.status),
+		["running", "failed", "running"],
+	);
 	// The worktree WAS created before the start failed, so the failed slot
 	// keeps its recorded path — that is what makes it reapable by abort.
 	assert.ok(m.slots[1].path, "failed slot keeps its write-ahead path");
@@ -523,8 +623,18 @@ test("stub 0.7.5: a pane-split failure fails only its own slot", () => {
 	assert.match(r.stderr, /slot 2 FAILED/);
 	// No orphan: the failing slot never got a pane, so nothing was left to run
 	// argv in — and no report-agent advertised a slot that is not working.
-	assert.equal(log().split("\n").filter((l) => /pane run/.test(l)).length, 2);
-	assert.equal(log().split("\n").filter((l) => /pane report-agent/.test(l)).length, 2);
+	assert.equal(
+		log()
+			.split("\n")
+			.filter((l) => /pane run/.test(l)).length,
+		2,
+	);
+	assert.equal(
+		log()
+			.split("\n")
+			.filter((l) => /pane report-agent/.test(l)).length,
+		2,
+	);
 });
 
 // --- fan-out pane: task file, overrides, presets, detritus --------------------
@@ -554,11 +664,16 @@ test("per-slot override lands in .swarm-task.md with the standing footer, exclud
 
 test("a configured preset's argv reaches agent start verbatim", () => {
 	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
-	fs.writeFileSync(path.join(cfg, "presets.conf"), "fast|argv|echo hello-fast\n");
+	fs.writeFileSync(
+		path.join(cfg, "presets.conf"),
+		"fast|argv|echo hello-fast\n",
+	);
 	const { repo, env } = setup({ HERDR_PLUGIN_CONFIG_DIR: cfg });
 	const r = runPane(lines(["1", "fast", "Preset test", ".", ""]), env, repo);
 	assert.equal(r.status, 0, r.stderr);
-	const start = log().split("\n").find((l) => /agent start/.test(l));
+	const start = log()
+		.split("\n")
+		.find((l) => /agent start/.test(l));
 	assert.match(start, / -- echo hello-fast$/);
 	const m = readManifest();
 	assert.equal(m.slots[0].branch, `swarm/${m.run_id}/s1-fast`);
@@ -570,7 +685,12 @@ test("detritus prompt: choosing delete clears the leftovers and the fan-out proc
 	const r = runPane(lines(["d", "1", "", "Cleanup run", ".", ""]), env, repo);
 	assert.equal(r.status, 0, `stderr: ${r.stderr}`);
 	assert.match(r.stdout, /deleted branch swarm\/r0\/s1/);
-	const refs = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout;
+	const refs = git(
+		repo,
+		"for-each-ref",
+		"--format=%(refname:short)",
+		"refs/heads/swarm",
+	).stdout;
 	assert.doesNotMatch(refs, /swarm\/r0\/s1/, "old branch gone");
 	assert.equal(readManifest().slots.length, 1, "new run created after cleanup");
 });
@@ -589,7 +709,8 @@ function seedUnmergedLeftover(repo, branch = "swarm/r0/s1") {
 }
 
 const branchRefs = (repo) =>
-	git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout;
+	git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm")
+		.stdout;
 
 test("detritus delete: an UNMERGED leftover is not deleted without the second typed confirmation", () => {
 	const { repo, env } = setup();
@@ -653,7 +774,9 @@ test("detritus delete: an archived run recording the branch is named as the harv
 			fork_sha: "a".repeat(40),
 			created_at: "2026-07-22T15:00:00Z",
 			exclude_pattern_added: false,
-			slots: [{ slot: 1, label: "s1", branch: "swarm/r0/s1", status: "archived" }],
+			slots: [
+				{ slot: 1, label: "s1", branch: "swarm/r0/s1", status: "archived" },
+			],
 		}),
 	);
 	const r = runPane(lines(["d", "n", "1", "", "Task", ".", ""]), env, repo);
@@ -673,7 +796,10 @@ test("setup.sh hook runs in each worktree; failure warns but slots still start",
 		assert.equal(r.status, 0, r.stderr);
 		for (const s of readManifest().slots) {
 			assert.equal(s.status, "running");
-			assert.ok(fs.existsSync(path.join(s.path, ".setup-ran")), `marker in ${s.path}`);
+			assert.ok(
+				fs.existsSync(path.join(s.path, ".setup-ran")),
+				`marker in ${s.path}`,
+			);
 		}
 		assert.doesNotMatch(r.stderr, /setup\.sh failed/);
 	}
@@ -740,9 +866,17 @@ test("fan-out targets the workspace's repo, not the process cwd", () => {
 	assert.notEqual(m.fork_sha, headB, "fork_sha is NOT the cwd repo's HEAD");
 
 	// 2. Branch and worktree landed in A.
-	const branchesA = git(repoA, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm")
-		.stdout.trim();
-	assert.equal(branchesA, `swarm/${m.run_id}/s1-claude`, "swarm branch created in A");
+	const branchesA = git(
+		repoA,
+		"for-each-ref",
+		"--format=%(refname:short)",
+		"refs/heads/swarm",
+	).stdout.trim();
+	assert.equal(
+		branchesA,
+		`swarm/${m.run_id}/s1-claude`,
+		"swarm branch created in A",
+	);
 	assert.match(
 		git(repoA, "worktree", "list", "--porcelain").stdout,
 		new RegExp(`branch refs/heads/swarm/${m.run_id}/s1-claude`),
@@ -753,18 +887,28 @@ test("fan-out targets the workspace's repo, not the process cwd", () => {
 	//    is the half that fails loudly if a single call site regresses to a
 	//    bare `git` while the rest of the flow still looks correct.
 	assert.equal(
-		git(repoB, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout.trim(),
+		git(
+			repoB,
+			"for-each-ref",
+			"--format=%(refname:short)",
+			"refs/heads/swarm",
+		).stdout.trim(),
 		"",
 		"no swarm branch in the cwd repo",
 	);
 	assert.equal(
-		git(repoB, "worktree", "list", "--porcelain").stdout.trim().split("\n\n").length,
+		git(repoB, "worktree", "list", "--porcelain").stdout.trim().split("\n\n")
+			.length,
 		1,
 		"cwd repo still has only its own working tree",
 	);
 	const excludeA = path.join(repoA, ".git/info/exclude");
 	const excludeB = path.join(repoB, ".git/info/exclude");
-	assert.match(fs.readFileSync(excludeA, "utf8"), /^\.swarm-task\.md$/m, "A excluded");
+	assert.match(
+		fs.readFileSync(excludeA, "utf8"),
+		/^\.swarm-task\.md$/m,
+		"A excluded",
+	);
 	assert.doesNotMatch(
 		fs.existsSync(excludeB) ? fs.readFileSync(excludeB, "utf8") : "",
 		/\.swarm-task\.md/,
@@ -796,14 +940,22 @@ test("env-driven: SLOTS+PRESETS+TASK fan out with no stdin at all", () => {
 	assert.equal(m.slots[1].branch, `swarm/${m.run_id}/s2-codex`);
 	for (const s of m.slots) {
 		assert.equal(s.status, "running");
-		assert.ok(s.path && s.path.startsWith(wtRoot), `path from response: ${s.path}`);
+		assert.ok(
+			s.path && s.path.startsWith(wtRoot),
+			`path from response: ${s.path}`,
+		);
 		assert.match(
 			fs.readFileSync(path.join(s.path, ".swarm-task.md"), "utf8"),
 			/Ship the thing/,
 		);
 	}
 	// Real branches in the real repo, not just manifest bookkeeping.
-	const refs = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout;
+	const refs = git(
+		repo,
+		"for-each-ref",
+		"--format=%(refname:short)",
+		"refs/heads/swarm",
+	).stdout;
 	assert.match(refs, new RegExp(`swarm/${m.run_id}/s1-claude`));
 	assert.match(refs, new RegExp(`swarm/${m.run_id}/s2-codex`));
 });
@@ -831,12 +983,20 @@ test("env-driven: a PRESETS/SLOTS count mismatch refuses before anything is crea
 	});
 	const r = runPaneNoStdin(env, repo);
 	assert.notEqual(r.status, 0);
-	assert.match(r.stderr, /lists 2 preset name\(s\) but the run has 3 slot\(s\)/);
+	assert.match(
+		r.stderr,
+		/lists 2 preset name\(s\) but the run has 3 slot\(s\)/,
+	);
 	// R3: refuse before creating. No worktree, no branch, no manifest.
 	assert.doesNotMatch(log(), /worktree create/);
 	assert.equal(fs.existsSync(manifestFile), false, "no manifest was written");
 	assert.equal(
-		git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm").stdout.trim(),
+		git(
+			repo,
+			"for-each-ref",
+			"--format=%(refname:short)",
+			"refs/heads/swarm",
+		).stdout.trim(),
 		"",
 	);
 });
@@ -850,12 +1010,18 @@ test("env-driven: an unknown preset name is refused, with the name in the messag
 	const r = runPaneNoStdin(env, repo);
 	assert.notEqual(r.status, 0);
 	assert.match(r.stderr, /unknown preset 'no-such-preset'/);
-	assert.match(r.stderr, /HERDR_SWARM_PRESETS names an unusable preset 'no-such-preset'/);
+	assert.match(
+		r.stderr,
+		/HERDR_SWARM_PRESETS names an unusable preset 'no-such-preset'/,
+	);
 	assert.doesNotMatch(log(), /worktree create/);
 });
 
 test("env-driven: TASK_FILE contents land in every slot with the standing footer, and beat TASK", () => {
-	const taskFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-task-")), "brief.md");
+	const taskFile = path.join(
+		fs.mkdtempSync(path.join(os.tmpdir(), "hs-task-")),
+		"brief.md",
+	);
 	fs.writeFileSync(taskFile, "Line one of the brief\nLine two of the brief\n");
 	const { repo, env } = setup({
 		HERDR_SWARM_SLOTS: "2",
@@ -873,7 +1039,10 @@ test("env-driven: TASK_FILE contents land in every slot with the standing footer
 		assert.doesNotMatch(tf, /must lose/, "TASK_FILE wins over TASK");
 		assert.match(tf, /Commit completed work locally/);
 		assert.match(tf, /Never push/);
-		assert.match(tf, new RegExp(`Work only in this worktree, on branch ${s.branch}`));
+		assert.match(
+			tf,
+			new RegExp(`Work only in this worktree, on branch ${s.branch}`),
+		);
 	}
 });
 
@@ -914,7 +1083,10 @@ test("env-driven: an unknown DETRITUS value is refused", () => {
 	git(repo, "branch", "swarm/r0/merged");
 	const r = runPaneNoStdin(env, repo);
 	assert.notEqual(r.status, 0);
-	assert.match(r.stderr, /HERDR_SWARM_DETRITUS='nuke' is not one of delete \/ rename \/ abort/);
+	assert.match(
+		r.stderr,
+		/HERDR_SWARM_DETRITUS='nuke' is not one of delete \/ rename \/ abort/,
+	);
 	assert.match(branchRefs(repo), /swarm\/r0\/merged/, "nothing was touched");
 });
 
@@ -972,7 +1144,12 @@ test("env-driven: DETRITUS=rename keeps the work and the fan-out proceeds", () =
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stdout, /renamed swarm\/r0\/s1 -> swarm-kept\/r0\/s1/);
 	assert.equal(
-		git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/swarm-kept").stdout.trim(),
+		git(
+			repo,
+			"for-each-ref",
+			"--format=%(refname:short)",
+			"refs/heads/swarm-kept",
+		).stdout.trim(),
 		"swarm-kept/r0/s1",
 		"the committed work is still reachable",
 	);
@@ -990,7 +1167,11 @@ test("env-driven: a missing required var fails loudly by name instead of hanging
 		// complete run still needs.
 	});
 	const r = await runPaneStalledStdin(env, repo);
-	assert.equal(r.signal, null, "the pane must exit on its own, never be killed for hanging");
+	assert.equal(
+		r.signal,
+		null,
+		"the pane must exit on its own, never be killed for hanging",
+	);
 	assert.notEqual(r.code, 0);
 	assert.match(r.stderr, /needs HERDR_SWARM_TASK_FILE or HERDR_SWARM_TASK/);
 	assert.match(r.stderr, /stdin is not a terminal/);
@@ -1008,7 +1189,11 @@ test("env-driven: leftover detritus with no DETRITUS var fails by name, not by h
 	});
 	git(repo, "branch", "swarm/r0/merged");
 	const r = await runPaneStalledStdin(env, repo);
-	assert.equal(r.signal, null, "the pane must exit on its own, never be killed for hanging");
+	assert.equal(
+		r.signal,
+		null,
+		"the pane must exit on its own, never be killed for hanging",
+	);
 	assert.notEqual(r.code, 0);
 	assert.match(r.stderr, /needs HERDR_SWARM_DETRITUS/);
 	assert.match(branchRefs(repo), /swarm\/r0\/merged/, "nothing was touched");
@@ -1020,8 +1205,16 @@ test("env-driven: leftover detritus with no DETRITUS var fails by name, not by h
 // pins the SCRIPTED=0 seam itself).
 test("no env vars set: the interactive stdin protocol is untouched", () => {
 	const { repo, env } = setup();
-	const r = runPane(lines(["1", "", "Interactive still works", ".", ""]), env, repo);
+	const r = runPane(
+		lines(["1", "", "Interactive still works", ".", ""]),
+		env,
+		repo,
+	);
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	assert.match(r.stdout, /Available presets:/, "the preset menu is still printed");
+	assert.match(
+		r.stdout,
+		/Available presets:/,
+		"the preset menu is still printed",
+	);
 	assert.equal(readManifest().slots.length, 1);
 });
