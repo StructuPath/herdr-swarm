@@ -181,7 +181,13 @@ test("Abort removes a landed exact harvest generation and archives every slot", 
 	});
 	assert.equal(result.status, 99, `${result.stdout}\n${result.stderr}`);
 	const journal = run.slotRow(1).journal;
-	h.git(run.repo, "update-ref", "refs/heads/main", journal.merge_commit_sha, run.fork);
+	h.git(
+		run.repo,
+		"update-ref",
+		"refs/heads/main",
+		journal.merge_commit_sha,
+		run.fork,
+	);
 	result = abort(run);
 	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 	assert.equal(fs.existsSync(journal.worktree), false);
@@ -199,7 +205,13 @@ test("Abort exits nonzero when a removed exact harvest generation cannot clear i
 	});
 	assert.equal(result.status, 99, `${result.stdout}\n${result.stderr}`);
 	const journal = run.slotRow(1).journal;
-	h.git(run.repo, "update-ref", "refs/heads/main", journal.merge_commit_sha, run.fork);
+	h.git(
+		run.repo,
+		"update-ref",
+		"refs/heads/main",
+		journal.merge_commit_sha,
+		run.fork,
+	);
 	const backup = path.join(run.sdir, "run-w9.json.bak");
 	fs.rmSync(backup, { force: true });
 	fs.symlinkSync(path.join(run.sdir, "missing-parent", "backup"), backup);
@@ -207,10 +219,17 @@ test("Abort exits nonzero when a removed exact harvest generation cannot clear i
 	result = abort(run);
 	assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
 	assert.equal(fs.existsSync(run.wt(1)), false, "slot removal completed");
-	assert.equal(fs.existsSync(journal.worktree), false, "harvest removal completed");
+	assert.equal(
+		fs.existsSync(journal.worktree),
+		false,
+		"harvest removal completed",
+	);
 	assert.match(result.stderr, /journal update failed|bookkeeping failure/);
 	assert.ok(fs.existsSync(path.join(run.sdir, "run-w9.json")));
-	assert.equal(fs.existsSync(path.join(run.sdir, `archived-${run.runId}.json`)), false);
+	assert.equal(
+		fs.existsSync(path.join(run.sdir, `archived-${run.runId}.json`)),
+		false,
+	);
 });
 
 test("full harvest archives exactly once, removes the live pointer/exclude, and retry is idempotent", () => {
@@ -331,7 +350,10 @@ test("a stale foreign legacy archive is quarantined without bricking this reposi
 		path.join(run.sdir, "archived-stale-foreign.json"),
 		JSON.stringify(stale),
 	);
-	const scan = h.runLib(`bookkeeping_scan ${JSON.stringify(run.repo)}`, run.env);
+	const scan = h.runLib(
+		`bookkeeping_scan ${JSON.stringify(run.repo)}`,
+		run.env,
+	);
 	assert.equal(scan.status, 0, scan.stderr);
 	const parsed = JSON.parse(scan.stdout);
 	assert.deepEqual(parsed.errors, []);

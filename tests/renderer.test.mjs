@@ -257,7 +257,10 @@ exit 0`,
 	const r = quiet(mkRenderer(h.freshEnv()));
 	r.gitBin = path.join(h.stubDir, "git");
 	const manifest = JSON.parse(sampleManifest());
-	const facts = await r.gitFactsFor(manifest, { ...manifest.slots[1], path: wt });
+	const facts = await r.gitFactsFor(manifest, {
+		...manifest.slots[1],
+		path: wt,
+	});
 	assert.equal(facts.branchMissing, true);
 });
 
@@ -385,12 +388,12 @@ test("sanitizeText strips C0/C1, bidi overrides, and zero-width from a hostile b
 		sanitizeText("swarm/\x1b]0;PWNED\x07r1/\x9bs1"),
 		"swarm/]0;PWNEDr1/s1",
 	);
-	assert.equal(
-		sanitizeText("swarm/good‮/1s/1r‬"),
-		"swarm/good/1s/1r",
-	);
+	assert.equal(sanitizeText("swarm/good‮/1s/1r‬"), "swarm/good/1s/1r");
 	assert.equal(sanitizeText("a​b﻿c\td"), "abc d");
-	assert.equal(sanitizeText("plain — unicode ✓ stays"), "plain — unicode ✓ stays");
+	assert.equal(
+		sanitizeText("plain — unicode ✓ stays"),
+		"plain — unicode ✓ stays",
+	);
 });
 
 test("renderStatus marks blocked rows loud (inverse+red) and shows every column", () => {
@@ -492,7 +495,9 @@ exit 0`,
 	);
 	let env = h.freshEnv();
 	let r = quiet(mkRenderer(env));
-	r.rows = [{ slot: 2, pane_id: "w9:p4", workspace_id: "w9", state: "blocked" }];
+	r.rows = [
+		{ slot: 2, pane_id: "w9:p4", workspace_id: "w9", state: "blocked" },
+	];
 	r.onKey("2"); // the actual key path users hit
 	assert.ok(
 		await until(() => h.log().includes("agent focus")),
@@ -504,7 +509,9 @@ exit 0`,
 	// Agent focus fails (agent gone, plugin-scoped reach): workspace fallback.
 	env = h.freshEnv({ STUB_FOCUS_EXIT: "1" });
 	r = quiet(mkRenderer(env));
-	r.rows = [{ slot: 2, pane_id: "w9:p4", workspace_id: "w9", state: "unknown" }];
+	r.rows = [
+		{ slot: 2, pane_id: "w9:p4", workspace_id: "w9", state: "unknown" },
+	];
 	await r.jumpToSlot(2);
 	assert.match(h.log(), /herdr agent focus w9:p4/);
 	assert.match(h.log(), /herdr workspace focus w9/);
@@ -648,7 +655,11 @@ test("harvest step is bounded: a hung verb is killed, busy clears, banner explai
 	assert.equal(res.timedOut, true);
 	assert.notEqual(res.code, 0, "a timeout is a failure, not a silent success");
 	assert.equal(r.busy, false, "busy must clear or the pane masks every key");
-	assert.match(r.banner, /timed out/, "the user learns why the pane went quiet");
+	assert.match(
+		r.banner,
+		/timed out/,
+		"the user learns why the pane went quiet",
+	);
 	assert.match(r.lastErrLine(res), /timed out/);
 	assert.match(r.lastErrLine(res), /merge/, "the stuck verb is named");
 	// Destructive verbs legitimately take a while: the default stays generous.
@@ -669,14 +680,21 @@ test("stale journal: the list phase offers abort-merge and 'a' dispatches it", a
 	const view = renderHarvest({ phase: { name: "list" }, rows: [row] }, 120);
 	assert.match(view, /a:abort stale merge \(slot 1\)/);
 	assert.doesNotMatch(
-		renderHarvest({ phase: { name: "list" }, rows: [{ ...row, journal: null }] }, 120),
+		renderHarvest(
+			{ phase: { name: "list" }, rows: [{ ...row, journal: null }] },
+			120,
+		),
 		/abort stale merge/,
 		"no journal, no destructive affordance",
 	);
 	const r = mkHarvest();
 	r.rows = [row];
 	await r.onKey("a");
-	assert.deepEqual(r.calls, [["abort-merge", 1]], "routed through step(), not raw git");
+	assert.deepEqual(
+		r.calls,
+		[["abort-merge", 1]],
+		"routed through step(), not raw git",
+	);
 });
 
 test("resume_stale becomes a stale phase whose 'a' clears the wedged journal", async () => {
@@ -692,7 +710,11 @@ test("resume_stale becomes a stale phase whose 'a' clears the wedged journal", a
 	assert.equal(r.phase.idx, 1, "the queue advances to the next stale slot");
 	await r.onKey("n"); // leave slot 3 journaled
 	assert.deepEqual(r.calls, [["abort-merge", 2]], "'n' must not mutate");
-	assert.equal(r.phase.name, "list", "the queue drains back to the resting phase");
+	assert.equal(
+		r.phase.name,
+		"list",
+		"the queue drains back to the resting phase",
+	);
 	assert.equal(r.enterStalePhase(), false, "queue consumed exactly once");
 });
 
@@ -708,17 +730,41 @@ test("the resume queue hands off to the stale queue instead of dropping it", asy
 test("terminal preview states — empty and external_merged included — archive", async () => {
 	// The preview verb already wrote skipped/merged to the manifest for these
 	// two; without them the only route to archiving was a manual re-preview.
-	for (const state of ["merged", "skipped", "failed", "empty", "external_merged"]) {
+	for (const state of [
+		"merged",
+		"skipped",
+		"failed",
+		"empty",
+		"external_merged",
+	]) {
 		const r = mkHarvest();
 		r.rows = [
-			{ slot: 1, label: "s1", branch: "b", status: "merged", preview: { state, dirty: 0 } },
+			{
+				slot: 1,
+				label: "s1",
+				branch: "b",
+				status: "merged",
+				preview: { state, dirty: 0 },
+			},
 		];
 		await r.selectSlot(1);
-		assert.deepEqual(r.calls, [["archive", 1]], `'${state}' must route to archive`);
+		assert.deepEqual(
+			r.calls,
+			[["archive", 1]],
+			`'${state}' must route to archive`,
+		);
 	}
 	// Anything genuinely non-terminal still refuses to act.
 	const r = mkHarvest();
-	r.rows = [{ slot: 1, label: "s1", branch: "b", status: "running", preview: { state: "missing" } }];
+	r.rows = [
+		{
+			slot: 1,
+			label: "s1",
+			branch: "b",
+			status: "running",
+			preview: { state: "missing" },
+		},
+	];
 	await r.selectSlot(1);
 	assert.deepEqual(r.calls, [], "an unknown state must never trigger a verb");
 	assert.match(r.banner, /nothing to do here/);
@@ -749,11 +795,18 @@ test("agent-supplied state text cannot smuggle escapes into any rendered view", 
 	// …and so does the resume offer's merge-commit SHA.
 	const resume = renderHarvest(
 		{
-			phase: { name: "resume", offers: [{ slot: 1, sha: "\x1b]0;pwn\x07dead" }], idx: 0 },
+			phase: {
+				name: "resume",
+				offers: [{ slot: 1, sha: "\x1b]0;pwn\x07dead" }],
+				idx: 0,
+			},
 			rows: [],
 		},
 		120,
 	);
-	assert.ok(!resume.includes("\x1b]"), `escape survived the resume view:\n${resume}`);
+	assert.ok(
+		!resume.includes("\x1b]"),
+		`escape survived the resume view:\n${resume}`,
+	);
 	assert.ok(!resume.includes("\x07"));
 });

@@ -27,11 +27,20 @@ test("sanitize_slug strips path-dangerous chars to [a-zA-Z0-9_-]", () => {
 		// this function exists to neutralize.
 		const r = spawnSync(
 			"bash",
-			["-c", `. "${repoRoot}/scripts/lib.sh" && sanitize_slug "$1"`, "--", input],
+			[
+				"-c",
+				`. "${repoRoot}/scripts/lib.sh" && sanitize_slug "$1"`,
+				"--",
+				input,
+			],
 			{ env: freshEnv(), encoding: "utf8" },
 		);
 		assert.equal(r.status, 0, `${input}: ${r.stderr}`);
-		assert.equal(r.stdout.trim(), want, `sanitize_slug(${JSON.stringify(input)})`);
+		assert.equal(
+			r.stdout.trim(),
+			want,
+			`sanitize_slug(${JSON.stringify(input)})`,
+		);
 	}
 });
 
@@ -50,14 +59,20 @@ test("sanitize_slug refuses input that strips to nothing (no silent default)", (
 
 test("state_dir expands a literal leading ~ instead of creating ./~", () => {
 	const rel = `.cache/hs-tilde-test-${process.pid}`;
-	const r = runLib("state_dir", freshEnv({ HERDR_PLUGIN_STATE_DIR: `~/${rel}` }));
+	const r = runLib(
+		"state_dir",
+		freshEnv({ HERDR_PLUGIN_STATE_DIR: `~/${rel}` }),
+	);
 	assert.equal(r.status, 0, r.stderr);
 	assert.equal(r.stdout.trim(), path.join(os.homedir(), rel));
 	fs.rmSync(path.join(os.homedir(), rel), { recursive: true, force: true });
 });
 
 test("state_dir rejects relative paths and falls back to the default", () => {
-	const r = runLib("state_dir", freshEnv({ HERDR_PLUGIN_STATE_DIR: "rel/path" }));
+	const r = runLib(
+		"state_dir",
+		freshEnv({ HERDR_PLUGIN_STATE_DIR: "rel/path" }),
+	);
 	assert.equal(r.status, 0, r.stderr);
 	assert.equal(
 		r.stdout.trim(),
@@ -237,7 +252,10 @@ test("herdr_agent_start drops --split-from on the 0.7.4 path", () => {
 		`herdr_agent_start slot1 --split-from w9:p1 --cwd /tmp/wt/s1 --no-focus -- claude`,
 	);
 	assert.equal(r.status, 0, r.stderr);
-	assert.match(log(), /herdr agent start slot1 --cwd \/tmp\/wt\/s1 --no-focus -- claude/);
+	assert.match(
+		log(),
+		/herdr agent start slot1 --cwd \/tmp\/wt\/s1 --no-focus -- claude/,
+	);
 	assert.doesNotMatch(log(), /--split-from/);
 });
 
@@ -253,12 +271,21 @@ test("herdr_agent_start on 0.7.5 splits, runs, and reports — never calls agent
 		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
 	);
 	assert.equal(r.status, 0, r.stderr);
-	const calls = log().split("\n").filter((l) => l.startsWith("herdr "));
+	const calls = log()
+		.split("\n")
+		.filter((l) => l.startsWith("herdr "));
 	const order = calls.filter((l) => /pane (split|run|report-agent)/.test(l));
-	assert.equal(order.length, 3, `expected 3 pane calls, got:\n${calls.join("\n")}`);
+	assert.equal(
+		order.length,
+		3,
+		`expected 3 pane calls, got:\n${calls.join("\n")}`,
+	);
 	// Order is load-bearing: the pane must exist before argv runs in it, and
 	// the agent must not be advertised as working before its argv is running.
-	assert.match(order[0], new RegExp(`pane split w9:p1 --direction down --cwd ${wt} --no-focus`));
+	assert.match(
+		order[0],
+		new RegExp(`pane split w9:p1 --direction down --cwd ${wt} --no-focus`),
+	);
 	assert.match(order[1], /pane run w9:p7 claude --model opus/);
 	assert.match(
 		order[2],
@@ -290,7 +317,10 @@ test("the 0.7.5 path refuses before splitting when the worktree cwd is missing",
 	// And without an anchor pane, `pane split` would split the user's own
 	// focused pane (it has no --workspace).
 	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
-	const noAnchor = runLib(`herdr_agent_start swarm-r1-s1 --cwd ${wt} -- claude`, env);
+	const noAnchor = runLib(
+		`herdr_agent_start swarm-r1-s1 --cwd ${wt} -- claude`,
+		env,
+	);
 	assert.notEqual(noAnchor.status, 0);
 	assert.match(noAnchor.stderr, /needs --split-from/);
 	assert.doesNotMatch(log(), /pane split/);
@@ -368,7 +398,10 @@ test("report_slot_agent_state reports on 0.7.5+ and no-ops on 0.7.4", () => {
 		log(),
 		/pane report-agent w9:p7 --source structupath\.swarm --agent swarm-r1-s1 --state idle/,
 	);
-	const off = runLib(`report_slot_agent_state w9:p7 swarm-r1-s1 idle`, freshEnv());
+	const off = runLib(
+		`report_slot_agent_state w9:p7 swarm-r1-s1 idle`,
+		freshEnv(),
+	);
 	assert.equal(off.status, 0, off.stderr);
 	assert.doesNotMatch(log(), /report-agent/);
 	// A slot with no recorded pane (a pending row) is skipped, never reported
@@ -390,7 +423,10 @@ test("herdr_agent_wait requires --timeout so no call site can wait forever", () 
 		`herdr_agent_wait term_abc123 --status idle --timeout 5000`,
 	);
 	assert.equal(ok.status, 0, ok.stderr);
-	assert.match(log(), /herdr agent wait term_abc123 --status idle --timeout 5000/);
+	assert.match(
+		log(),
+		/herdr agent wait term_abc123 --status idle --timeout 5000/,
+	);
 });
 
 test("herdr_pane_open pins --plugin to this plugin's id", () => {
@@ -559,7 +595,10 @@ test("every harvest-worktree removal route uses the shared exact verifier/remove
 		path.join(repoRoot, "scripts/harvest-step.sh"),
 		"utf8",
 	);
-	const abort = fs.readFileSync(path.join(repoRoot, "scripts/abort.sh"), "utf8");
+	const abort = fs.readFileSync(
+		path.join(repoRoot, "scripts/abort.sh"),
+		"utf8",
+	);
 	const lib = fs.readFileSync(path.join(repoRoot, "scripts/lib.sh"), "utf8");
 	assert.doesNotMatch(harvest, /worktree remove "\$(?:hwt|wt|jwt|d)"/);
 	assert.doesNotMatch(abort, /worktree remove "\$(?:hwt|jwt|d)"/);
@@ -583,7 +622,10 @@ test("every harvest-worktree removal route uses the shared exact verifier/remove
 // alone silently narrows the safety net to nothing, with no runtime error —
 // this test is the lockstep.
 test("preflight's pane-title sweep set matches the manifest's [[panes]] titles exactly", () => {
-	const toml = fs.readFileSync(path.join(repoRoot, "herdr-plugin.toml"), "utf8");
+	const toml = fs.readFileSync(
+		path.join(repoRoot, "herdr-plugin.toml"),
+		"utf8",
+	);
 	// [[panes]] blocks only: [[actions]] also has `title =` keys, and only the
 	// pane titles are sweep labels.
 	const paneTitles = toml
@@ -594,7 +636,10 @@ test("preflight's pane-title sweep set matches the manifest's [[panes]] titles e
 		.map((m) => m[1]);
 	assert.equal(paneTitles.length, 3, "manifest declares all three panes");
 
-	const pf = fs.readFileSync(path.join(repoRoot, "scripts", "preflight.sh"), "utf8");
+	const pf = fs.readFileSync(
+		path.join(repoRoot, "scripts", "preflight.sh"),
+		"utf8",
+	);
 	const set = pf.match(/const titles = new Set\(\[([^\]]*)\]\)/);
 	assert.ok(set, "preflight.sh still declares a hardcoded pane-title set");
 	const swept = [...set[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
@@ -607,7 +652,10 @@ test("preflight's pane-title sweep set matches the manifest's [[panes]] titles e
 });
 
 test("every script the manifest references exists on disk", () => {
-	const toml = fs.readFileSync(path.join(repoRoot, "herdr-plugin.toml"), "utf8");
+	const toml = fs.readFileSync(
+		path.join(repoRoot, "herdr-plugin.toml"),
+		"utf8",
+	);
 	const refs = [...toml.matchAll(/"scripts\/([^"]+)"/g)].map((m) => m[1]);
 	assert.ok(refs.length >= 8, "manifest lists all actions and panes");
 	for (const ref of refs) {
