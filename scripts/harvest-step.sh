@@ -14,9 +14,9 @@
 #
 # Output protocol: machine-readable "key<TAB>value…" lines on stdout, human
 # messages on stderr, typed exit codes (HS_EC_*) so the renderer branches on
-# codes, never on prose. Every invocation takes the per-repo mutation lock —
-# the same "mutate-$(ws_id)" every launcher uses — so an abort can never reap
-# a worktree mid-merge.
+# codes, never on prose. Every invocation takes the physical-repository
+# mutation lock every launcher uses, so workspace aliases cannot race and an
+# abort can never reap a worktree mid-merge.
 #
 # Env contract (all optional):
 #   HERDR_SWARM_CONFIRM               discard's confirmation token; must equal
@@ -24,8 +24,8 @@
 #                                     user in the renderer, re-verified here —
 #                                     the renderer's prompt alone is UI, not a
 #                                     guard)
-#   HERDR_SWARM_ACK_IGNORED=1         archive: user acknowledged the
-#                                     ignored-file inventory
+#   HERDR_SWARM_CLEANUP_APPROVAL      archive: exact one-use JSON approval
+#                                     emitted by the ignored inventory preview
 #   HERDR_SWARM_HARVEST_WT_NO_HOOKS=1 disable repo hooks in the plugin-owned
 #                                     harvest worktree ONLY (hook-policy KTD:
 #                                     fresh worktrees lack node_modules, so
@@ -65,32 +65,32 @@ VERB="${1-}"
 }
 shift
 
-# One mutation lock per verb invocation (destructive-surface KTD): fan-out,
-# harvest verbs, abort, and prune all contend on this name.
-acquire_lock "mutate-$(ws_id)" || exit 1
-trap 'release_lock "mutate-$(ws_id)"' EXIT
-
 # --- Run + slot context ------------------------------------------------------
-
-# Manifest read up front: missing (2) or corrupt (3) refuses every verb with
-# the lib's own exit code — never guess against unreadable bookkeeping.
-DOC="$(manifest_read)" || exit $?
 
 # Internal field separator is ASCII unit separator (\x1f), NOT tab: tab is
 # IFS *whitespace*, so bash collapses runs of it and empty fields silently
 # shift every later field left — exactly the bug for nullable columns.
 US=$'\x1f'
 
-# Run context from the shared extractor (lib.sh): the guard is the
-# extractor's; the refusal wording is ours.
+# The workspace-named manifest is only a repository-discovery hint. Select the
+# one exact live generation for that physical repository under its lock, so a
+# reopened/aliased workspace reaches the same run and multiples fail closed.
+REPO_HINT="$(discover_live_repo)" || {
+	echo "herdr-swarm: cannot resolve the workspace repository — cannot harvest." >&2
+	exit "$MANIFEST_EC_MISSING"
+}
+SWARM_REPO="$REPO_HINT"
+export SWARM_REPO
+MUTATION_LOCK="$(repo_mutation_lock_name "$REPO_HINT")" || exit 1
+acquire_lock "$MUTATION_LOCK" || exit 1
+trap 'release_lock "$MUTATION_LOCK"' EXIT
+bind_live_manifest_locked "$REPO_HINT" || exit $?
+DOC="$(manifest_read)" || exit $?
 CTX="$(manifest_run_context "$DOC")" || {
 	echo "herdr-swarm: manifest has no usable run_id/repo_root — cannot harvest." >&2
 	exit 1
 }
 IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF FORK_SHA <<<"$CTX"
-# Pin the repo_git seam (lib.sh) to the MANIFEST's repo: every call site here
-# already passes `git -C "$REPO_ROOT"`, but preflight.sh helpers sourced above
-# resolve through SWARM_REPO, whose source-time default was cwd-based.
 SWARM_REPO="$REPO_ROOT"
 export SWARM_REPO
 # run_id is interpolated into the harvest worktree path ($(state_dir)/harvest-
@@ -173,17 +173,21 @@ journal_field() {
 # record written BEFORE git mutates anything, so a crash inside the merge
 # critical section is detected and resumable on the next open (manifest KTD).
 journal_set() {
-	local slot="$1" patch
+	local slot="$1" locus="$2" expected="$3" merge_sha="$4" wt="$5" generation="${6-}" patch identity
+	identity="$(repo_identity_json "$REPO_ROOT")" || return 1
 	patch="$(node -e '
-		const [locus, expected, mergeSha, wt] = process.argv.slice(1);
-		process.stdout.write(JSON.stringify({ journal: {
-			locus,
-			expected_base_sha: expected,
-			merge_commit_sha: mergeSha || null,
-			worktree: wt || null,
-		}}));
-	' "$2" "$3" "$4" "$5")" || return 1
-	manifest_update_slot "$slot" "$patch"
+		const [locus,expected,mergeSha,wt,generation,identity,runId,slot]=process.argv.slice(1);
+		const journal={locus,expected_base_sha:expected,merge_commit_sha:mergeSha||null,worktree:wt||null};
+		if(locus==="detached") {
+			const id=JSON.parse(identity);
+			if(!generation) process.exit(2);
+			journal.resource={type:"harvest",repo_key:id.repo_key,git_common_dir:id.git_common_dir,
+				run_id:runId,slot,path:wt,generation,head:mergeSha||expected};
+		}
+		process.stdout.write(JSON.stringify({journal}));
+	' "$locus" "$expected" "$merge_sha" "$wt" "$generation" "$identity" "$RUN_ID" "$slot")" || return 1
+	manifest_update_slot "$slot" "$patch" || return $?
+	SLOT_JOURNAL="$(printf '%s' "$patch" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.stringify(JSON.parse(d).journal)))')"
 }
 
 journal_clear() {
@@ -261,7 +265,16 @@ run_merge() {
 # merge and resume-complete. Three-arg update-ref IS the guarantee (KTD): a
 # check-then-plain-write has exactly the clobber window this exists to close.
 swap_base() {
-	local slot="$1" expected="$2" new="$3" hwt="$4" lp
+	local slot="$1" expected="$2" new="$3" hwt="$4" lp cleanup_rc=0
+	# A resumed journal must prove the exact detached resource before it can
+	# advance the base ref. This prevents a forged worktree pointer from being
+	# treated as trusted merely because its merge commit is plausible.
+	if [ -n "$hwt" ]; then
+		verify_harvest_resource "$RUN_ID" "$slot" "$hwt" "$SLOT_JOURNAL" >/dev/null || {
+			echo "herdr-swarm: harvest resource identity failed before base swap; base unchanged and resource kept." >&2
+			return "$HS_EC_REFUSED"
+		}
+	fi
 	# Millisecond guard (KTD): the locus decision can go stale between the
 	# merge and this write — a base checked out NOW means update-ref would
 	# desync that checkout's index; refuse and let resume finish the swap.
@@ -276,27 +289,19 @@ swap_base() {
 		echo "herdr-swarm: base $BASE_REF moved during the merge — swap FAILED, base unchanged. Merge commit $new is journaled and kept${hwt:+ in $hwt}; reopen harvest to re-preview." >&2
 		return "$HS_EC_SWAP"
 	fi
-	manifest_update_slot "$slot" '{"status":"merged","journal":null}'
-	# Ownership guard (belt-and-braces against the user-tree-locus journal):
-	# journal.worktree holds the USER's checkout for the user-tree locus, and
-	# `git worktree remove` DOES delete a base checked out in a linked worktree
-	# (only a MAIN working tree is refused) — so the removal below is a user-
-	# data-loss hazard for any path that is not plugin-owned. Callers already
-	# gate on locus = detached; this is the second lock on the same door.
-	if [ -n "$hwt" ]; then
-		case "$hwt" in
-		"$(state_dir)"/harvest-*) ;;
-		*)
-			echo "herdr-swarm: refusing to remove $hwt — not a plugin-owned harvest worktree (kept untouched)." >&2
-			hwt=""
-			;;
-		esac
-	fi
+	# Record the landed merge while retaining the exact resource journal until
+	# deletion succeeds. A crash or approval refusal therefore remains safely
+	# resumable instead of creating an unverifiable leftover path.
+	manifest_update_slot "$slot" '{"status":"merged"}' || return 1
 	if [ -n "$hwt" ] && [ -d "$hwt" ]; then
-		# Clean after a committed merge, so no --force is needed; a refusal
-		# here is bookkeeping noise, not data loss — report, never force.
-		git -C "$REPO_ROOT" worktree remove "$hwt" 2>/dev/null ||
-			echo "herdr-swarm: note: kept harvest worktree $hwt (remove refused)" >&2
+		remove_harvest_resource "$RUN_ID" "$slot" "$hwt" "$SLOT_JOURNAL" || cleanup_rc=$?
+		case "$cleanup_rc" in
+		0) journal_clear "$slot" || return 1 ;;
+		"$HS_EC_IGNORED") echo "herdr-swarm: merge landed; harvest worktree kept until the emitted ignored-file approval is applied via resume." >&2 ;;
+		*) echo "herdr-swarm: merge landed; harvest worktree kept because exact cleanup verification/removal failed." >&2 ;;
+		esac
+	else
+		journal_clear "$slot" || return 1
 	fi
 	printf 'merged\t%s\n' "$new"
 }
@@ -489,15 +494,17 @@ do_merge() {
 }
 
 merge_detached() {
-	local slot="$1" expected="$2" hwt rc=0 new
-	hwt="$(state_dir)/harvest-$RUN_ID-s$slot"
+	local slot="$1" expected="$2" hwt generation rc=0 new
+	generation="$(cleanup_operation_id)" || return 1
+	hwt="$(state_dir)/harvest-$RUN_ID-s$slot-$generation"
 	if [ -e "$hwt" ]; then
-		echo "herdr-swarm: leftover harvest worktree $hwt — resume or abort-merge first." >&2
+		echo "herdr-swarm: harvest generation path already exists at $hwt — refused." >&2
 		return "$HS_EC_REFUSED"
 	fi
 	# Intent journaled BEFORE the worktree exists: abort/resume must always
-	# over-approximate what might be on disk (manifest KTD).
-	journal_set "$slot" detached "$expected" "" "$hwt" || return 1
+	# over-approximate what might be on disk (manifest KTD). The generation is
+	# part of both the exact path and the resource identity.
+	journal_set "$slot" detached "$expected" "" "$hwt" "$generation" || return 1
 	# Plain git worktree add --detach, never `herdr worktree create` — that
 	# would mint a branch and open a workspace (merge-locus KTD).
 	if ! git -C "$REPO_ROOT" worktree add --detach "$hwt" "$expected"; then
@@ -516,7 +523,7 @@ merge_detached() {
 	new="$(git -C "$hwt" rev-parse HEAD)" || return 1
 	# The merge commit's SHA lands in the journal the moment it exists: a
 	# crash between here and the swap is detected by resume, never silent.
-	journal_set "$slot" detached "$expected" "$new" "$hwt" || return 1
+	journal_set "$slot" detached "$expected" "$new" "$hwt" "$generation" || return 1
 	# Test seams for the crash window — see file header.
 	if [ -n "${HERDR_SWARM_TEST_DIE_BEFORE_SWAP:-}" ]; then exit 99; fi
 	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_SWAP:-}" ]; then
@@ -599,24 +606,28 @@ do_resume() {
 		return $?
 	fi
 	# Scan every journaled slot; each line is a typed fact for the renderer.
-	local slot locus expected msha hwt
-	while IFS="$US" read -r slot locus expected msha hwt; do
+	local slot locus expected msha hwt journal cleanup_rc
+	while IFS="$US" read -r slot locus expected msha hwt journal; do
 		[ -n "$slot" ] || continue
+		SLOT_JOURNAL="$journal"
 		if [ -z "$msha" ]; then
 			# Crash (or conflict-stall) before a merge commit existed.
 			printf 'resume_stale\t%s\n' "$slot"
 			echo "herdr-swarm: slot $slot has a journaled merge intent with no commit — abort-merge cleans it up." >&2
 		elif [ "$cur" = "$msha" ]; then
-			# The swap itself landed before the crash; only bookkeeping is
-			# missing — finish it.
-			manifest_update_slot "$slot" '{"status":"merged","journal":null}' || true
-			# locus gate (abort.sh:235's rule): only the detached locus journals
-			# a plugin-owned worktree. The user-tree locus journals the USER's
-			# checkout, and `git worktree remove` deletes a LINKED-worktree
-			# checkout of the base — removing it here would destroy user work.
+			# The swap itself landed before the crash; retain the journal until
+			# the exact generation is removed (or prove it is already absent).
+			manifest_update_slot "$slot" '{"status":"merged"}' || return 1
+			cleanup_rc=0
 			if [ "$locus" = "detached" ] && [ -n "$hwt" ] && [ -d "$hwt" ]; then
-				git -C "$REPO_ROOT" worktree remove "$hwt" 2>/dev/null ||
-					echo "herdr-swarm: note: kept harvest worktree $hwt" >&2
+				remove_harvest_resource "$RUN_ID" "$slot" "$hwt" "$journal" || cleanup_rc=$?
+				if [ "$cleanup_rc" -eq 0 ]; then
+					journal_clear "$slot" || return 1
+				else
+					echo "herdr-swarm: slot $slot landed merge remains journaled; exact harvest cleanup was refused or needs approval." >&2
+				fi
+			else
+				journal_clear "$slot" || return 1
 			fi
 			printf 'resume_completed\t%s\t%s\n' "$slot" "$msha"
 		elif [ "$cur" = "$expected" ]; then
@@ -635,7 +646,7 @@ do_resume() {
 				if (!s.journal) continue;
 				const j = s.journal;
 				console.log([s.slot, j.locus ?? "", j.expected_base_sha ?? "",
-					j.merge_commit_sha ?? "", j.worktree ?? ""].join("\x1f"));
+					j.merge_commit_sha ?? "", j.worktree ?? "", JSON.stringify(j)].join("\x1f"));
 			}
 		});
 	')"
@@ -646,6 +657,11 @@ do_archive() {
 	read_slot "$1" || return $?
 	case "$SLOT_STATUS" in
 	merged | skipped | failed) ;;
+	archived)
+		finalize_run "$REPO_ROOT" "$RUN_ID" || return $?
+		printf 'archived\t%s\n' "$1"
+		return 0
+		;;
 	*)
 		echo "herdr-swarm: slot $1 is '$SLOT_STATUS' — only merged/skipped/failed slots can be archived." >&2
 		return "$HS_EC_REFUSED"
@@ -679,17 +695,44 @@ do_archive() {
 		# remove is not an error — just settle the bookkeeping.
 		manifest_update_slot "$1" '{"status":"archived"}' || return 1
 		printf 'archived\t%s\n' "$1"
+		finalize_run "$REPO_ROOT" "$RUN_ID" || return $?
 		return 0
 	fi
-	# Ignored files are the ONE class `worktree remove` deletes silently
-	# (spike (h)) — inventory first; the plugin's own task file is exempt.
-	local inv
-	inv="$(git -C "$SLOT_PATH" status --ignored --porcelain |
-		awk -v tf="$SWARM_TASK_FILE" '/^!! /{f=substr($0,4); if (f != tf) print f}')"
-	if [ -n "$inv" ] && [ "${HERDR_SWARM_ACK_IGNORED:-0}" != "1" ]; then
-		printf '%s\n' "$inv" | sed $'s/^/ignored\t/'
-		echo "herdr-swarm: slot $1 worktree holds ignored files that removal would silently delete — acknowledge to proceed." >&2
+	# Cleanup is preview/apply, not a process-global boolean. The recursive
+	# inventory is canonicalized as NUL-delimited path bytes and its digest is
+	# bound to repo/run/slot/physical worktree/operation. Apply re-verifies
+	# ownership and recomputes immediately before the first removal call.
+	local operation inventory count used rechecked why
+	operation="$(printf '%s' "${HERDR_SWARM_CLEANUP_APPROVAL:-}" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);if(a.operation_id)process.stdout.write(String(a.operation_id));}catch{}});
+	')"
+	[ -n "$operation" ] || operation="$(cleanup_operation_id)" || return 1
+	inventory="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_PATH" "$operation")" || return 1
+	count="$(cleanup_inventory_count "$inventory")" || return 1
+	if [ "$count" -gt 0 ]; then
+		used="$(cleanup_approval_validate "$inventory")" || {
+			print_cleanup_inventory "$inventory"
+			echo "herdr-swarm: slot $1 worktree holds ignored files; apply requires the exact one-use cleanup approval emitted by this preview." >&2
+			return "$HS_EC_IGNORED"
+		}
+	fi
+	if [ -n "${HERDR_SWARM_TEST_CLEANUP_READY_FILE:-}" ]; then : >"$HERDR_SWARM_TEST_CLEANUP_READY_FILE"; fi
+	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK:-}" ]; then
+		sleep "$HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK"
+	fi
+	if ! why="$(verify_slot_ownership "$RUN_ID" "$SLOT_BRANCH" "$SLOT_PATH")"; then
+		echo "herdr-swarm: slot $1 ownership changed before cleanup — $why; removal refused." >&2
+		return "$HS_EC_REFUSED"
+	fi
+	rechecked="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_PATH" "$operation")" || return 1
+	if [ "$(printf '%s' "$inventory" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')" != \
+		"$(printf '%s' "$rechecked" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')" ]; then
+		print_cleanup_inventory "$rechecked"
+		echo "herdr-swarm: cleanup inventory changed after preview — zero removal performed; review the new digest." >&2
 		return "$HS_EC_IGNORED"
+	fi
+	if [ "$count" -gt 0 ]; then
+		cleanup_approval_consume "$used" || return "$HS_EC_REFUSED"
 	fi
 	local out rc=0
 	if [ -n "$SLOT_WS" ]; then
@@ -722,8 +765,23 @@ do_archive() {
 			return 1
 		fi
 	fi
+	# Herdr success is not the disk authority (stale server responses and test
+	# doubles can leave the registered worktree behind). Re-verify and reconcile
+	# with plain git before declaring the slot archived/finalizable.
+	if [ -d "$SLOT_PATH" ]; then
+		if ! why="$(verify_slot_ownership "$RUN_ID" "$SLOT_BRANCH" "$SLOT_PATH")"; then
+			echo "herdr-swarm: slot $1 still exists after Herdr removal and ownership no longer matches — kept, not archived: $why" >&2
+			return "$HS_EC_REFUSED"
+		fi
+		out="$(git -C "$REPO_ROOT" worktree remove "$SLOT_PATH" 2>&1)" || {
+			if [ -n "$(git -C "$SLOT_PATH" status --porcelain 2>/dev/null)" ]; then return "$HS_EC_DIRTY"; fi
+			printf '%s\n' "$out" >&2
+			return 1
+		}
+	fi
 	manifest_update_slot "$1" '{"status":"archived"}' || return 1
 	printf 'archived\t%s\n' "$1"
+	finalize_run "$REPO_ROOT" "$RUN_ID" || return $?
 }
 
 do_abort_merge() {
@@ -739,9 +797,12 @@ do_abort_merge() {
 	cur="$(base_sha)" || return 1
 	if [ "$locus" = "detached" ]; then
 		if [ -n "$msha" ] && [ "$cur" = "$msha" ]; then
-			# The swap already landed — this is resume_completed territory.
-			manifest_update_slot "$1" '{"status":"merged","journal":null}' || return 1
-			[ -d "$wt" ] && { git -C "$REPO_ROOT" worktree remove "$wt" 2>/dev/null || true; }
+			# The swap already landed — settle only after exact cleanup succeeds.
+			manifest_update_slot "$1" '{"status":"merged"}' || return 1
+			if [ -d "$wt" ]; then
+				remove_harvest_resource "$RUN_ID" "$1" "$wt" "$SLOT_JOURNAL" || return $?
+			fi
+			journal_clear "$1" || return 1
 			printf 'aborted\talready-swapped\n'
 			return 0
 		fi
@@ -753,25 +814,21 @@ do_abort_merge() {
 			return "$HS_EC_REFUSED"
 		fi
 		if [ -d "$wt" ]; then
-			# An empty journal sha does NOT prove there is no merge commit: a
-			# crash between the merge commit's rev-parse and its journal_set
-			# leaves a real, un-swapped merge commit in a worktree the journal
-			# never learned about. Removing it makes that commit unreachable —
-			# the same hazard abort.sh:243-251 guards, with the same test:
-			# a HEAD that is not an ancestor of base is possibly un-swapped
-			# work, so keep it and report the SHA (never silently unreachable).
 			local head_sha
 			head_sha="$(git -C "$wt" rev-parse --verify HEAD 2>/dev/null || true)"
 			if [ -n "$head_sha" ] &&
 				! git -C "$REPO_ROOT" merge-base --is-ancestor "$head_sha" "$BASE_REF" 2>/dev/null; then
-				echo "herdr-swarm: slot $1 worktree $wt has HEAD $head_sha, which is NOT on $BASE_BRANCH — possibly an un-swapped merge commit the journal lost (crash before the SHA was recorded). KEPT for recovery; abort refused." >&2
+				echo "herdr-swarm: slot $1 worktree $wt has HEAD $head_sha, which is NOT on $BASE_BRANCH — possibly an un-swapped merge commit the journal lost. KEPT for recovery." >&2
 				return "$HS_EC_REFUSED"
 			fi
-			# May or may not be mid-merge (a crash before the merge started
-			# leaves a clean worktree) — abort is best-effort by design.
+			# Verify before aborting the merge: merge --abort itself resets tracked
+			# state and must never run against a forged foreign journal.
+			verify_harvest_resource "$RUN_ID" "$1" "$wt" "$SLOT_JOURNAL" >/dev/null || {
+				echo "herdr-swarm: slot $1 harvest resource identity failed — kept untouched." >&2
+				return "$HS_EC_REFUSED"
+			}
 			git -C "$wt" merge --abort 2>/dev/null || true
-			git -C "$REPO_ROOT" worktree remove "$wt" 2>/dev/null ||
-				echo "herdr-swarm: kept $wt (dirty after abort — inspect by hand)" >&2
+			remove_harvest_resource "$RUN_ID" "$1" "$wt" "$SLOT_JOURNAL" || return $?
 		fi
 		journal_clear "$1" || return 1
 		printf 'aborted\t%s\n' "$1"

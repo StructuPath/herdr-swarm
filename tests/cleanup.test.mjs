@@ -40,9 +40,13 @@ const run = (r, script, extraEnv = {}, cwd = r.repo) =>
 	});
 
 const branchExists = (repo, b) =>
-	spawnSync("git", ["-C", repo, "rev-parse", "--verify", "-q", `refs/heads/${b}`], {
-		encoding: "utf8",
-	}).status === 0;
+	spawnSync(
+		"git",
+		["-C", repo, "rev-parse", "--verify", "-q", `refs/heads/${b}`],
+		{
+			encoding: "utf8",
+		},
+	).status === 0;
 
 const count = (haystack, needle) => haystack.split(needle).length - 1;
 
@@ -58,10 +62,18 @@ test("abort closes tracked panes exactly once and the label sweep spares the dec
 	const a = run(r, "abort.sh");
 	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
 	const log = h.log();
-	assert.equal(count(log, "pane close w9:p9"), 1, "tracked+swept pane closed once");
+	assert.equal(
+		count(log, "pane close w9:p9"),
+		1,
+		"tracked+swept pane closed once",
+	);
 	// w9:p4 is a plain user terminal pane in the stub pane list (no plugin
 	// label) — the sweep matches manifest pane titles only, so it survives.
-	assert.equal(log.includes("pane close w9:p4"), false, "decoy user pane untouched");
+	assert.equal(
+		log.includes("pane close w9:p4"),
+		false,
+		"decoy user pane untouched",
+	);
 	assert.equal(fs.existsSync(path.join(r.sdir, "status-pane-w9")), false);
 	assert.match(a.stdout, /abort summary/);
 });
@@ -84,7 +96,7 @@ test("dirty slot worktree is KEPT and reported — never prompted, never forced"
 // what it cannot verify — but it also never lets one unverifiable row abandon
 // the rest of the teardown, so the mismatch KEEPS and reports rather than
 // exiting.
-test("abort KEEPS a slot whose branch is outside the run namespace and still tears the rest down", () => {
+test("abort refuses every deletion when a slot branch makes bookkeeping semantically unknown", () => {
 	const r = mkRun({ slots: 2 });
 	// A cross-repo or hand-edited manifest row: this branch is not ours, so
 	// neither is anything it names.
@@ -92,14 +104,13 @@ test("abort KEEPS a slot whose branch is outside the run namespace and still tea
 		d.slots.find((s) => s.slot === 1).branch = "swarm/some-other-run/s1";
 	});
 	const a = run(r, "abort.sh");
-	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
+	assert.equal(a.status, 3, `${a.stdout}\n${a.stderr}`);
 	assert.equal(fs.existsSync(r.wt(1)), true, "unverifiable worktree survives");
-	assert.match(a.stderr, /slot 1 KEPT — ownership check failed/);
-	assert.match(a.stderr, /outside this run's namespace/);
-	// The whole run is not abandoned over one bad row.
-	assert.equal(fs.existsSync(r.wt(2)), false, "slot 2 was still reaped");
-	assert.match(a.stdout, /worktrees removed 1, kept 1/);
-	assert.equal(r.slotRow(1).status, "running", "kept slot is not marked archived");
+	assert.equal(fs.existsSync(r.wt(2)), true, "all deletion is refused");
+	assert.match(a.stderr, /bookkeeping_unknown/);
+	assert.match(a.stderr, /outside the run namespace/);
+	assert.doesNotMatch(h.log(), /worktree remove|pane close/);
+	assert.equal(r.slotRow(1).status, "running", "manifest is untouched");
 });
 
 test("abort KEEPS a slot whose recorded path is another branch's worktree", () => {
@@ -116,7 +127,11 @@ test("abort KEEPS a slot whose recorded path is another branch's worktree", () =
 	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
 	assert.match(a.stderr, /slot 1 KEPT — ownership check failed/);
 	assert.match(a.stderr, /is not a worktree of .* checked out on/);
-	assert.equal(fs.existsSync(r.wt(2)), true, "the other slot's worktree untouched");
+	assert.equal(
+		fs.existsSync(r.wt(2)),
+		true,
+		"the other slot's worktree untouched",
+	);
 });
 
 // The recovery route abort prints is Harvest, and Harvest reads the LIVE
@@ -139,7 +154,11 @@ test("abort that KEPT a dirty slot leaves the run ACTIVE: manifest stays live an
 	);
 	assert.match(a.stdout, /stays ACTIVE/);
 	assert.ok(a.stdout.includes(r.wt(1)), "the kept worktree is listed by path");
-	assert.equal(r.slotRow(1).status, "running", "kept slot is not marked archived");
+	assert.equal(
+		r.slotRow(1).status,
+		"running",
+		"kept slot is not marked archived",
+	);
 });
 
 // The exclude file is shared repo-wide: dropping the pattern while a kept
@@ -152,10 +171,14 @@ test("abort that KEPT a slot also keeps the .swarm-task.md exclude pattern", () 
 	const lines = fs
 		.readFileSync(path.join(r.repo, ".git/info/exclude"), "utf8")
 		.split("\n");
-	assert.ok(lines.includes(".swarm-task.md"), "pattern survives a kept-work abort");
+	assert.ok(
+		lines.includes(".swarm-task.md"),
+		"pattern survives a kept-work abort",
+	);
 	assert.equal(
-		spawnSync("git", ["-C", r.wt(1), "status", "--porcelain"], { encoding: "utf8" })
-			.stdout.includes(".swarm-task.md"),
+		spawnSync("git", ["-C", r.wt(1), "status", "--porcelain"], {
+			encoding: "utf8",
+		}).stdout.includes(".swarm-task.md"),
 		false,
 		"task file still invisible to git status in the kept worktree",
 	);
@@ -170,13 +193,19 @@ test("harvest worktree with unmerged paths is a LIVE conflict: kept untouched, n
 	commitIn(r.wt(1), "conflict.txt", "slot side\n");
 	const hwt = path.join(r.sdir, `harvest-${r.runId}-s1`);
 	h.git(r.repo, "worktree", "add", "-q", "--detach", hwt, "main");
-	const m = spawnSync("git", ["-C", hwt, "merge", "--no-ff", "-m", "swarm merge", r.branch(1)], {
-		encoding: "utf8",
-		env: { PATH: "/usr/bin:/bin", HOME: os.homedir(), ...gitIdent },
-	});
+	const m = spawnSync(
+		"git",
+		["-C", hwt, "merge", "--no-ff", "-m", "swarm merge", r.branch(1)],
+		{
+			encoding: "utf8",
+			env: { PATH: "/usr/bin:/bin", HOME: os.homedir(), ...gitIdent },
+		},
+	);
 	assert.notEqual(m.status, 0, "fixture must actually conflict");
 	assert.notEqual(
-		spawnSync("git", ["-C", hwt, "ls-files", "-u"], { encoding: "utf8" }).stdout.trim(),
+		spawnSync("git", ["-C", hwt, "ls-files", "-u"], {
+			encoding: "utf8",
+		}).stdout.trim(),
 		"",
 		"fixture must leave unmerged index entries",
 	);
@@ -190,9 +219,15 @@ test("harvest worktree with unmerged paths is a LIVE conflict: kept untouched, n
 	});
 	const a = run(r, "abort.sh");
 	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`);
-	assert.equal(fs.existsSync(hwt), true, "conflicted harvest worktree survives");
+	assert.equal(
+		fs.existsSync(hwt),
+		true,
+		"conflicted harvest worktree survives",
+	);
 	assert.notEqual(
-		spawnSync("git", ["-C", hwt, "ls-files", "-u"], { encoding: "utf8" }).stdout.trim(),
+		spawnSync("git", ["-C", hwt, "ls-files", "-u"], {
+			encoding: "utf8",
+		}).stdout.trim(),
 		"",
 		"the in-flight conflict resolution was NOT reset",
 	);
@@ -204,7 +239,10 @@ test("crash abort (manifest present, herdr agents gone) completes, reaps both sl
 	commitIn(r.wt(1), "a.txt");
 	commitIn(r.wt(2), "b.txt");
 	// Foreign branch + worktree: ownership rule says abort may never touch them.
-	const fwt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-fwt-")), "fx");
+	const fwt = path.join(
+		fs.mkdtempSync(path.join(os.tmpdir(), "hs-fwt-")),
+		"fx",
+	);
 	h.git(r.repo, "worktree", "add", "-q", "-b", "feature-x", fwt, r.fork);
 	const a = run(r, "abort.sh");
 	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
@@ -239,8 +277,16 @@ test("pending-null-path row: worktree found by run-unique branch name and reaped
 	});
 	const a = run(r, "abort.sh");
 	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
-	assert.equal(fs.existsSync(wt), false, "worktree reconciled by branch and removed");
-	assert.equal(h.log().includes("worktree remove"), false, "no workspace id -> plain git path");
+	assert.equal(
+		fs.existsSync(wt),
+		false,
+		"worktree reconciled by branch and removed",
+	);
+	assert.equal(
+		h.log().includes("worktree remove"),
+		false,
+		"no workspace id -> plain git path",
+	);
 	assert.match(a.stdout, /worktrees removed 1/);
 });
 
@@ -261,10 +307,18 @@ test("harvest worktree holding an un-swapped merge commit is reported loudly, ne
 	});
 	const a = run(r, "abort.sh");
 	assert.equal(a.status, 4, `${a.stdout}\n${a.stderr}`); // kept work => ACTIVE
-	assert.equal(fs.existsSync(hwt), true, "worktree with the dangling commit survives");
+	assert.equal(
+		fs.existsSync(hwt),
+		true,
+		"worktree with the dangling commit survives",
+	);
 	assert.match(a.stderr, /UN-SWAPPED/);
 	assert.ok(a.stderr.includes(msha), "dangling SHA named in the report");
-	assert.equal(fs.existsSync(r.wt(1)), false, "the clean slot worktree still gets reaped");
+	assert.equal(
+		fs.existsSync(r.wt(1)),
+		false,
+		"the clean slot worktree still gets reaped",
+	);
 	assert.match(a.stdout, /kept 1/);
 });
 
@@ -273,7 +327,11 @@ test("corrupt manifest: report-only discovery, nothing destroyed, distinct exit 
 	fs.writeFileSync(path.join(r.sdir, "run-w9.json"), "{ definitely not json");
 	const a = run(r, "abort.sh");
 	assert.equal(a.status, 3, `${a.stdout}\n${a.stderr}`);
-	assert.match(a.stderr, /\.bak/, "recovery hint names the previous generation");
+	assert.match(
+		a.stderr,
+		/\.bak/,
+		"recovery hint names the previous generation",
+	);
 	assert.match(a.stdout, /WOULD act on/);
 	assert.ok(a.stdout.includes(r.branch(1)), "discovery lists the swarm branch");
 	assert.ok(a.stdout.includes(r.wt(1)), "discovery lists the swarm worktree");
@@ -284,7 +342,11 @@ test("corrupt manifest: report-only discovery, nothing destroyed, distinct exit 
 		"corrupt manifest kept in place (not archived, not deleted)",
 	);
 	assert.equal(h.log().includes("pane close"), false, "no pane was closed");
-	assert.match(a.stdout, /abort summary/, "summary printed on the refusal path too");
+	assert.match(
+		a.stdout,
+		/abort summary/,
+		"summary printed on the refusal path too",
+	);
 });
 
 test("manually deleted worktree path: 'already gone' via the worktree-prune fallback", () => {
@@ -334,7 +396,11 @@ test("abort archives the manifest (rename, never delete) with final slot states"
 	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
 	assert.equal(fs.existsSync(path.join(r.sdir, "run-w9.json")), false);
 	const doc = r.archived();
-	assert.equal(doc.run_id, r.runId, "archived manifest parses and is the run's record");
+	assert.equal(
+		doc.run_id,
+		r.runId,
+		"archived manifest parses and is the run's record",
+	);
 	assert.equal(doc.slots[0].status, "archived");
 });
 
@@ -353,7 +419,11 @@ exit 0`,
 	const a = run(r, "abort.sh");
 	h.writeHerdrStub(); // restore the shared default for later tests
 	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
-	assert.equal(fs.existsSync(r.wt(1)), false, "git fallback removed the worktree");
+	assert.equal(
+		fs.existsSync(r.wt(1)),
+		false,
+		"git fallback removed the worktree",
+	);
 	assert.match(a.stderr, /falling back to plain git/);
 	assert.match(h.log(), /workspace close w11/);
 });
@@ -411,28 +481,32 @@ function addBranch(p, branch, { merge = true } = {}) {
 function writeArchived(p, runId, branches, baseRef = "refs/heads/main") {
 	fs.writeFileSync(
 		path.join(p.sdir, `archived-${runId}.json`),
-		JSON.stringify({
-			run_id: runId,
-			repo_root: p.repo,
-			base_ref: baseRef,
-			fork_sha: p.fork,
-			created_at: "2026-07-22T15:00:00Z",
-			exclude_pattern_added: false,
-			slots: branches.map((b, i) => ({
-				slot: i + 1,
-				label: `s${i + 1}`,
-				branch: b,
-				path: null,
-				workspace_id: null,
-				pane_id: null,
-				terminal_id: null,
-				agent_name: "claude",
-				self_created: true,
-				status: "archived",
-				backup_ref: null,
-				journal: null,
-			})),
-		}, null, 2),
+		JSON.stringify(
+			{
+				run_id: runId,
+				repo_root: p.repo,
+				base_ref: baseRef,
+				fork_sha: p.fork,
+				created_at: "2026-07-22T15:00:00Z",
+				exclude_pattern_added: false,
+				slots: branches.map((b, i) => ({
+					slot: i + 1,
+					label: `s${i + 1}`,
+					branch: b,
+					path: null,
+					workspace_id: null,
+					pane_id: null,
+					terminal_id: null,
+					agent_name: "claude",
+					self_created: true,
+					status: "archived",
+					backup_ref: null,
+					journal: null,
+				})),
+			},
+			null,
+			2,
+		),
 	);
 }
 
@@ -447,7 +521,10 @@ test("prune dry-run lists merged branch, backup refs, archived manifests — and
 	assert.match(r.stdout, /backup\s+refs\/swarm-backups\/rp1\/1/);
 	assert.match(r.stdout, /archived manifests: 1/);
 	assert.match(r.stdout, /DRY RUN/);
-	assert.ok(branchExists(p.repo, "swarm/rp1/s1"), "branch survives the dry run");
+	assert.ok(
+		branchExists(p.repo, "swarm/rp1/s1"),
+		"branch survives the dry run",
+	);
 	assert.equal(
 		h.git(p.repo, "for-each-ref", "refs/swarm-backups").stdout.trim() === "",
 		false,
@@ -468,11 +545,19 @@ test("prune with confirm deletes merged branch and backup ref; unmerged and fore
 		HERDR_SWARM_PRUNE_BACKUPS: "yes",
 	});
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	assert.equal(branchExists(p.repo, "swarm/rp2/s1"), false, "merged branch deleted");
+	assert.equal(
+		branchExists(p.repo, "swarm/rp2/s1"),
+		false,
+		"merged branch deleted",
+	);
 	assert.ok(branchExists(p.repo, "swarm/rp2/s2"), "unmerged branch kept");
 	assert.match(r.stdout, /unmerged swarm\/rp2\/s2/);
 	assert.ok(branchExists(p.repo, "feature-x"), "foreign branch untouched");
-	assert.equal(r.stdout.includes("feature-x"), false, "foreign branch never even listed");
+	assert.equal(
+		r.stdout.includes("feature-x"),
+		false,
+		"foreign branch never even listed",
+	);
 	assert.equal(
 		h.git(p.repo, "for-each-ref", "refs/swarm-backups").stdout.trim(),
 		"",
@@ -490,11 +575,21 @@ test("PRUNE_CONFIRM alone lists backup refs but never deletes one", () => {
 	h.git(p.repo, "update-ref", "refs/swarm-backups/rp6/1", p.fork);
 	const r = run(p, "prune.sh", { HERDR_SWARM_PRUNE_CONFIRM: "yes" });
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	assert.equal(branchExists(p.repo, "swarm/rp6/s1"), false, "the branch gate still works");
+	assert.equal(
+		branchExists(p.repo, "swarm/rp6/s1"),
+		false,
+		"the branch gate still works",
+	);
 	assert.match(r.stdout, /backup\s+refs\/swarm-backups\/rp6\/1/, "listed");
-	assert.equal(r.stdout.includes("deleted  refs/swarm-backups"), false, "never deleted");
+	assert.equal(
+		r.stdout.includes("deleted  refs/swarm-backups"),
+		false,
+		"never deleted",
+	);
 	assert.ok(
-		h.git(p.repo, "for-each-ref", "refs/swarm-backups").stdout.includes("rp6/1"),
+		h
+			.git(p.repo, "for-each-ref", "refs/swarm-backups")
+			.stdout.includes("rp6/1"),
 		"backup ref survives PRUNE_CONFIRM",
 	);
 	assert.match(r.stdout, /HERDR_SWARM_PRUNE_BACKUPS/, "the real flag is named");
@@ -510,15 +605,19 @@ test("PRUNE_BACKUPS deletes archived-run snapshots but never the ACTIVE run's", 
 	const active = "rp7live";
 	fs.writeFileSync(
 		path.join(p.sdir, "run-w9.json"),
-		JSON.stringify({
-			run_id: active,
-			repo_root: p.repo,
-			base_ref: "refs/heads/main",
-			fork_sha: p.fork,
-			created_at: "2026-07-22T15:00:00Z",
-			exclude_pattern_added: false,
-			slots: [],
-		}, null, 2),
+		JSON.stringify(
+			{
+				run_id: active,
+				repo_root: p.repo,
+				base_ref: "refs/heads/main",
+				fork_sha: p.fork,
+				created_at: "2026-07-22T15:00:00Z",
+				exclude_pattern_added: false,
+				slots: [],
+			},
+			null,
+			2,
+		),
 	);
 	h.git(p.repo, "update-ref", `refs/swarm-backups/${active}/1`, p.fork);
 	const r = run(p, "prune.sh", {
@@ -542,12 +641,18 @@ test("ancestry is judged against the recorded base even with another branch chec
 	h.git(p.repo, "checkout", "-q", "-b", "elsewhere", p.fork);
 	const dry = run(p, "prune.sh");
 	assert.equal(dry.status, 0, `${dry.stdout}\n${dry.stderr}`);
-	assert.match(dry.stdout, /merged\s+swarm\/rp3\/s1 \(base refs\/heads\/main\)/);
+	assert.match(
+		dry.stdout,
+		/merged\s+swarm\/rp3\/s1 \(base refs\/heads\/main\)/,
+	);
 	// Under confirm, `git branch -d` (HEAD-relative) refuses — prune reports
 	// and skips instead of escalating to -D.
 	const del = run(p, "prune.sh", { HERDR_SWARM_PRUNE_CONFIRM: "yes" });
 	assert.equal(del.status, 0, `${del.stdout}\n${del.stderr}`);
-	assert.ok(branchExists(p.repo, "swarm/rp3/s1"), "branch survives the -d refusal");
+	assert.ok(
+		branchExists(p.repo, "swarm/rp3/s1"),
+		"branch survives the -d refusal",
+	);
 	assert.match(del.stderr, /branch -d refused/);
 });
 
@@ -572,21 +677,29 @@ test("merged-then-reverted: flagged in dry-run; deletion additionally requires t
 	const dry = run(p, "prune.sh");
 	assert.match(dry.stdout, /MERGED-THEN-REVERTED/);
 	const noAck = run(p, "prune.sh", { HERDR_SWARM_PRUNE_CONFIRM: "yes" });
-	assert.ok(branchExists(p.repo, "swarm/rp5/s1"), "confirm alone does not delete a reverted branch");
+	assert.ok(
+		branchExists(p.repo, "swarm/rp5/s1"),
+		"confirm alone does not delete a reverted branch",
+	);
 	assert.match(noAck.stderr, /HERDR_SWARM_PRUNE_ACK_REVERTED/);
 	const acked = run(p, "prune.sh", {
 		HERDR_SWARM_PRUNE_CONFIRM: "yes",
 		HERDR_SWARM_PRUNE_ACK_REVERTED: "yes",
 	});
 	assert.equal(acked.status, 0, `${acked.stdout}\n${acked.stderr}`);
-	assert.equal(branchExists(p.repo, "swarm/rp5/s1"), false, "ack + confirm deletes it");
+	assert.equal(
+		branchExists(p.repo, "swarm/rp5/s1"),
+		false,
+		"ack + confirm deletes it",
+	);
 });
 
-test("branch no manifest mentions falls back to the current branch as base — and says so per line", () => {
+test("branch no validated manifest mentions is kept without a destructive current-branch fallback", () => {
 	const p = mkPruneRepo(); // state dir stays empty: no manifest knows this branch
 	addBranch(p, "swarm/orphan/s1");
 	const r = run(p, "prune.sh");
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	assert.match(r.stdout, /merged\s+swarm\/orphan\/s1/);
-	assert.match(r.stdout, /no manifest records this branch — using current branch 'main' as base/);
+	assert.match(r.stdout, /kept\s+swarm\/orphan\/s1/);
+	assert.match(r.stdout, /destructive current-branch fallback is forbidden/);
+	assert.ok(branchExists(p.repo, "swarm/orphan/s1"));
 });

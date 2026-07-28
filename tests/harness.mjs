@@ -71,7 +71,10 @@ export function makeFannedOutRun(h, opts = {}) {
 	const slots = [];
 	for (let i = 1; i <= nslots; i++) {
 		const branch = `swarm/${runId}/s${i}`;
-		const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")), `s${i}`);
+		const wt = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")),
+			`s${i}`,
+		);
 		git(repo, "worktree", "add", "-q", "-b", branch, wt, fork);
 		fs.writeFileSync(path.join(wt, ".swarm-task.md"), "task\n");
 		slots.push({
@@ -113,10 +116,15 @@ export function makeFannedOutRun(h, opts = {}) {
 		branch: (i) => slots[i - 1].branch,
 		manifest: () =>
 			JSON.parse(fs.readFileSync(path.join(sdir, "run-w9.json"), "utf8")),
-		slotRow: (i) =>
-			JSON.parse(fs.readFileSync(path.join(sdir, "run-w9.json"), "utf8")).slots.find(
+		slotRow: (i) => {
+			const live = path.join(sdir, "run-w9.json");
+			const file = fs.existsSync(live)
+				? live
+				: path.join(sdir, `archived-${runId}.json`);
+			return JSON.parse(fs.readFileSync(file, "utf8")).slots.find(
 				(s) => s.slot === i,
-			),
+			);
+		},
 		archived: () =>
 			JSON.parse(
 				fs.readFileSync(path.join(sdir, `archived-${runId}.json`), "utf8"),

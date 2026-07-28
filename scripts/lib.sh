@@ -162,7 +162,269 @@ pane_alive() {
 	[ -n "$1" ] && "$HERDR" pane read "$1" --lines 1 >/dev/null 2>&1
 }
 
-# --- Mutation lock -----------------------------------------------------------
+# --- Repository identity + mutation lock ------------------------------------
+# Physical git-common-dir identity is the ownership key. Workspace ids are
+# observations only: two Herdr workspaces pointed at one repository must
+# contend on one lock and discover one another's live manifests.
+safety_state() {
+	node "${PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/safety-state.mjs" "$@"
+}
+
+repo_identity_json() {
+	require_node || return 1
+	safety_state repo "$1"
+}
+
+repo_identity_field() {
+	local doc="$1" field="$2"
+	printf '%s' "$doc" | node -e '
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			const value = JSON.parse(d)[process.argv[1]];
+			if (typeof value !== "string" || value.length === 0) process.exit(1);
+			process.stdout.write(value);
+		});
+	' "$field"
+}
+
+repo_mutation_lock_name() {
+	local identity key
+	identity="$(repo_identity_json "$1")" || return 1
+	key="$(repo_identity_field "$identity" repo_key)" || return 1
+	printf 'mutate-repo-%s\n' "$key"
+}
+
+bookkeeping_scan() {
+	require_node || return 1
+	safety_state scan "$(state_dir)" "$1"
+}
+
+# Resolve the physical repository before selecting a live generation. An
+# explicit Herdr workspace context is authoritative and must never be
+# redirected by a stale workspace-named manifest. Without explicit context,
+# the legacy manifest remains a discovery hint for reopened workspaces; cwd is
+# the final fallback. The selected hint is validated again under the physical
+# repository lock by bind_live_manifest_locked before it can authorize use.
+discover_live_repo() {
+	local hint repo=""
+	if [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
+		resolve_repo_root
+		return $?
+	fi
+	hint="$(state_dir)/run-$(ws_id).json"
+	if [ -f "$hint" ] && [ ! -L "$hint" ]; then
+		repo="$(node -e '
+			const fs=require("fs");
+			try { const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+				if(typeof d.repo_root==="string") process.stdout.write(d.repo_root); }
+			catch {}
+		' "$hint" 2>/dev/null || true)"
+	fi
+	[ -n "$repo" ] && [ -d "$repo" ] || repo="$(resolve_repo_root 2>/dev/null || true)"
+	[ -n "$repo" ] || return 1
+	printf '%s\n' "$repo"
+}
+
+# Caller holds repo_mutation_lock_name(repo). Exactly one semantically valid
+# live manifest may be selected; zero is MANIFEST_EC_MISSING and multiples or
+# unknown bookkeeping fail closed through bookkeeping_assert_known.
+resolve_live_manifest_locked() {
+	local repo_root="$1" scan
+	scan="$(bookkeeping_scan "$repo_root")" || return 1
+	bookkeeping_assert_known "$scan" || return $?
+	printf '%s' "$scan" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const live=JSON.parse(d).live||[];
+			if(live.length===0) process.exit(2);
+			if(live.length!==1) process.exit(3);
+			process.stdout.write(live[0].path+"\n");
+		});
+	'
+}
+
+# A workspace-named legacy manifest may participate only when it is the exact
+# generation selected by the locked repository scan. A foreign/stale hint is
+# never ignored in favor of a convenient candidate: fail closed before any
+# pane, Git, manifest, or archive mutation.
+validate_workspace_manifest_hint_locked() {
+	local selected="$1" hint
+	hint="$(state_dir)/run-$(ws_id).json"
+	if [ -e "$hint" ] || [ -L "$hint" ]; then
+		if [ -L "$hint" ] || [ ! -f "$hint" ] || ! node -e '
+			const path=require("path");
+			process.exit(path.resolve(process.argv[1])===path.resolve(process.argv[2]) ? 0 : 1);
+		' "$hint" "$selected"; then
+			echo "herdr-swarm: bookkeeping_unknown: workspace manifest hint $hint does not match the locked live generation $selected" >&2
+			return "$MANIFEST_EC_CORRUPT"
+		fi
+	fi
+}
+
+bind_live_manifest_locked() {
+	local selected
+	selected="$(resolve_live_manifest_locked "$1")" || return $?
+	validate_workspace_manifest_hint_locked "$selected" || return $?
+	HERDR_SWARM_MANIFEST_PATH="$selected"
+	export HERDR_SWARM_MANIFEST_PATH
+}
+
+bookkeeping_assert_known() {
+	local scan="$1"
+	printf '%s' "$scan" | node -e '
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			const scan = JSON.parse(d);
+			if ((scan.errors || []).length === 0) return;
+			for (const error of scan.errors) console.error("herdr-swarm: bookkeeping_unknown: " + error);
+			process.exit(3);
+		});
+	'
+}
+
+active_index_write() {
+	local run_id="$1" repo_root="$2" mf identity key dst tmp
+	mf="$(manifest_path)" || return 1
+	identity="$(repo_identity_json "$repo_root")" || return 1
+	key="$(repo_identity_field "$identity" repo_key)" || return 1
+	dst="$(state_dir)/active-repo-$key.json"
+	tmp="$dst.tmp.$$"
+	node -e '
+		const fs = require("fs");
+		const [dst, runId, manifestPath, identity] = process.argv.slice(1);
+		const id = JSON.parse(identity);
+		const doc = { repo_key: id.repo_key, git_common_dir: id.git_common_dir,
+			run_id: runId, manifest_path: manifestPath };
+		fs.writeFileSync(dst, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+	' "$tmp" "$run_id" "$mf" "$identity" || {
+		rm -f "$tmp"
+		return 1
+	}
+	mv "$tmp" "$dst"
+}
+
+active_index_remove() {
+	local repo_root="$1" run_id="$2" identity key dst
+	identity="$(repo_identity_json "$repo_root")" || return 1
+	key="$(repo_identity_field "$identity" repo_key)" || return 1
+	dst="$(state_dir)/active-repo-$key.json"
+	[ -e "$dst" ] || return 0
+	node -e '
+		const fs = require("fs");
+		const [file, key, runId] = process.argv.slice(1);
+		const stat = fs.lstatSync(file);
+		if (!stat.isFile() || stat.isSymbolicLink()) process.exit(2);
+		const doc = JSON.parse(fs.readFileSync(file, "utf8"));
+		if (doc.repo_key !== key || doc.run_id !== runId) process.exit(2);
+		fs.unlinkSync(file);
+	' "$dst" "$key" "$run_id"
+}
+
+cleanup_operation_id() {
+	safety_state operation-id
+}
+
+slot_resource_binding() {
+	local repo_root="$1" run_id="$2" slot="$3" wt="$4" identity physical head
+	identity="$(repo_identity_json "$repo_root")" || return 1
+	physical="$(cd "$wt" 2>/dev/null && pwd -P)" || return 1
+	head="$(git -C "$physical" rev-parse --verify 'HEAD^{commit}')" || return 1
+	node -e '
+		const [identity,runId,slot,worktree,head]=process.argv.slice(1), id=JSON.parse(identity);
+		process.stdout.write(JSON.stringify({resource_type:"slot",repo_key:id.repo_key,
+			git_common_dir:id.git_common_dir,run_id:runId,slot,worktree,
+			generation:"slot-worktree",head}));
+	' "$identity" "$run_id" "$slot" "$physical" "$head"
+}
+
+cleanup_inventory() {
+	local repo_root="$1" binding="$2" operation_id="$3"
+	safety_state inventory "$repo_root" "$binding" "$operation_id"
+}
+
+slot_ignored_inventory() {
+	local repo_root="$1" run_id="$2" slot="$3" wt="$4" operation_id="$5" binding
+	binding="$(slot_resource_binding "$repo_root" "$run_id" "$slot" "$wt")" || return 1
+	cleanup_inventory "$repo_root" "$binding" "$operation_id"
+}
+
+verify_harvest_resource() {
+	local run_id="$1" slot="$2" wt="$3" journal="$4"
+	safety_state verify-harvest "$(state_dir)" "${SWARM_REPO:?}" "$run_id" "$slot" "$wt" "$journal" "$(manifest_path)"
+}
+
+harvest_ignored_inventory() {
+	local repo_root="$1" run_id="$2" slot="$3" wt="$4" journal="$5" operation_id="$6" binding
+	binding="$(verify_harvest_resource "$run_id" "$slot" "$wt" "$journal")" || return 1
+	cleanup_inventory "$repo_root" "$binding" "$operation_id"
+}
+
+# The sole git-removal surface for detached harvest resources. Identity and
+# recursive ignored inventory are checked twice, immediately around the
+# no-force removal. Ignored data requires the exact one-use approval.
+remove_harvest_resource() {
+	local run_id="$1" slot="$2" wt="$3" journal="$4" operation inventory count used rechecked before after binding
+	binding="$(verify_harvest_resource "$run_id" "$slot" "$wt" "$journal")" || return 36
+	operation="$(printf '%s' "${HERDR_SWARM_CLEANUP_APPROVAL:-}" | node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);if(a.operation_id)process.stdout.write(String(a.operation_id));}catch{}});
+	')"
+	[ -n "$operation" ] || operation="$(cleanup_operation_id)" || return 1
+	inventory="$(cleanup_inventory "$SWARM_REPO" "$binding" "$operation")" || return 1
+	count="$(cleanup_inventory_count "$inventory")" || return 1
+	if [ "$count" -gt 0 ]; then
+		used="$(cleanup_approval_validate "$inventory")" || {
+			print_cleanup_inventory "$inventory"
+			echo "herdr-swarm: harvest worktree holds ignored files; apply requires this exact one-use cleanup approval." >&2
+			return 37
+		}
+	fi
+	if [ -n "${HERDR_SWARM_TEST_CLEANUP_READY_FILE:-}" ]; then : >"$HERDR_SWARM_TEST_CLEANUP_READY_FILE"; fi
+	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK:-}" ]; then sleep "$HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK"; fi
+	binding="$(verify_harvest_resource "$run_id" "$slot" "$wt" "$journal")" || return 36
+	rechecked="$(cleanup_inventory "$SWARM_REPO" "$binding" "$operation")" || return 1
+	before="$(printf '%s' "$inventory" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')"
+	after="$(printf '%s' "$rechecked" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')"
+	if [ "$before" != "$after" ]; then
+		print_cleanup_inventory "$rechecked"
+		echo "herdr-swarm: harvest cleanup inventory changed after preview; zero removal performed." >&2
+		return 37
+	fi
+	if [ "$count" -gt 0 ]; then cleanup_approval_consume "$used" || return 36; fi
+	git -C "$SWARM_REPO" worktree remove "$wt" || return 1
+	safety_state verify-harvest-removed "$SWARM_REPO" "$binding" || return 1
+}
+
+cleanup_inventory_count() {
+	printf '%s' "$1" | node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(String(JSON.parse(d).count)))'
+}
+
+print_cleanup_inventory() {
+	printf '%s' "$1" | node -e '
+		let d="";
+		process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const i=JSON.parse(d);
+			console.log("cleanup_operation\t" + i.operation_id);
+			console.log("cleanup_digest\t" + i.digest);
+			if (i.count > 0) {
+				const approval={approved:true};
+				for (const k of ["resource_type","repo_key","git_common_dir","run_id","slot","worktree","generation","head","operation_id","digest"]) approval[k]=i[k];
+				console.log("cleanup_approval\t" + JSON.stringify(approval));
+			}
+			for (const p of i.paths_display) console.log("ignored_json\t" + JSON.stringify(p));
+		});
+	'
+}
+
+cleanup_approval_validate() {
+	local inventory="$1" approval="${HERDR_SWARM_CLEANUP_APPROVAL:-}"
+	[ -n "$approval" ] || return 2
+	printf '%s' "$approval" | safety_state approval "$inventory" "$(state_dir)"
+}
+
+cleanup_approval_consume() {
+	local used="$1" approval="${HERDR_SWARM_CLEANUP_APPROVAL:-}"
+	printf '%s' "$approval" | safety_state consume "$used" >/dev/null
+}
+
 # One mkdir+PID-token lock per caller-supplied name (e.g. the per-repo
 # mutation lock shared by fan-out, harvest, abort, and prune — an abort must
 # never reap a worktree mid-merge). mkdir is the portable atomic lock; the
@@ -693,7 +955,11 @@ require_node() {
 }
 
 manifest_path() {
-	printf '%s/run-%s.json\n' "$(state_dir)" "$(ws_id)"
+	if [ -n "${HERDR_SWARM_MANIFEST_PATH:-}" ]; then
+		printf '%s\n' "$HERDR_SWARM_MANIFEST_PATH"
+	else
+		printf '%s/run-%s.json\n' "$(state_dir)" "$(ws_id)"
+	fi
 }
 
 # manifest_write: full manifest JSON on stdin → $(manifest_path). The order
@@ -740,7 +1006,11 @@ manifest_write() {
 manifest_read() {
 	local mf
 	mf="$(manifest_path)" || return 1
-	[ -f "$mf" ] || return "$MANIFEST_EC_MISSING"
+	[ -e "$mf" ] || return "$MANIFEST_EC_MISSING"
+	if [ -L "$mf" ] || [ ! -f "$mf" ]; then
+		echo "herdr-swarm: manifest $mf is not a regular non-symlink file (corrupt); .bak is recovery inventory only" >&2
+		return "$MANIFEST_EC_CORRUPT"
+	fi
 	if [ ! -s "$mf" ]; then
 		echo "herdr-swarm: manifest $mf is zero-length (corrupt); previous generation may be in $mf.bak" >&2
 		return "$MANIFEST_EC_CORRUPT"

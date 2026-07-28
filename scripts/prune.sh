@@ -44,24 +44,30 @@ ack_reverted=0
 # both. Deleting a snapshot is unrecoverable — it deserves its own keystroke.
 prune_backups=0
 [ "${HERDR_SWARM_PRUNE_BACKUPS:-}" = "yes" ] && prune_backups=1
+requested_delete=0
+if [ "$confirm" -eq 1 ] || [ "$prune_backups" -eq 1 ]; then requested_delete=1; fi
 
-# The live run's snapshots are never deletable at all — not even under
-# PRUNE_BACKUPS: harvest may still be running and its discards are the only
-# undo the active run has. A missing/corrupt manifest yields an empty id, so
-# the guard simply does not fire (nothing claims to be active).
-ACTIVE_RUN_ID="$(manifest_read 2>/dev/null | node -e '
-	let d = "";
-	process.stdin.on("data", (c) => (d += c)).on("end", () => {
-		try { process.stdout.write(String(JSON.parse(d).run_id || "")); } catch {}
-	});
-' 2>/dev/null || true)"
-
-# Same per-repo mutation lock as fan-out/harvest/abort: branch deletion must
-# never interleave with a merge in flight (destructive-surface KTD).
-acquire_lock "mutate-$(ws_id)" || exit 1
-trap 'release_lock "mutate-$(ws_id)"' EXIT
+# Same physical-repository lock as fan-out/harvest/abort: workspace aliases
+# must never prune while another workspace mutates the same common git dir.
+MUTATION_LOCK="$(repo_mutation_lock_name "$REPO_ROOT")" || exit 1
+acquire_lock "$MUTATION_LOCK" || exit 1
+trap 'release_lock "$MUTATION_LOCK"' EXIT
 
 US=$'\x1f'
+SCAN="$(bookkeeping_scan "$REPO_ROOT")" || exit 1
+bookkeeping_known=1
+if ! bookkeeping_assert_known "$SCAN"; then
+	bookkeeping_known=0
+	echo "herdr-swarm: bookkeeping_unknown — prune is report-only; ALL branch and backup deletion is refused." >&2
+fi
+ACTIVE_RUN_IDS="$(printf '%s' "$SCAN" | node -e '
+	let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{for(const x of JSON.parse(d).live||[])console.log(x.run_id)});
+')"
+# Confirmation flags never override unknown bookkeeping.
+if [ "$bookkeeping_known" -eq 0 ]; then
+	confirm=0
+	prune_backups=0
+fi
 
 # branch -> recorded base_ref, harvested from the current manifest plus every
 # archived one (abort archives, never deletes, precisely so prune can still
@@ -70,16 +76,16 @@ US=$'\x1f'
 # beats refusing prune outright over one unreadable record.
 collect_bases() {
 	local f
-	for f in "$(manifest_path)" "$(state_dir)"/archived-*.json; do
+	[ "$bookkeeping_known" -eq 1 ] || return 0
+	printf '%s' "$SCAN" | node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const s=JSON.parse(d); for(const x of [...(s.live||[]),...(s.archived||[])]) console.log(x.path);
+		});
+	' | while IFS= read -r f; do
 		[ -f "$f" ] || continue
 		node -e '
-			const fs = require("fs");
-			let doc;
-			try { doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
-			catch { process.exit(0); }
-			for (const s of doc.slots || []) {
-				if (s.branch && doc.base_ref) console.log(s.branch + "\x1f" + doc.base_ref);
-			}
+			const fs = require("fs"), doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+			for (const s of doc.slots || []) if (s.branch && doc.base_ref) console.log(s.branch + "\x1f" + doc.base_ref);
 		' "$f"
 	done
 }
@@ -92,11 +98,6 @@ recorded_base() {
 	[ -n "$hit" ] || return 1
 	printf '%s\n' "$hit"
 }
-
-# Fallback base when no manifest mentions a branch: the repo's CURRENT branch
-# — said out loud on every such line, because a wrong implicit base is
-# exactly how a not-actually-merged branch gets deleted.
-cur_branch="$(git -C "$REPO_ROOT" symbolic-ref -q --short HEAD || echo HEAD)"
 
 # The merge commit in base whose SECOND parent is the branch tip — the commit
 # a revert of the merge would name. Empty for ff/squash merges (then the
@@ -119,9 +120,9 @@ while IFS= read -r b; do
 	if base="$(recorded_base "$b")"; then
 		:
 	else
-		base="refs/heads/$cur_branch"
-		[ "$cur_branch" = "HEAD" ] && base="HEAD" # detached: only HEAD itself is usable
-		note=" [no manifest records this branch — using current branch '$cur_branch' as base]"
+		echo "kept     $b — no validated manifest records its base; destructive current-branch fallback is forbidden"
+		n_unmerged=$((n_unmerged + 1))
+		continue
 	fi
 	if ! git -C "$REPO_ROOT" rev-parse --verify -q "$base^{commit}" >/dev/null; then
 		# A vanished base proves nothing about merged-ness — keep the branch.
@@ -170,7 +171,7 @@ while IFS= read -r ref; do
 	# Run id is the path component after the namespace: refs/swarm-backups/<run>/<slot>.
 	ref_run="${ref#refs/swarm-backups/}"
 	ref_run="${ref_run%%/*}"
-	if [ -n "$ACTIVE_RUN_ID" ] && [ "$ref_run" = "$ACTIVE_RUN_ID" ]; then
+	if printf '%s\n' "$ACTIVE_RUN_IDS" | grep -qFx "$ref_run"; then
 		echo "backup   $ref [ACTIVE RUN — kept; abort or harvest the run first]"
 		n_refs_active=$((n_refs_active + 1))
 		continue
@@ -199,4 +200,5 @@ if [ "$prune_backups" -eq 0 ] && [ "$n_refs" -gt 0 ]; then
 	echo "herdr-swarm: backup refs were LISTED ONLY — set HERDR_SWARM_PRUNE_BACKUPS=yes to delete them (they are the last copy of discarded work)."
 fi
 echo "herdr-swarm: prune summary — merged $n_merged (deleted $n_deleted), unmerged kept $n_unmerged, skipped $n_skipped, backup refs $n_refs (deleted $n_refs_deleted, active-run kept $n_refs_active), archived manifests $n_manifests."
+if [ "$bookkeeping_known" -eq 0 ] && [ "$requested_delete" -eq 1 ]; then exit 3; fi
 exit 0

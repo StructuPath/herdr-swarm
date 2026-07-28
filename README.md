@@ -39,7 +39,8 @@ Conductor).
   warning, never a refusal.
 - **git >= 2.38** recommended (relies on `git worktree`, three-arg
   `git update-ref` compare-and-swap, and `git merge-base --is-ancestor`).
-- **Node.js >= 20** on your PATH (manifest handling and the pane renderers).
+- **Node.js >= 20** on your PATH (manifest handling, manifest validation, and
+  pane renderers). No Python runtime or third-party parser is required.
 - macOS or Linux.
 
 ## Install
@@ -88,13 +89,17 @@ add your own, see below):
      branch-name confirmation; a snapshot ref is written first).
    - *Conflict or hook failure* — classified distinctly; `s` shells into the
      merge tree, `a` aborts the merge (`git merge --abort`), `b` backs out.
-   - *Archive* — after merge/skip, the worktree is removed (branch kept); an
-     inventory of ignored files that removal would silently delete is shown
-     first and requires acknowledgment.
+   - *Archive* — after merge/skip, the worktree is removed (branch kept).
+     Recursive ignored-file inventory is byte-safe and requires the exact
+     digest-bound, one-use approval before ignored data can be removed. The
+     same guard covers plugin-owned detached merge worktrees during swap,
+     resume, and merge-abort cleanup.
 4. **Abort** (`structupath.swarm.abort`) — abandon the run, mid-flight or
-   post-crash: stops agents, closes swarm panes/workspaces, removes clean
-   swarm worktrees, keeps everything questionable, prints a summary. Branches
-   are never deleted by abort.
+   post-crash: stops agents, closes swarm panes/workspaces, removes only exact
+   verified resources, keeps dirty/ignored/unresolved resources, and prints a
+   summary. Ignored cleanup is preview/apply, described below. Abort exits
+   nonzero unless every slot update succeeds and the exact completed archive
+   exists. Branches are never deleted by abort.
 5. **Prune** (`structupath.swarm.prune`) — dry-run listing of fully-merged
    `swarm/*` branches, discard-snapshot backup refs, and archived run
    manifests. Deletion is gated per resource class, because the classes are
@@ -118,7 +123,7 @@ exactly one prompt; anything you leave unset still prompts, so interactive use i
 unchanged.
 
 | Variable | Replaces |
-|---|---|
+| --- | --- |
 | `HERDR_SWARM_SLOTS` | slot count (same cap check, raise with `HERDR_SWARM_MAX_SLOTS`) |
 | `HERDR_SWARM_PRESETS` | comma-separated preset names, one per slot; a single name applies to all slots |
 | `HERDR_SWARM_TASK_FILE` | path to a file whose contents become the shared task |
@@ -172,11 +177,56 @@ scripts directly rather than through `herdr plugin action invoke` (which
 forwards no environment):
 
 | Capability | Scriptable path |
-|---|---|
+| --- | --- |
 | Fan out | `scripts/fanout-pane.sh` with the variables above (zero-TTY) |
 | Harvest | `scripts/harvest-step.sh <verb>` — a verb CLI with typed exit codes and `key<TAB>value` stdout |
 | Abort | `scripts/abort.sh` — a zero-TTY action, env-gated |
 | Prune | `scripts/prune.sh` — a zero-TTY action, dry run by default, env-gated per resource class |
+
+Harvest, Status, and Abort resolve the active generation by physical Git
+repository, not by the current Herdr workspace filename. An explicit
+`HERDR_PLUGIN_CONTEXT_JSON.workspace_cwd` is authoritative; any legacy
+workspace-named manifest must match the exact generation selected under that
+repository's lock or the operation refuses without mutation. Reopening the
+same repository under another workspace ID therefore reaches the same run.
+The resolution refuses rather than choosing when multiple live manifests, a
+conflicting workspace hint, or an invalid active index exists.
+
+#### Scripted ignored-file cleanup
+
+Ignored-only work is **kept by default**. Cleanup is an exact two-step
+preview/apply protocol; a generic yes/ack variable never authorizes deletion.
+The relevant variables are:
+
+| Variable | Meaning |
+| --- | --- |
+| `HERDR_SWARM_ABORT_PREVIEW=yes` | read-only Abort preview; closes/removes/updates nothing |
+| `HERDR_SWARM_CLEANUP_OPERATION_ID=<safe-id>` | stable caller-chosen preview operation ID; Abort derives one resource ID per slot |
+| `HERDR_SWARM_CLEANUP_APPROVAL='<json>'` | exact `cleanup_approval` JSON emitted by preview; bound to resource type, repository, run, slot, physical path, generation/HEAD, operation, and inventory digest |
+
+Example:
+
+```sh
+HERDR_SWARM_ABORT_PREVIEW=yes \
+HERDR_SWARM_CLEANUP_OPERATION_ID=abort-review-1 \
+  bash scripts/abort.sh
+
+# Copy one cleanup_approval JSON line from the preview, inspect every
+# ignored_json line, then apply exactly that one resource approval:
+HERDR_SWARM_CLEANUP_APPROVAL='{"approved":true,"...":"exact preview fields"}' \
+  bash scripts/abort.sh
+```
+
+Apply immediately rechecks resource identity and recursively recomputes the
+NUL-delimited ignored inventory. Any changed path, HEAD, registration,
+generation, digest, symlink, duplicate owner, stale approval, or already-used
+operation refuses removal. If several resources contain ignored data, repeat
+preview/apply for each emitted approval. `harvest-step.sh archive` uses the
+same output protocol (exit 37 when approval is required); detached merge
+cleanup may emit an approval after the base swap lands and retains its exact
+journaled worktree until approved. Retry `harvest-step.sh resume` for a
+Harvest cleanup, or retry Abort with the exact approval Abort emitted; only a
+verified removal clears the journal and permits terminal slot/run archival.
 
 ### Keybinding
 
@@ -255,9 +305,10 @@ starts the agent anyway; output lands in the plugin state dir.
 - **Squash merges are invisible.** A slot you squash-merged yourself still
   shows as pending and will conflict on re-merge — skip it by hand. Fast-
   forward and plain external merges *are* auto-detected via ancestry.
-- **Ignored files sit outside every safety net** — not in WIP commits, not in
-  discard snapshots, not protected by no-`--force` removal. The archive-time
-  ignored-file inventory prompt is the only guard.
+- **Ignored files are not in commits or discard snapshots.** Every slot or
+  detached-harvest worktree removal recursively inventories them and keeps the
+  resource by default. Deletion requires the exact one-use preview approval;
+  changed inventories refuse and must be previewed again.
 - **Closing the parent repo workspace kills swarm agents silently** (the
   worktree workspaces are grouped under it). Committed work survives and
   stays harvestable; uncommitted editor state in the agent does not.

@@ -185,27 +185,18 @@ preflight_check_sparse() {
 	return 0
 }
 
-# One active run per repo workspace (v1). Missing manifest = no run = pass;
-# all-archived = run complete = pass; corrupt manifest = unknown state =
-# refuse with the corrupt code (caller degrades to report_only_discovery —
-# never "assume no run" when the bookkeeping is unreadable).
+# One active run per physical repository, regardless of Herdr workspace id.
+# Every live/archived candidate is semantically validated first: unreadable or
+# identity-ambiguous bookkeeping is unknown state, never permission to start a
+# second run or resolve detritus destructively.
 preflight_check_active_run() {
-	local doc rc=0
-	doc="$(manifest_read)" || rc=$?
-	case "$rc" in
-	0) ;;
-	"$MANIFEST_EC_MISSING") return 0 ;;
-	*) return "$rc" ;;
-	esac
-	if printf '%s' "$doc" | node -e '
-		let d = "";
-		process.stdin.on("data", (c) => (d += c)).on("end", () => {
-			const doc = JSON.parse(d);
-			const live = (doc.slots || []).filter((s) => s.status !== "archived");
-			process.exit(live.length > 0 ? 0 : 1);
-		});
+	local scan
+	scan="$(bookkeeping_scan "$SWARM_REPO")" || return 1
+	bookkeeping_assert_known "$scan" || return $?
+	if printf '%s' "$scan" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>process.exit(JSON.parse(d).live.length>0?0:1));
 	'; then
-		echo "herdr-swarm: an active run exists in this repo ($(manifest_path)) — harvest or abort it first." >&2
+		echo "herdr-swarm: an active run exists for this repository (possibly in another workspace) — harvest or abort it first." >&2
 		return "$PF_EC_ACTIVE_RUN"
 	fi
 	return 0
@@ -308,6 +299,106 @@ remove_exclude_pattern() {
 		}
 	fi
 	_manifest_set_exclude_flag false 2>/dev/null || true
+	return 0
+}
+
+exact_run_archive_exists() {
+	local run_id="$1" arch
+	arch="$(state_dir)/archived-$run_id.json"
+	[ -f "$arch" ] && [ ! -L "$arch" ] && node -e '
+		const fs=require("fs"); const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+		process.exit(d.run_id===process.argv[2] && d.status==="completed" &&
+			(d.slots||[]).every(s=>s.status==="archived"&&!s.journal) ? 0 : 1);
+	' "$arch" "$run_id" 2>/dev/null
+}
+
+# finalize_run <repo-root> <run-id> [require-complete]: partial Harvest uses
+# the default benign no-op; Abort passes require-complete and must fail unless
+# every slot is archived/journal-free and the exact archive is durable.
+finalize_run() {
+	local repo_root="$1" run_id="$2" mode="${3-}" mf arch doc updated scan rc=0
+	mf="$(manifest_path)" || return 1
+	arch="$(state_dir)/archived-$run_id.json"
+	if [ ! -e "$mf" ]; then
+		if exact_run_archive_exists "$run_id"; then
+			# Retry after the archive rename: finish only idempotent bookkeeping
+			# tails, never rewrite the immutable archive.
+			active_index_remove "$repo_root" "$run_id" 2>/dev/null || true
+			if [ -f "$mf.bak" ] && [ ! -e "$arch.bak" ]; then mv "$mf.bak" "$arch.bak" || return 1; fi
+			return 0
+		fi
+		echo "herdr-swarm: finalization refused — neither the live manifest nor the exact completed archive is available." >&2
+		return 1
+	fi
+	[ ! -e "$arch" ] || {
+		echo "herdr-swarm: finalization refused — archive $arch already exists; it will not be overwritten." >&2
+		return 1
+	}
+	doc="$(manifest_read)" || return $?
+	rc=0
+	printf '%s' "$doc" | node -e '
+		const fs=require("fs"); let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const m=JSON.parse(d);
+			if (m.run_id !== process.argv[1] || !(m.slots||[]).every(s=>s.status==="archived" && !s.journal)) process.exit(1);
+			const present=(m.slots||[]).find(s=>s.path && fs.existsSync(s.path));
+			if (present) { console.error("herdr-swarm: finalization refused — archived slot resource still exists at " + JSON.stringify(present.path)); process.exit(2); }
+		});
+	' "$run_id" || rc=$?
+	case "$rc" in
+	0) ;;
+	1)
+		if [ "$mode" = "require-complete" ]; then
+			echo "herdr-swarm: finalization refused — not every slot is archived and journal-free." >&2
+			return 1
+		fi
+		return 0
+		;;
+	*) return "$rc" ;;
+	esac
+	for resource_path in "$(state_dir)"/harvest-"$run_id"-s*; do
+		[ -e "$resource_path" ] || continue
+		echo "herdr-swarm: finalization refused — harvest resource still exists at $resource_path." >&2
+		return 1
+	done
+	updated="$(printf '%s' "$doc" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const m=JSON.parse(d), now=new Date().toISOString();
+			if (m.status !== "completed") {
+				m.status="completed"; m.completed_at=now; m.completion_reason="all_slots_archived";
+				m.completion_events=Array.isArray(m.completion_events)?m.completion_events:[];
+				m.completion_events.push({type:"run.completed",at:now});
+			}
+			process.stdout.write(JSON.stringify(m,null,2));
+		});
+	')" || return 1
+	printf '%s' "$updated" | manifest_write || return 1
+	[ "${HERDR_SWARM_TEST_FAIL_FINALIZE_STEP:-}" = "after-complete" ] && return 99
+	# No other live manifest may still need the shared task-file exclusion.
+	scan="$(bookkeeping_scan "$repo_root")" || return 1
+	bookkeeping_assert_known "$scan" || return $?
+	if printf '%s' "$scan" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const s=JSON.parse(d); process.exit(s.live.some(x=>x.run_id!==process.argv[1] && x.exclude_pattern_added)?1:0);
+		});
+	' "$run_id"; then
+		remove_exclude_pattern || return 1
+	fi
+	[ "${HERDR_SWARM_TEST_FAIL_FINALIZE_STEP:-}" = "after-exclude" ] && return 99
+	active_index_remove "$repo_root" "$run_id" || return 1
+	[ "${HERDR_SWARM_TEST_FAIL_FINALIZE_STEP:-}" = "after-index" ] && return 99
+	if ! mv "$mf" "$arch"; then
+		active_index_write "$run_id" "$repo_root" 2>/dev/null || true
+		echo "herdr-swarm: could not archive the completed manifest $mf to $arch." >&2
+		return 1
+	fi
+	[ "${HERDR_SWARM_TEST_FAIL_FINALIZE_STEP:-}" = "after-archive" ] && return 99
+	if [ -f "$mf.bak" ]; then
+		mv "$mf.bak" "$arch.bak" || {
+			echo "herdr-swarm: could not archive the manifest backup $mf.bak." >&2
+			return 1
+		}
+	fi
+	printf 'run_archived\t%s\n' "$arch"
 	return 0
 }
 

@@ -47,7 +47,7 @@ fatal() {
 	local code="$1"
 	shift || true
 	[ $# -gt 0 ] && echo "$*" >&2
-	release_lock "mutate-$(ws_id)"
+	[ -n "${MUTATION_LOCK:-}" ] && release_lock "$MUTATION_LOCK"
 	pane_linger
 	exit "$code"
 }
@@ -377,12 +377,6 @@ rename_detritus() {
 
 # --- Main flow ---------------------------------------------------------------
 
-# The mutation lock spans the WHOLE fan-out including preflight: if it
-# covered only the create loop, two racing panes could both pass the
-# active-run check and then serialize straight into a double run.
-acquire_lock "mutate-$(ws_id)" || exit 1
-trap 'release_lock "mutate-$(ws_id)"' EXIT
-
 # The repo every git call below targets, resolved from the herdr workspace
 # context and NOT from this process's cwd (a pane inherits the server's cwd,
 # which is routinely a different repo — lib.sh resolve_repo_root). Resolved
@@ -392,6 +386,12 @@ SWARM_REPO="$(resolve_repo_root 2>/dev/null || true)"
 export SWARM_REPO
 
 preflight_check_repo || fatal $?
+# The mutation lock spans the WHOLE fan-out including the repository-scoped
+# active-run scan. Its key is the physical git common directory, never the
+# Herdr workspace id, so aliased/reopened workspaces cannot race a second run.
+MUTATION_LOCK="$(repo_mutation_lock_name "$SWARM_REPO")" || fatal 1
+acquire_lock "$MUTATION_LOCK" || fatal 1
+trap 'release_lock "$MUTATION_LOCK"' EXIT
 # Version before anything herdr-shaped: below the 0.7.4 floor nothing may be
 # created and nothing else is worth prompting for (R13).
 preflight_check_version || fatal $?
@@ -556,14 +556,18 @@ repo_root="$SWARM_REPO"
 # against this, never the moving base tip (R5/R7).
 fork_sha="$(repo_git rev-parse --verify "$base_ref^{commit}")" || fatal 1 "herdr-swarm: could not resolve $base_ref."
 
+identity="$(repo_identity_json "$repo_root")" || fatal 1 "herdr-swarm: could not resolve repository identity."
 if ! node -e '
-	const [run_id, repo_root, base_ref, fork_sha, created_at] = process.argv.slice(1);
+	const [run_id, repo_root, base_ref, fork_sha, created_at, identity] = process.argv.slice(1);
+	const id = JSON.parse(identity);
 	process.stdout.write(JSON.stringify(
-		{ run_id, repo_root, base_ref, fork_sha, created_at, exclude_pattern_added: false, slots: [] },
+		{ run_id, repo_root, repo_key: id.repo_key, git_common_dir: id.git_common_dir,
+			base_ref, fork_sha, created_at, exclude_pattern_added: false, slots: [] },
 		null, 2));
-' "$run_id" "$repo_root" "$base_ref" "$fork_sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | manifest_write; then
+' "$run_id" "$repo_root" "$base_ref" "$fork_sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$identity" | manifest_write; then
 	fatal 1 "herdr-swarm: could not write the run manifest."
 fi
+active_index_write "$run_id" "$repo_root" || fatal 1 "herdr-swarm: could not write the repository active-run index."
 
 # Once, before the loop: the exclude file is shared repo-wide (resolved via
 # --git-path because .git is a file in linked worktrees), so one append
@@ -695,7 +699,7 @@ fi
 
 # Keep a partial-failure summary readable: this pane closes when the process
 # exits. Lock released first — a lingering pane must never block abort.
-release_lock "mutate-$(ws_id)"
+release_lock "$MUTATION_LOCK"
 if [ "$failed" -gt 0 ]; then
 	pane_linger
 fi
