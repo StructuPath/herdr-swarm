@@ -418,7 +418,7 @@ test("concurrent double-invoke: exactly one fan-out proceeds (mutation lock)", a
 
 test("an active run refuses fan-out with 'harvest or abort' before any create", () => {
 	const { repo, env } = setup();
-	fs.writeFileSync(manifestFile, sampleManifest());
+	fs.writeFileSync(manifestFile, sampleManifest({ repo_root: repo }));
 	const r = runPane(lines(["1", "", "Nope", ".", ""]), env, repo);
 	assert.equal(r.status, 17, r.stderr); // PF_EC_ACTIVE_RUN
 	assert.match(r.stderr, /harvest or abort/);
