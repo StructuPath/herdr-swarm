@@ -199,11 +199,18 @@ bookkeeping_scan() {
 	safety_state scan "$(state_dir)" "$1"
 }
 
-# Resolve the physical repository before selecting a live generation. The
-# workspace-named manifest is only a discovery hint; repository aliases fall
-# back to Herdr's workspace context/cwd, and neither route authorizes mutation.
+# Resolve the physical repository before selecting a live generation. An
+# explicit Herdr workspace context is authoritative and must never be
+# redirected by a stale workspace-named manifest. Without explicit context,
+# the legacy manifest remains a discovery hint for reopened workspaces; cwd is
+# the final fallback. The selected hint is validated again under the physical
+# repository lock by bind_live_manifest_locked before it can authorize use.
 discover_live_repo() {
 	local hint repo=""
+	if [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
+		resolve_repo_root
+		return $?
+	fi
 	hint="$(state_dir)/run-$(ws_id).json"
 	if [ -f "$hint" ] && [ ! -L "$hint" ]; then
 		repo="$(node -e '
@@ -235,9 +242,28 @@ resolve_live_manifest_locked() {
 	'
 }
 
+# A workspace-named legacy manifest may participate only when it is the exact
+# generation selected by the locked repository scan. A foreign/stale hint is
+# never ignored in favor of a convenient candidate: fail closed before any
+# pane, Git, manifest, or archive mutation.
+validate_workspace_manifest_hint_locked() {
+	local selected="$1" hint
+	hint="$(state_dir)/run-$(ws_id).json"
+	if [ -e "$hint" ] || [ -L "$hint" ]; then
+		if [ -L "$hint" ] || [ ! -f "$hint" ] || ! node -e '
+			const path=require("path");
+			process.exit(path.resolve(process.argv[1])===path.resolve(process.argv[2]) ? 0 : 1);
+		' "$hint" "$selected"; then
+			echo "herdr-swarm: bookkeeping_unknown: workspace manifest hint $hint does not match the locked live generation $selected" >&2
+			return "$MANIFEST_EC_CORRUPT"
+		fi
+	fi
+}
+
 bind_live_manifest_locked() {
 	local selected
 	selected="$(resolve_live_manifest_locked "$1")" || return $?
+	validate_workspace_manifest_hint_locked "$selected" || return $?
 	HERDR_SWARM_MANIFEST_PATH="$selected"
 	export HERDR_SWARM_MANIFEST_PATH
 }
@@ -378,9 +404,11 @@ print_cleanup_inventory() {
 			const i=JSON.parse(d);
 			console.log("cleanup_operation\t" + i.operation_id);
 			console.log("cleanup_digest\t" + i.digest);
-			const approval={approved:true};
-			for (const k of ["resource_type","repo_key","git_common_dir","run_id","slot","worktree","generation","head","operation_id","digest"]) approval[k]=i[k];
-			console.log("cleanup_approval\t" + JSON.stringify(approval));
+			if (i.count > 0) {
+				const approval={approved:true};
+				for (const k of ["resource_type","repo_key","git_common_dir","run_id","slot","worktree","generation","head","operation_id","digest"]) approval[k]=i[k];
+				console.log("cleanup_approval\t" + JSON.stringify(approval));
+			}
 			for (const p of i.paths_display) console.log("ignored_json\t" + JSON.stringify(p));
 		});
 	'

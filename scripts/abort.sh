@@ -185,23 +185,26 @@ done <<<"$(report_only_discovery 2>/dev/null || true)"
 
 # --- (2) Slot worktrees + (4) harvest worktrees ------------------------------
 
-# One line per non-archived slot (pending/running/failed/settled/merged/
-# skipped — abort over-approximates; the archived filter is the only one).
+# One line per slot that still has ordinary resources to reap, plus archived
+# rows carrying an exact detached journal from an older interrupted cleanup.
+# New cleanups defer terminal slot archival until detached generation removal
+# succeeds, but retaining the archived+journal case keeps old recovery state
+# reachable instead of demoting it to an unauthenticated leftover.
 SLOT_LINES="$(printf '%s' "$DOC" | node -e '
 	let d = "";
 	process.stdin.on("data", (c) => (d += c)).on("end", () => {
 		for (const s of JSON.parse(d).slots || []) {
-			if (s.status === "archived") continue;
 			const j = s.journal || {};
-			console.log([s.slot, s.branch ?? "", s.path ?? "", s.workspace_id ?? "",
-				j.locus ?? "", j.merge_commit_sha ?? "", j.worktree ?? "",
-				JSON.stringify(s.journal ?? null)].join("\x1f"));
+			if (s.status === "archived" && j.locus !== "detached") continue;
+			console.log([s.slot, s.status ?? "", s.branch ?? "", s.path ?? "",
+				s.workspace_id ?? "", j.locus ?? "", j.merge_commit_sha ?? "",
+				j.worktree ?? "", JSON.stringify(s.journal ?? null)].join("\x1f"));
 		}
 	});
 ')"
 
 reap_slot_worktree() {
-	local slot="$1" branch="$2" wtpath="$3" wsid="$4" wt="" herdr_ok=0 why operation inventory count used rechecked before_digest after_digest
+	local slot="$1" branch="$2" wtpath="$3" wsid="$4" defer_archive="$5" wt="" herdr_ok=0 why operation inventory count used rechecked before_digest after_digest
 	# Ownership before destruction, same shared verifier harvest-step.sh's
 	# read_slot uses (lib.sh) — the third instance of the drift pattern in
 	# docs/solutions/best-practices/cross-script-invariant-drift.md, closed in
@@ -234,8 +237,11 @@ reap_slot_worktree() {
 		git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
 		echo "herdr-swarm: slot $slot: worktree already gone."
 		gone=$((gone + 1))
-		manifest_update_slot "$slot" '{"status":"archived"}' ||
-			note_failure "slot $slot was already gone but could not be marked archived"
+		slot_reaped=1
+		if [ "$defer_archive" != "yes" ]; then
+			manifest_update_slot "$slot" '{"status":"archived"}' ||
+				note_failure "slot $slot was already gone but could not be marked archived"
+		fi
 		return 0
 	fi
 	# Re-verify the RESOLVED path, whichever route produced it. The
@@ -320,9 +326,12 @@ reap_slot_worktree() {
 		fi
 	fi
 	removed=$((removed + 1))
+	slot_reaped=1
 	echo "herdr-swarm: slot $slot: removed worktree $wt (branch $branch kept — prune deletes merged branches)."
-	manifest_update_slot "$slot" '{"status":"archived"}' ||
-		note_failure "slot $slot was removed but could not be marked archived"
+	if [ "$defer_archive" != "yes" ]; then
+		manifest_update_slot "$slot" '{"status":"archived"}' ||
+			note_failure "slot $slot was removed but could not be marked archived"
+	fi
 }
 
 handled_hwts=" " # journaled harvest worktrees, so the leftover glob below skips them
@@ -335,14 +344,14 @@ harvest_wt_in_conflict() {
 	[ -n "$(git -C "$1" ls-files -u 2>/dev/null)" ]
 }
 reap_harvest_worktree() {
-	local slot="$1" jmsha="$2" jwt="$3" journal="$4" cur cleanup_rc=0
+	local slot="$1" jmsha="$2" jwt="$3" journal="$4" archive_after="$5" cur cleanup_rc=0
 	[ -n "$jwt" ] || return 0
 	handled_hwts="$handled_hwts$jwt "
 	if [ ! -d "$jwt" ]; then
 		# A crash may occur after verified removal but before journal clear. No
 		# deletion is attempted; settle the exact slot update strictly.
-		if [ -n "$jmsha" ]; then
-			manifest_update_slot "$slot" '{"status":"archived","journal":null}' || note_failure "slot $slot harvest resource was absent but its landed journal could not be cleared"
+		if [ "$archive_after" = "1" ]; then
+			manifest_update_slot "$slot" '{"status":"archived","journal":null}' || note_failure "slot $slot harvest resource was absent but its journal/final status could not be settled"
 		else
 			manifest_update_slot "$slot" '{"journal":null}' || note_failure "slot $slot harvest resource was absent but its journal could not be cleared"
 		fi
@@ -376,21 +385,31 @@ reap_harvest_worktree() {
 	fi
 	removed=$((removed + 1))
 	echo "herdr-swarm: removed harvest worktree $jwt."
-	if [ -n "$jmsha" ]; then
-		manifest_update_slot "$slot" '{"status":"archived","journal":null}' || note_failure "slot $slot harvest worktree was removed but landed journal update failed"
+	if [ "$archive_after" = "1" ]; then
+		manifest_update_slot "$slot" '{"status":"archived","journal":null}' || note_failure "slot $slot harvest worktree was removed but its journal/final status update failed"
 	else
 		manifest_update_slot "$slot" '{"journal":null}' || note_failure "slot $slot harvest worktree was removed but journal clear failed"
 	fi
 }
 
-while IFS="$US" read -r slot branch wtpath wsid jlocus jmsha jwt journal; do
+while IFS="$US" read -r slot slot_status branch wtpath wsid jlocus jmsha jwt journal; do
 	[ -n "$slot" ] || continue
-	reap_slot_worktree "$slot" "$branch" "$wtpath" "$wsid"
+	slot_reaped=0
+	defer_archive=no
+	[ "$jlocus" = "detached" ] && defer_archive=yes
+	if [ "$slot_status" = "archived" ]; then
+		# Recovery compatibility for the old broken transition: the ordinary
+		# slot resource was already declared gone, but its exact harvest journal
+		# remains authoritative and must stay reachable.
+		slot_reaped=1
+	else
+		reap_slot_worktree "$slot" "$branch" "$wtpath" "$wsid" "$defer_archive"
+	fi
 	# Only the detached locus owns a plugin worktree; the user-tree locus
 	# journals the USER's checkout, which abort never touches (MERGE_HEAD
 	# detection below is the only user-tree interaction, and it is read-only).
 	if [ "$jlocus" = "detached" ]; then
-		reap_harvest_worktree "$slot" "$jmsha" "$jwt" "$journal"
+		reap_harvest_worktree "$slot" "$jmsha" "$jwt" "$journal" "$slot_reaped"
 	fi
 done <<<"$SLOT_LINES"
 

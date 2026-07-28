@@ -188,6 +188,63 @@ test("Abort removes a landed exact harvest generation and archives every slot", 
 	assert.ok(run.archived().slots.every((slot) => slot.status === "archived"));
 });
 
+test("Abort keeps an ignored harvest journal reachable, then exact approval removes and archives once", () => {
+	const run = mkRun();
+	fs.writeFileSync(path.join(run.wt(1), "feature.txt"), "work\n");
+	h.git(run.wt(1), "add", "feature.txt");
+	h.git(run.wt(1), "commit", "-q", "-m", "feature");
+	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
+	let result = step(run, "merge", [1, run.fork], {
+		HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+	});
+	assert.equal(result.status, 99, `${result.stdout}\n${result.stderr}`);
+	const journal = run.slotRow(1).journal;
+	h.git(
+		run.repo,
+		"update-ref",
+		"refs/heads/main",
+		journal.merge_commit_sha,
+		run.fork,
+	);
+	appendIgnore(run, "*.secret");
+	fs.writeFileSync(path.join(journal.worktree, "precious.secret"), "keep\n");
+
+	result = abort(run);
+	assert.equal(result.status, 4, `${result.stdout}\n${result.stderr}`);
+	assert.equal(fs.existsSync(run.wt(1)), false, "ordinary slot was reaped");
+	assert.ok(fs.existsSync(journal.worktree), "ignored harvest generation kept");
+	const keptRow = run.slotRow(1);
+	assert.notEqual(
+		keptRow.status,
+		"archived",
+		"slot is not terminal while its exact harvest journal remains",
+	);
+	assert.deepEqual(keptRow.journal, journal);
+	const approvals = result.stdout
+		.split("\n")
+		.filter((line) => line.startsWith("cleanup_approval\t"));
+	assert.equal(approvals.length, 1, "zero-count slot inventory emits no approval");
+	const approval = approvals[0].slice("cleanup_approval\t".length);
+	assert.equal(JSON.parse(approval).resource_type, "harvest");
+
+	result = abort(run, { HERDR_SWARM_CLEANUP_APPROVAL: approval });
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.equal(fs.existsSync(journal.worktree), false);
+	assert.equal(fs.existsSync(path.join(journal.worktree, "precious.secret")), false);
+	assert.equal(fs.existsSync(path.join(run.sdir, "run-w9.json")), false);
+	const archive = run.archived();
+	assert.equal(archive.slots[0].status, "archived");
+	assert.equal(archive.slots[0].journal, null);
+	assert.equal(archive.completion_events.length, 1);
+	assert.equal(
+		fs
+			.readdirSync(run.sdir)
+			.filter((name) => name === `archived-${run.runId}.json`).length,
+		1,
+		"run is archived exactly once",
+	);
+});
+
 test("Abort exits nonzero when a removed exact harvest generation cannot clear its journal", () => {
 	const run = mkRun();
 	fs.writeFileSync(path.join(run.wt(1), "feature.txt"), "work\n");
@@ -286,6 +343,67 @@ test("Harvest, Status, and Abort resolve the exact live run from a second worksp
 	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 	assert.equal(fs.existsSync(path.join(run.sdir, "run-w9.json")), false);
 	assert.ok(fs.existsSync(path.join(run.sdir, `archived-${run.runId}.json`)));
+});
+
+test("explicit repository context refuses a conflicting workspace hint with zero removal", () => {
+	const foreign = mkRun({ prefix: "r-foreign" });
+	const current = mkRun({ prefix: "r-current" });
+	const currentManifest = path.join(current.sdir, "run-w9.json");
+	const currentHint = path.join(foreign.sdir, "run-w2.json");
+	fs.copyFileSync(currentManifest, currentHint);
+	const env = {
+		...foreign.env,
+		HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ workspace_cwd: current.repo }),
+	};
+
+	const harvest = spawnSync(
+		"bash",
+		[path.join(repoRoot, "scripts/harvest-step.sh"), "archive", "1"],
+		{ cwd: current.repo, env, encoding: "utf8" },
+	);
+	assert.equal(harvest.status, 3, `${harvest.stdout}\n${harvest.stderr}`);
+	assert.match(harvest.stderr, /workspace manifest hint|bookkeeping_unknown/);
+
+	const status = spawnSync(
+		"bash",
+		[path.join(repoRoot, "scripts/status-pane.sh")],
+		{
+			cwd: current.repo,
+			env: { ...env, HERDR_SWARM_LINGER_SECS: "1" },
+			encoding: "utf8",
+			timeout: 3000,
+		},
+	);
+	assert.doesNotMatch(status.stdout, new RegExp(`run:${foreign.runId}`));
+	assert.doesNotMatch(status.stdout, new RegExp(`run:${current.runId}`));
+	assert.match(status.stdout, /no single validated active run/);
+
+	const result = spawnSync("bash", [path.join(repoRoot, "scripts/abort.sh")], {
+		cwd: current.repo,
+		env,
+		encoding: "utf8",
+	});
+	assert.equal(result.status, 3, `${result.stdout}\n${result.stderr}`);
+	for (const [label, run] of [
+		["current", current],
+		["foreign", foreign],
+	]) {
+		assert.ok(fs.existsSync(run.wt(1)), `${label} worktree survives`);
+	}
+	assert.ok(fs.existsSync(currentHint), "current live generation survives");
+	assert.ok(
+		fs.existsSync(path.join(foreign.sdir, "run-w9.json")),
+		"foreign workspace hint survives",
+	);
+	assert.equal(
+		fs.existsSync(path.join(foreign.sdir, `archived-${foreign.runId}.json`)),
+		false,
+	);
+	assert.equal(
+		fs.existsSync(path.join(foreign.sdir, `archived-${current.runId}.json`)),
+		false,
+	);
+	assert.doesNotMatch(h.log(), /worktree remove/);
 });
 
 test("repository identity makes workspace aliases share one lock and discover the same active run", () => {

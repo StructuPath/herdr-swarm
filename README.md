@@ -184,10 +184,13 @@ forwards no environment):
 | Prune | `scripts/prune.sh` — a zero-TTY action, dry run by default, env-gated per resource class |
 
 Harvest, Status, and Abort resolve the active generation by physical Git
-repository, not by the current Herdr workspace filename. Reopening the same
-repository under another workspace ID therefore reaches the same run. The
-resolution occurs under the repository lock and refuses rather than choosing
-when multiple live manifests or an invalid active index exist.
+repository, not by the current Herdr workspace filename. An explicit
+`HERDR_PLUGIN_CONTEXT_JSON.workspace_cwd` is authoritative; any legacy
+workspace-named manifest must match the exact generation selected under that
+repository's lock or the operation refuses without mutation. Reopening the
+same repository under another workspace ID therefore reaches the same run.
+The resolution refuses rather than choosing when multiple live manifests, a
+conflicting workspace hint, or an invalid active index exists.
 
 #### Scripted ignored-file cleanup
 
@@ -220,8 +223,10 @@ generation, digest, symlink, duplicate owner, stale approval, or already-used
 operation refuses removal. If several resources contain ignored data, repeat
 preview/apply for each emitted approval. `harvest-step.sh archive` uses the
 same output protocol (exit 37 when approval is required); detached merge
-cleanup may emit an approval after the base swap lands, retains its journaled
-worktree, and finishes on `harvest-step.sh resume` with that approval.
+cleanup may emit an approval after the base swap lands and retains its exact
+journaled worktree until approved. Retry `harvest-step.sh resume` for a
+Harvest cleanup, or retry Abort with the exact approval Abort emitted; only a
+verified removal clears the journal and permits terminal slot/run archival.
 
 ### Keybinding
 
