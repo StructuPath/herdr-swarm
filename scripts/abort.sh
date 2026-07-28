@@ -27,7 +27,7 @@ version_gate intersection || true
 # is still ACTIVE and the caller must not treat this as a clean teardown.
 ABORT_EC_KEPT=4
 
-closed=0 removed=0 kept=0 gone=0 branches_remaining=0
+closed=0 removed=0 kept=0 gone=0 branches_remaining=0 failures=0
 # Human-readable inventory of everything KEPT — printed with the ACTIVE-run
 # notice below, because the summary counter alone does not say WHERE the work
 # survived.
@@ -36,6 +36,10 @@ note_kept() {
 	kept=$((kept + 1))
 	kept_paths="$kept_paths  $1"$'\n'
 }
+note_failure() {
+	failures=$((failures + 1))
+	echo "herdr-swarm: abort bookkeeping failure — $1" >&2
+}
 
 # Always printed — success, refusal, corrupt, nothing-to-do (R11: cleanup
 # always reports what was closed/removed/kept; sibling close.sh convention).
@@ -43,28 +47,32 @@ print_summary() {
 	echo "herdr-swarm: abort summary — panes closed $closed, worktrees removed $removed, kept $kept, already gone $gone, swarm branches remaining $branches_remaining (branches are deleted only by prune — R10)."
 }
 
+# The workspace manifest is a repository-discovery hint only. Select the exact
+# live generation across aliases while holding the physical-repository lock.
+US=$'\x1f'
+REPO_HINT="$(discover_live_repo 2>/dev/null || true)"
+if [ -z "$REPO_HINT" ]; then
+	echo "herdr-swarm: no active swarm run for this repository — nothing to abort."
+	print_summary
+	exit 0
+fi
+SWARM_REPO="$REPO_HINT"
+export SWARM_REPO
+MUTATION_LOCK="$(repo_mutation_lock_name "$REPO_HINT")" || exit 1
+acquire_lock "$MUTATION_LOCK" || exit 1
+trap 'release_lock "$MUTATION_LOCK"' EXIT
 rc=0
-DOC="$(manifest_read)" || rc=$?
+bind_live_manifest_locked "$REPO_HINT" || rc=$?
 case "$rc" in
 0) ;;
 "$MANIFEST_EC_MISSING")
-	echo "herdr-swarm: no active swarm run for this workspace ($(manifest_path)) — nothing to abort."
+	echo "herdr-swarm: no active swarm run for this repository — nothing to abort."
 	print_summary
 	exit 0
 	;;
-"$MANIFEST_EC_CORRUPT")
-	# manifest_read already printed the .bak hint on stderr. Unknown state
-	# must never be guess-deleted: degrade to report-only discovery (U3
-	# fallback), refuse ALL destruction, and exit the distinct corrupt code
-	# so a caller can branch without string-matching.
-	echo "herdr-swarm: manifest is CORRUPT — abort REFUSES all destruction. Restore the manifest (see the .bak hint above) and re-run." >&2
+*)
+	echo "herdr-swarm: repository live-run bookkeeping is unknown — abort REFUSES all destruction." >&2
 	echo "herdr-swarm: report-only discovery — what an abort WOULD act on:"
-	# The manifest is unreadable, so its repo_root is unavailable: seed the
-	# repo_git seam from the workspace context instead (lib.sh). Empty means
-	# not-a-repo, and discovery's git side then reports nothing rather than
-	# scanning whatever repo this action's cwd happened to be.
-	SWARM_REPO="$(resolve_repo_root 2>/dev/null || true)"
-	export SWARM_REPO
 	report_only_discovery | while IFS=$'\t' read -r kind a b; do
 		case "$kind" in
 		branch) echo "  branch   $a (kept either way — abort never deletes branches)" ;;
@@ -73,20 +81,17 @@ case "$rc" in
 		esac
 	done
 	print_summary
-	exit "$MANIFEST_EC_CORRUPT"
-	;;
-*)
-	echo "herdr-swarm: could not read the manifest (exit $rc) — abort refused." >&2
-	print_summary
 	exit "$rc"
 	;;
 esac
+DOC="$(manifest_read)" || {
+	rc=$?
+	echo "herdr-swarm: exact live manifest is unreadable — abort REFUSES all destruction." >&2
+	print_summary
+	exit "$rc"
+}
 
 # --- Run context -------------------------------------------------------------
-# \x1f-separated fields from the shared extractor (see lib.sh for why tab
-# would silently shift nullable columns). The guard is the extractor's; the
-# refusal wording is ours.
-US=$'\x1f'
 CTX="$(manifest_run_context "$DOC")" || {
 	echo "herdr-swarm: manifest has no usable run_id/repo_root — abort refused." >&2
 	print_summary
@@ -103,33 +108,8 @@ if ! run_id_safe="$(sanitize_slug "$RUN_ID")" || [ "$run_id_safe" != "$RUN_ID" ]
 	exit 1
 fi
 
-# The repo every preflight helper below acts on. abort learns the repo from
-# the MANIFEST, not from cwd, so it pins the seam explicitly (lib.sh repo_git)
-# instead of inheriting preflight's cwd-based default — the source-time default
-# was resolved before REPO_ROOT was known.
 SWARM_REPO="$REPO_ROOT"
 export SWARM_REPO
-# The unlocked manifest read above discovers identity only. Serialize on the
-# physical repository, re-read the exact live generation under that lock, and
-# refuse all deletion when any live/archived bookkeeping is unknown.
-MUTATION_LOCK="$(repo_mutation_lock_name "$REPO_ROOT")" || exit 1
-acquire_lock "$MUTATION_LOCK" || exit 1
-trap 'release_lock "$MUTATION_LOCK"' EXIT
-DOC_LOCKED="$(manifest_read)" || exit $?
-LOCKED_CTX="$(manifest_run_context "$DOC_LOCKED")" || exit 1
-IFS="$US" read -r LOCKED_RUN LOCKED_REPO _ <<<"$LOCKED_CTX"
-if [ "$LOCKED_RUN" != "$RUN_ID" ] || [ "$LOCKED_REPO" != "$REPO_ROOT" ]; then
-	echo "herdr-swarm: manifest identity changed while acquiring the repository lock — abort refused." >&2
-	print_summary
-	exit 3
-fi
-DOC="$DOC_LOCKED"
-SCAN="$(bookkeeping_scan "$REPO_ROOT")" || exit 1
-if ! bookkeeping_assert_known "$SCAN"; then
-	echo "herdr-swarm: abort REFUSES all destruction because repository bookkeeping is unknown." >&2
-	print_summary
-	exit 3
-fi
 
 # --- Optional read-only cleanup preview -------------------------------------
 # Preview inventories every owned slot and exits before pane close, worktree
@@ -146,6 +126,21 @@ if [ "${HERDR_SWARM_ABORT_PREVIEW:-}" = "yes" ]; then
 		[ -n "$pslot" ] && [ -n "$ppath" ] && [ -d "$ppath" ] || continue
 		if verify_slot_ownership "$RUN_ID" "$pbranch" "$ppath" >/dev/null; then
 			pinv="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$pslot" "$ppath" "$PREVIEW_BASE-s$pslot")" || exit 1
+			print_cleanup_inventory "$pinv"
+		fi
+	done
+	printf '%s' "$DOC" | node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			for(const s of JSON.parse(d).slots||[]) {
+				const j=s.journal;
+				if(j?.locus==="detached"&&j.worktree)
+					console.log([s.slot,j.worktree,JSON.stringify(j)].join("\x1f"));
+			}
+		});
+	' | while IFS="$US" read -r pslot ppath pjournal; do
+		[ -d "$ppath" ] || continue
+		if verify_harvest_resource "$RUN_ID" "$pslot" "$ppath" "$pjournal" >/dev/null; then
+			pinv="$(harvest_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$pslot" "$ppath" "$pjournal" "$PREVIEW_BASE-hs$pslot")" || exit 1
 			print_cleanup_inventory "$pinv"
 		fi
 	done
@@ -199,7 +194,8 @@ SLOT_LINES="$(printf '%s' "$DOC" | node -e '
 			if (s.status === "archived") continue;
 			const j = s.journal || {};
 			console.log([s.slot, s.branch ?? "", s.path ?? "", s.workspace_id ?? "",
-				j.locus ?? "", j.merge_commit_sha ?? "", j.worktree ?? ""].join("\x1f"));
+				j.locus ?? "", j.merge_commit_sha ?? "", j.worktree ?? "",
+				JSON.stringify(s.journal ?? null)].join("\x1f"));
 		}
 	});
 ')"
@@ -238,7 +234,8 @@ reap_slot_worktree() {
 		git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
 		echo "herdr-swarm: slot $slot: worktree already gone."
 		gone=$((gone + 1))
-		manifest_update_slot "$slot" '{"status":"archived"}' 2>/dev/null || true
+		manifest_update_slot "$slot" '{"status":"archived"}' ||
+			note_failure "slot $slot was already gone but could not be marked archived"
 		return 0
 	fi
 	# Re-verify the RESOLVED path, whichever route produced it. The
@@ -324,7 +321,8 @@ reap_slot_worktree() {
 	fi
 	removed=$((removed + 1))
 	echo "herdr-swarm: slot $slot: removed worktree $wt (branch $branch kept — prune deletes merged branches)."
-	manifest_update_slot "$slot" '{"status":"archived"}' 2>/dev/null || true
+	manifest_update_slot "$slot" '{"status":"archived"}' ||
+		note_failure "slot $slot was removed but could not be marked archived"
 }
 
 handled_hwts=" " # journaled harvest worktrees, so the leftover glob below skips them
@@ -337,85 +335,77 @@ harvest_wt_in_conflict() {
 	[ -n "$(git -C "$1" ls-files -u 2>/dev/null)" ]
 }
 reap_harvest_worktree() {
-	local slot="$1" jmsha="$2" jwt="$3" cur
+	local slot="$1" jmsha="$2" jwt="$3" journal="$4" cur cleanup_rc=0
 	[ -n "$jwt" ] || return 0
 	handled_hwts="$handled_hwts$jwt "
+	if [ ! -d "$jwt" ]; then
+		# A crash may occur after verified removal but before journal clear. No
+		# deletion is attempted; settle the exact slot update strictly.
+		if [ -n "$jmsha" ]; then
+			manifest_update_slot "$slot" '{"status":"archived","journal":null}' || note_failure "slot $slot harvest resource was absent but its landed journal could not be cleared"
+		else
+			manifest_update_slot "$slot" '{"journal":null}' || note_failure "slot $slot harvest resource was absent but its journal could not be cleared"
+		fi
+		return 0
+	fi
 	cur="$(git -C "$REPO_ROOT" rev-parse --verify "$BASE_REF^{commit}" 2>/dev/null || true)"
 	if [ -n "$jmsha" ] && [ "$cur" != "$jmsha" ]; then
-		# The abort-merge rule, reused: a worktree holding an un-swapped merge
-		# commit is that commit's only obvious anchor — report the SHA loudly
-		# and keep it (plan risk: never silently unreachable, never auto-deleted).
-		echo "herdr-swarm: slot $slot has UN-SWAPPED merge commit $jmsha in $jwt — KEPT for recovery (reopen Harvest to resume the swap, or recover by hand)." >&2
+		echo "herdr-swarm: slot $slot has UN-SWAPPED merge commit $jmsha in $jwt — KEPT for recovery." >&2
 		note_kept "harvest worktree $jwt (un-swapped merge commit $jmsha)"
 		return 0
 	fi
-	if [ -d "$jwt" ] && harvest_wt_in_conflict "$jwt"; then
-		# Checked BEFORE the journal is cleared: the conflict resolution the
-		# user is in the middle of still belongs to that journaled merge.
-		echo "herdr-swarm: slot $slot has a LIVE conflict resolution in $jwt (unmerged paths present) — KEPT untouched; finish or abandon it in Harvest." >&2
+	if harvest_wt_in_conflict "$jwt"; then
+		echo "herdr-swarm: slot $slot has a LIVE conflict resolution in $jwt — KEPT untouched." >&2
 		note_kept "harvest worktree $jwt (live conflict resolution)"
 		return 0
 	fi
-	if [ -n "$jmsha" ]; then
-		# Base already equals the journaled commit: the swap landed before the
-		# crash and only bookkeeping is missing (same as resume_completed).
-		manifest_update_slot "$slot" '{"status":"merged","journal":null}' 2>/dev/null || true
-	else
-		manifest_update_slot "$slot" '{"journal":null}' 2>/dev/null || true
+	if ! verify_harvest_resource "$RUN_ID" "$slot" "$jwt" "$journal" >/dev/null; then
+		echo "herdr-swarm: slot $slot harvest resource identity FAILED — KEPT untouched." >&2
+		note_kept "harvest worktree $jwt (exact resource identity failed)"
+		return 0
 	fi
-	if [ -d "$jwt" ]; then
-		# May be mid-conflict or clean — merge --abort is best-effort, then a
-		# no-force removal; a refusal keeps it and says so.
+	if [ -z "$jmsha" ]; then
+		# Verification precedes merge --abort because it resets tracked state.
 		git -C "$jwt" merge --abort >/dev/null 2>&1 || true
-		if git -C "$REPO_ROOT" worktree remove "$jwt" >/dev/null 2>&1; then
-			removed=$((removed + 1))
-			echo "herdr-swarm: removed harvest worktree $jwt."
-		else
-			echo "herdr-swarm: KEPT harvest worktree $jwt (removal refused; inspect by hand)." >&2
-			note_kept "harvest worktree $jwt (removal refused)"
-		fi
+	fi
+	remove_harvest_resource "$RUN_ID" "$slot" "$jwt" "$journal" || cleanup_rc=$?
+	if [ "$cleanup_rc" -ne 0 ]; then
+		echo "herdr-swarm: KEPT harvest worktree $jwt (exact cleanup refused or needs approval)." >&2
+		note_kept "harvest worktree $jwt (cleanup refused or approval required)"
+		return 0
+	fi
+	removed=$((removed + 1))
+	echo "herdr-swarm: removed harvest worktree $jwt."
+	if [ -n "$jmsha" ]; then
+		manifest_update_slot "$slot" '{"status":"archived","journal":null}' || note_failure "slot $slot harvest worktree was removed but landed journal update failed"
+	else
+		manifest_update_slot "$slot" '{"journal":null}' || note_failure "slot $slot harvest worktree was removed but journal clear failed"
 	fi
 }
 
-while IFS="$US" read -r slot branch wtpath wsid jlocus jmsha jwt; do
+while IFS="$US" read -r slot branch wtpath wsid jlocus jmsha jwt journal; do
 	[ -n "$slot" ] || continue
 	reap_slot_worktree "$slot" "$branch" "$wtpath" "$wsid"
 	# Only the detached locus owns a plugin worktree; the user-tree locus
 	# journals the USER's checkout, which abort never touches (MERGE_HEAD
 	# detection below is the only user-tree interaction, and it is read-only).
 	if [ "$jlocus" = "detached" ]; then
-		reap_harvest_worktree "$slot" "$jmsha" "$jwt"
+		reap_harvest_worktree "$slot" "$jmsha" "$jwt" "$journal"
 	fi
 done <<<"$SLOT_LINES"
 
-# Leftover harvest worktrees whose journal was already cleared (crash between
-# journal_clear and removal). Guard even here: a HEAD that is not an ancestor
-# of base could be an un-swapped merge commit the bookkeeping lost — keep it.
+# A harvest-looking path with no exact live journal has no generation/HEAD/
+# slot ownership proof. Route it through the shared verifier, which must fail,
+# and quarantine it in place rather than resurrecting the old prefix-only rm.
 for d in "$(state_dir)"/harvest-"$RUN_ID"-s*; do
 	[ -d "$d" ] || continue
 	case "$handled_hwts" in *" $d "*) continue ;; esac
-	head_sha="$(git -C "$d" rev-parse --verify HEAD 2>/dev/null || true)"
-	if [ -n "$head_sha" ] && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$head_sha" "$BASE_REF" 2>/dev/null; then
-		echo "herdr-swarm: KEPT leftover harvest worktree $d — its HEAD $head_sha is not on $BASE_REF (possible un-swapped merge commit)." >&2
-		note_kept "leftover harvest worktree $d (HEAD $head_sha not on $BASE_REF)"
-		continue
-	fi
-	# Same live-conflict hazard as the journaled path: a mid-conflict merge
-	# leaves HEAD at base (no merge commit yet), so the ancestry guard above
-	# passes and only the unmerged-index check catches it.
-	if harvest_wt_in_conflict "$d"; then
-		echo "herdr-swarm: KEPT leftover harvest worktree $d — LIVE conflict resolution in progress (unmerged paths present)." >&2
-		note_kept "leftover harvest worktree $d (live conflict resolution)"
-		continue
-	fi
-	git -C "$d" merge --abort >/dev/null 2>&1 || true
-	if git -C "$REPO_ROOT" worktree remove "$d" >/dev/null 2>&1; then
-		removed=$((removed + 1))
-		echo "herdr-swarm: removed leftover harvest worktree $d."
+	if verify_harvest_resource "$RUN_ID" "0" "$d" "null" >/dev/null 2>&1; then
+		echo "herdr-swarm: internal error: unjournaled harvest resource unexpectedly verified — KEPT." >&2
 	else
-		echo "herdr-swarm: KEPT leftover harvest worktree $d (removal refused)." >&2
-		note_kept "leftover harvest worktree $d (removal refused)"
+		echo "herdr-swarm: KEPT leftover harvest-looking worktree $d — no exact live resource journal owns it." >&2
 	fi
+	note_kept "leftover harvest-looking worktree $d (unresolved generation ownership)"
 done
 
 # --- (5) MERGE_HEAD in the user's tree: offer, never run ---------------------
@@ -435,9 +425,10 @@ fi
 # abort, so leaving it is the cheap side of the trade.
 # remove_exclude_pattern resolves --git-path through repo_git, so it lands in
 # SWARM_REPO's exclude file regardless of abort's own cwd.
-if [ "$kept" -eq 0 ]; then
-	remove_exclude_pattern ||
-		echo "herdr-swarm: warning: could not remove the $SWARM_TASK_FILE exclude pattern." >&2
+if [ "$kept" -eq 0 ] && [ "$failures" -eq 0 ]; then
+	remove_exclude_pattern || {
+		note_failure "could not remove the $SWARM_TASK_FILE exclude pattern"
+	}
 else
 	echo "herdr-swarm: kept the $SWARM_TASK_FILE exclude pattern — kept worktrees still contain that file, and un-excluding it would expose it to git status."
 fi
@@ -458,6 +449,11 @@ fi
 # manifest at $(manifest_path); archiving it would leave the kept worktrees
 # unreachable through the tool that is supposed to rescue them. So when
 # kept > 0 the manifest stays exactly where it is and the run stays ACTIVE.
+if [ "$failures" -gt 0 ]; then
+	echo "herdr-swarm: run $RUN_ID stays ACTIVE — $failures authoritative slot/bookkeeping update(s) failed after cleanup; Abort is incomplete." >&2
+	print_summary
+	exit 1
+fi
 if [ "$kept" -gt 0 ]; then
 	echo "herdr-swarm: run $RUN_ID stays ACTIVE — $kept item(s) were KEPT and the manifest is NOT archived, so Harvest can still reach them:"
 	printf '%s' "$kept_paths"
@@ -466,15 +462,19 @@ if [ "$kept" -gt 0 ]; then
 	exit "$ABORT_EC_KEPT"
 fi
 
-# Exact-name, idempotent finalization is shared with full Harvest. Archive
-# failure is fatal: a successful exit may never claim a run finished while
-# its durable recovery record is still live or ambiguous.
-if ! final_out="$(finalize_run "$REPO_ROOT" "$RUN_ID")"; then
+# Abort requires a complete slot set and the exact immutable archive. Partial
+# Harvest's benign no-op finalization mode is explicitly not accepted here.
+if ! final_out="$(finalize_run "$REPO_ROOT" "$RUN_ID" require-complete)"; then
 	echo "herdr-swarm: abort cleanup finished but run finalization/archive FAILED; the run remains recoverable and this abort is incomplete." >&2
 	print_summary
 	exit 1
 fi
 [ -n "$final_out" ] && printf '%s\n' "$final_out"
+if ! exact_run_archive_exists "$RUN_ID"; then
+	echo "herdr-swarm: abort finalization did not leave the exact completed archive; Abort is incomplete." >&2
+	print_summary
+	exit 1
+fi
 
 print_summary
 exit 0

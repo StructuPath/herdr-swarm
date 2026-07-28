@@ -584,7 +584,7 @@ test("status-pane.sh lingers with a friendly message instead of flash-closing", 
 			timeout: 1500,
 		},
 	);
-	assert.match(r.stdout, /no active swarm run/);
+	assert.match(r.stdout, /no single validated active run|no active swarm run/);
 	assert.equal(r.signal, "SIGTERM", "still lingering when the timeout hit");
 });
 
@@ -592,8 +592,13 @@ test("status-pane.sh execs the renderer with the resolved context (end to end)",
 	h.writeHerdrStub();
 	fs.rmSync(path.join(h.stubDir, "git"), { force: true });
 	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-e2e-"));
+	const repo = h.makeRepo();
+	const fork = h.git(repo, "rev-parse", "HEAD").stdout.trim();
 	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir });
-	fs.writeFileSync(path.join(sdir, "run-w9.json"), sampleManifest());
+	fs.writeFileSync(
+		path.join(sdir, "run-w9.json"),
+		sampleManifest({ repo_root: repo, fork_sha: fork }),
+	);
 	const r = spawnSync(
 		"bash",
 		[path.join(repoRoot, "scripts", "status-pane.sh")],

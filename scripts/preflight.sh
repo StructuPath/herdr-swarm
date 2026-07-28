@@ -302,19 +302,25 @@ remove_exclude_pattern() {
 	return 0
 }
 
-# finalize_run <repo-root> <run-id>: idempotently complete and archive a run
-# after every slot is archived. The exact archive name is immutable: retries
-# never create PID-suffixed generations or overwrite a prior recovery record.
-# Callers hold the repository mutation lock.
+exact_run_archive_exists() {
+	local run_id="$1" arch
+	arch="$(state_dir)/archived-$run_id.json"
+	[ -f "$arch" ] && [ ! -L "$arch" ] && node -e '
+		const fs=require("fs"); const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+		process.exit(d.run_id===process.argv[2] && d.status==="completed" &&
+			(d.slots||[]).every(s=>s.status==="archived"&&!s.journal) ? 0 : 1);
+	' "$arch" "$run_id" 2>/dev/null
+}
+
+# finalize_run <repo-root> <run-id> [require-complete]: partial Harvest uses
+# the default benign no-op; Abort passes require-complete and must fail unless
+# every slot is archived/journal-free and the exact archive is durable.
 finalize_run() {
-	local repo_root="$1" run_id="$2" mf arch doc updated scan rc=0
+	local repo_root="$1" run_id="$2" mode="${3-}" mf arch doc updated scan rc=0
 	mf="$(manifest_path)" || return 1
 	arch="$(state_dir)/archived-$run_id.json"
 	if [ ! -e "$mf" ]; then
-		if [ -f "$arch" ] && [ ! -L "$arch" ] && node -e '
-			const fs=require("fs"); const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
-			process.exit(d.run_id===process.argv[2] && d.status==="completed" ? 0 : 1);
-		' "$arch" "$run_id" 2>/dev/null; then
+		if exact_run_archive_exists "$run_id"; then
 			# Retry after the archive rename: finish only idempotent bookkeeping
 			# tails, never rewrite the immutable archive.
 			active_index_remove "$repo_root" "$run_id" 2>/dev/null || true
@@ -340,7 +346,13 @@ finalize_run() {
 	' "$run_id" || rc=$?
 	case "$rc" in
 	0) ;;
-	1) return 0 ;;
+	1)
+		if [ "$mode" = "require-complete" ]; then
+			echo "herdr-swarm: finalization refused — not every slot is archived and journal-free." >&2
+			return 1
+		fi
+		return 0
+		;;
 	*) return "$rc" ;;
 	esac
 	for resource_path in "$(state_dir)"/harvest-"$run_id"-s*; do

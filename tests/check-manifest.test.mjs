@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -33,6 +34,21 @@ test("repository manifest passes CI validation", () => {
 	const result = validateRepository(root);
 	assert.deepEqual(result.errors, []);
 	assert.equal(result.entrypointCount, 8);
+});
+
+test("manifest validation needs only Node and works with no Python on PATH", () => {
+	const result = spawnSync(
+		process.execPath,
+		[path.join(root, "scripts/check-manifest.mjs")],
+		{ env: { ...process.env, PATH: "" }, encoding: "utf8" },
+	);
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.match(result.stdout, /Manifest valid/);
+	const source = fs.readFileSync(
+		path.join(root, "scripts/check-manifest.mjs"),
+		"utf8",
+	);
+	assert.doesNotMatch(source, /python3|tomllib|node:child_process/);
 });
 
 test("manifest validation reports malformed TOML", (t) => {

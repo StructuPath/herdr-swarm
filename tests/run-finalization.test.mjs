@@ -148,6 +148,71 @@ test("abort ignored cleanup is preview/apply and a generic legacy acknowledgment
 	assert.ok(fs.existsSync(path.join(run.sdir, `archived-${run.runId}.json`)));
 });
 
+test("Abort exits nonzero when post-removal or already-gone slot bookkeeping cannot persist", () => {
+	for (const alreadyGone of [false, true]) {
+		const run = mkRun();
+		if (alreadyGone) {
+			fs.rmSync(run.wt(1), { recursive: true, force: true });
+			h.git(run.repo, "worktree", "prune");
+		}
+		const backup = path.join(run.sdir, "run-w9.json.bak");
+		fs.rmSync(backup, { force: true });
+		fs.symlinkSync(path.join(run.sdir, "missing-parent", "backup"), backup);
+		const result = abort(run);
+		assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+		assert.match(result.stderr, /bookkeeping failure/);
+		assert.equal(fs.existsSync(run.wt(1)), false);
+		assert.ok(fs.existsSync(path.join(run.sdir, "run-w9.json")));
+		assert.equal(
+			fs.existsSync(path.join(run.sdir, `archived-${run.runId}.json`)),
+			false,
+		);
+	}
+});
+
+test("Abort removes a landed exact harvest generation and archives every slot", () => {
+	const run = mkRun();
+	fs.writeFileSync(path.join(run.wt(1), "feature.txt"), "work\n");
+	h.git(run.wt(1), "add", "feature.txt");
+	h.git(run.wt(1), "commit", "-q", "-m", "feature");
+	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
+	let result = step(run, "merge", [1, run.fork], {
+		HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+	});
+	assert.equal(result.status, 99, `${result.stdout}\n${result.stderr}`);
+	const journal = run.slotRow(1).journal;
+	h.git(run.repo, "update-ref", "refs/heads/main", journal.merge_commit_sha, run.fork);
+	result = abort(run);
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.equal(fs.existsSync(journal.worktree), false);
+	assert.ok(run.archived().slots.every((slot) => slot.status === "archived"));
+});
+
+test("Abort exits nonzero when a removed exact harvest generation cannot clear its journal", () => {
+	const run = mkRun();
+	fs.writeFileSync(path.join(run.wt(1), "feature.txt"), "work\n");
+	h.git(run.wt(1), "add", "feature.txt");
+	h.git(run.wt(1), "commit", "-q", "-m", "feature");
+	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
+	let result = step(run, "merge", [1, run.fork], {
+		HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+	});
+	assert.equal(result.status, 99, `${result.stdout}\n${result.stderr}`);
+	const journal = run.slotRow(1).journal;
+	h.git(run.repo, "update-ref", "refs/heads/main", journal.merge_commit_sha, run.fork);
+	const backup = path.join(run.sdir, "run-w9.json.bak");
+	fs.rmSync(backup, { force: true });
+	fs.symlinkSync(path.join(run.sdir, "missing-parent", "backup"), backup);
+
+	result = abort(run);
+	assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.equal(fs.existsSync(run.wt(1)), false, "slot removal completed");
+	assert.equal(fs.existsSync(journal.worktree), false, "harvest removal completed");
+	assert.match(result.stderr, /journal update failed|bookkeeping failure/);
+	assert.ok(fs.existsSync(path.join(run.sdir, "run-w9.json")));
+	assert.equal(fs.existsSync(path.join(run.sdir, `archived-${run.runId}.json`)), false);
+});
+
 test("full harvest archives exactly once, removes the live pointer/exclude, and retry is idempotent", () => {
 	const run = mkRun({ slots: 2, status: "skipped" });
 	let result = step(run, "archive", [1]);
@@ -195,6 +260,34 @@ test("full harvest archives exactly once, removes the live pointer/exclude, and 
 	);
 });
 
+test("Harvest, Status, and Abort resolve the exact live run from a second workspace alias", () => {
+	const run = mkRun();
+	const aliasEnv = { ...run.env, HERDR_WORKSPACE_ID: "w2" };
+	const preview = spawnSync(
+		"bash",
+		[path.join(repoRoot, "scripts/harvest-step.sh"), "preview", "1"],
+		{ cwd: run.repo, env: aliasEnv, encoding: "utf8" },
+	);
+	assert.equal(preview.status, 0, `${preview.stdout}\n${preview.stderr}`);
+	assert.match(preview.stdout, /^slot\t1$/m);
+
+	const status = spawnSync(
+		"bash",
+		[path.join(repoRoot, "scripts/status-pane.sh")],
+		{ cwd: run.repo, env: aliasEnv, encoding: "utf8", timeout: 1800 },
+	);
+	assert.match(status.stdout, new RegExp(`run:${run.runId}`));
+
+	const result = spawnSync("bash", [path.join(repoRoot, "scripts/abort.sh")], {
+		cwd: run.repo,
+		env: aliasEnv,
+		encoding: "utf8",
+	});
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.equal(fs.existsSync(path.join(run.sdir, "run-w9.json")), false);
+	assert.ok(fs.existsSync(path.join(run.sdir, `archived-${run.runId}.json`)));
+});
+
 test("repository identity makes workspace aliases share one lock and discover the same active run", () => {
 	const run = mkRun();
 	const source = path.join(run.sdir, "run-w9.json");
@@ -221,6 +314,30 @@ test("repository identity makes workspace aliases share one lock and discover th
 	);
 	assert.equal(active.status, 17, active.stderr);
 	assert.match(active.stderr, /another workspace/);
+});
+
+test("a stale foreign legacy archive is quarantined without bricking this repository", () => {
+	const run = mkRun();
+	const stale = {
+		run_id: "stale-foreign",
+		repo_root: "/a/repository/that/no/longer/exists",
+		base_ref: "refs/heads/main",
+		fork_sha: "a".repeat(40),
+		created_at: "2026-01-01T00:00:00Z",
+		exclude_pattern_added: false,
+		slots: [{ slot: 1, branch: "swarm/stale-foreign/s1", status: "archived" }],
+	};
+	fs.writeFileSync(
+		path.join(run.sdir, "archived-stale-foreign.json"),
+		JSON.stringify(stale),
+	);
+	const scan = h.runLib(`bookkeeping_scan ${JSON.stringify(run.repo)}`, run.env);
+	assert.equal(scan.status, 0, scan.stderr);
+	const parsed = JSON.parse(scan.stdout);
+	assert.deepEqual(parsed.errors, []);
+	assert.equal(parsed.quarantined.length, 1);
+	assert.match(parsed.quarantined[0].reason, /cannot be resolved/);
+	assert.equal(parsed.live[0].run_id, run.runId);
 });
 
 test("corrupt or symlinked archived bookkeeping refuses all prune deletion", () => {

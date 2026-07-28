@@ -1,35 +1,67 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const COMMAND_SECTIONS = ["build", "startup", "actions", "panes", "events"];
-const TOML_TO_JSON = `
-import json
-import sys
-import tomllib
 
-with open(sys.argv[1], "rb") as manifest:
-    json.dump(tomllib.load(manifest), sys.stdout)
-`;
+function stripTomlComment(line) {
+	let quoted = false;
+	let escaped = false;
+	for (let index = 0; index < line.length; index += 1) {
+		const char = line[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (quoted && char === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (char === '"') quoted = !quoted;
+		else if (char === "#" && !quoted) return line.slice(0, index);
+	}
+	if (quoted) throw new Error("unterminated string");
+	return line;
+}
 
+function parseTomlValue(raw) {
+	const value = raw.trim();
+	if (value.startsWith('"') || value.startsWith("[")) return JSON.parse(value);
+	if (/^(?:true|false)$/.test(value)) return value === "true";
+	if (/^-?[0-9]+$/.test(value)) return Number(value);
+	throw new Error(`unsupported value ${JSON.stringify(value)}`);
+}
+
+// Herdr's manifest contract here uses root scalars and arrays of tables with
+// scalar/string-array fields. Parsing that declared subset in Node keeps the
+// validator zero-dependency and makes Node >=20 the complete CI toolchain.
 function parseManifest(manifestPath) {
-	const result = spawnSync("python3", ["-c", TOML_TO_JSON, manifestPath], {
-		encoding: "utf8",
-	});
-	if (result.error) {
-		throw new Error(
-			`could not run python3 to parse the manifest: ${result.error.message}`,
-		);
-	}
-	if (result.status !== 0) {
-		throw new Error(`manifest is not valid TOML: ${result.stderr.trim()}`);
-	}
+	const document = {};
+	let current = document;
 	try {
-		return JSON.parse(result.stdout);
+		for (const source of fs.readFileSync(manifestPath, "utf8").split(/\r?\n/)) {
+			const line = stripTomlComment(source).trim();
+			if (!line) continue;
+			const table = line.match(/^\[\[([A-Za-z0-9_-]+)\]\]$/);
+			if (table) {
+				const section = table[1];
+				document[section] ??= [];
+				if (!Array.isArray(document[section]))
+					throw new Error(`${section} is not an array of tables`);
+				current = {};
+				document[section].push(current);
+				continue;
+			}
+			const assignment = line.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
+			if (!assignment) throw new Error("unsupported statement");
+			const [, key, raw] = assignment;
+			if (Object.hasOwn(current, key)) throw new Error(`duplicate key ${key}`);
+			current[key] = parseTomlValue(raw);
+		}
+		return document;
 	} catch (error) {
-		throw new Error(`manifest parser returned invalid JSON: ${error.message}`);
+		throw new Error(`manifest is not valid TOML: ${error.message}`);
 	}
 }
 

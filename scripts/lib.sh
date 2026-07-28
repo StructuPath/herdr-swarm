@@ -199,6 +199,49 @@ bookkeeping_scan() {
 	safety_state scan "$(state_dir)" "$1"
 }
 
+# Resolve the physical repository before selecting a live generation. The
+# workspace-named manifest is only a discovery hint; repository aliases fall
+# back to Herdr's workspace context/cwd, and neither route authorizes mutation.
+discover_live_repo() {
+	local hint repo=""
+	hint="$(state_dir)/run-$(ws_id).json"
+	if [ -f "$hint" ] && [ ! -L "$hint" ]; then
+		repo="$(node -e '
+			const fs=require("fs");
+			try { const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+				if(typeof d.repo_root==="string") process.stdout.write(d.repo_root); }
+			catch {}
+		' "$hint" 2>/dev/null || true)"
+	fi
+	[ -n "$repo" ] && [ -d "$repo" ] || repo="$(resolve_repo_root 2>/dev/null || true)"
+	[ -n "$repo" ] || return 1
+	printf '%s\n' "$repo"
+}
+
+# Caller holds repo_mutation_lock_name(repo). Exactly one semantically valid
+# live manifest may be selected; zero is MANIFEST_EC_MISSING and multiples or
+# unknown bookkeeping fail closed through bookkeeping_assert_known.
+resolve_live_manifest_locked() {
+	local repo_root="$1" scan
+	scan="$(bookkeeping_scan "$repo_root")" || return 1
+	bookkeeping_assert_known "$scan" || return $?
+	printf '%s' "$scan" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const live=JSON.parse(d).live||[];
+			if(live.length===0) process.exit(2);
+			if(live.length!==1) process.exit(3);
+			process.stdout.write(live[0].path+"\n");
+		});
+	'
+}
+
+bind_live_manifest_locked() {
+	local selected
+	selected="$(resolve_live_manifest_locked "$1")" || return $?
+	HERDR_SWARM_MANIFEST_PATH="$selected"
+	export HERDR_SWARM_MANIFEST_PATH
+}
+
 bookkeeping_assert_known() {
 	local scan="$1"
 	printf '%s' "$scan" | node -e '
@@ -254,12 +297,74 @@ cleanup_operation_id() {
 	safety_state operation-id
 }
 
-slot_ignored_inventory() {
-	local repo_root="$1" run_id="$2" slot="$3" wt="$4" operation_id="$5" identity key common
+slot_resource_binding() {
+	local repo_root="$1" run_id="$2" slot="$3" wt="$4" identity physical head
 	identity="$(repo_identity_json "$repo_root")" || return 1
-	key="$(repo_identity_field "$identity" repo_key)" || return 1
-	common="$(repo_identity_field "$identity" git_common_dir)" || return 1
-	safety_state inventory "$repo_root" "$key" "$common" "$run_id" "$slot" "$wt" "$operation_id"
+	physical="$(cd "$wt" 2>/dev/null && pwd -P)" || return 1
+	head="$(git -C "$physical" rev-parse --verify 'HEAD^{commit}')" || return 1
+	node -e '
+		const [identity,runId,slot,worktree,head]=process.argv.slice(1), id=JSON.parse(identity);
+		process.stdout.write(JSON.stringify({resource_type:"slot",repo_key:id.repo_key,
+			git_common_dir:id.git_common_dir,run_id:runId,slot,worktree,
+			generation:"slot-worktree",head}));
+	' "$identity" "$run_id" "$slot" "$physical" "$head"
+}
+
+cleanup_inventory() {
+	local repo_root="$1" binding="$2" operation_id="$3"
+	safety_state inventory "$repo_root" "$binding" "$operation_id"
+}
+
+slot_ignored_inventory() {
+	local repo_root="$1" run_id="$2" slot="$3" wt="$4" operation_id="$5" binding
+	binding="$(slot_resource_binding "$repo_root" "$run_id" "$slot" "$wt")" || return 1
+	cleanup_inventory "$repo_root" "$binding" "$operation_id"
+}
+
+verify_harvest_resource() {
+	local run_id="$1" slot="$2" wt="$3" journal="$4"
+	safety_state verify-harvest "$(state_dir)" "${SWARM_REPO:?}" "$run_id" "$slot" "$wt" "$journal" "$(manifest_path)"
+}
+
+harvest_ignored_inventory() {
+	local repo_root="$1" run_id="$2" slot="$3" wt="$4" journal="$5" operation_id="$6" binding
+	binding="$(verify_harvest_resource "$run_id" "$slot" "$wt" "$journal")" || return 1
+	cleanup_inventory "$repo_root" "$binding" "$operation_id"
+}
+
+# The sole git-removal surface for detached harvest resources. Identity and
+# recursive ignored inventory are checked twice, immediately around the
+# no-force removal. Ignored data requires the exact one-use approval.
+remove_harvest_resource() {
+	local run_id="$1" slot="$2" wt="$3" journal="$4" operation inventory count used rechecked before after binding
+	binding="$(verify_harvest_resource "$run_id" "$slot" "$wt" "$journal")" || return 36
+	operation="$(printf '%s' "${HERDR_SWARM_CLEANUP_APPROVAL:-}" | node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);if(a.operation_id)process.stdout.write(String(a.operation_id));}catch{}});
+	')"
+	[ -n "$operation" ] || operation="$(cleanup_operation_id)" || return 1
+	inventory="$(cleanup_inventory "$SWARM_REPO" "$binding" "$operation")" || return 1
+	count="$(cleanup_inventory_count "$inventory")" || return 1
+	if [ "$count" -gt 0 ]; then
+		used="$(cleanup_approval_validate "$inventory")" || {
+			print_cleanup_inventory "$inventory"
+			echo "herdr-swarm: harvest worktree holds ignored files; apply requires this exact one-use cleanup approval." >&2
+			return 37
+		}
+	fi
+	if [ -n "${HERDR_SWARM_TEST_CLEANUP_READY_FILE:-}" ]; then : >"$HERDR_SWARM_TEST_CLEANUP_READY_FILE"; fi
+	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK:-}" ]; then sleep "$HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK"; fi
+	binding="$(verify_harvest_resource "$run_id" "$slot" "$wt" "$journal")" || return 36
+	rechecked="$(cleanup_inventory "$SWARM_REPO" "$binding" "$operation")" || return 1
+	before="$(printf '%s' "$inventory" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')"
+	after="$(printf '%s' "$rechecked" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')"
+	if [ "$before" != "$after" ]; then
+		print_cleanup_inventory "$rechecked"
+		echo "herdr-swarm: harvest cleanup inventory changed after preview; zero removal performed." >&2
+		return 37
+	fi
+	if [ "$count" -gt 0 ]; then cleanup_approval_consume "$used" || return 36; fi
+	git -C "$SWARM_REPO" worktree remove "$wt" || return 1
+	safety_state verify-harvest-removed "$SWARM_REPO" "$binding" || return 1
 }
 
 cleanup_inventory_count() {
@@ -274,7 +379,7 @@ print_cleanup_inventory() {
 			console.log("cleanup_operation\t" + i.operation_id);
 			console.log("cleanup_digest\t" + i.digest);
 			const approval={approved:true};
-			for (const k of ["repo_key","git_common_dir","run_id","slot","worktree","operation_id","digest"]) approval[k]=i[k];
+			for (const k of ["resource_type","repo_key","git_common_dir","run_id","slot","worktree","generation","head","operation_id","digest"]) approval[k]=i[k];
 			console.log("cleanup_approval\t" + JSON.stringify(approval));
 			for (const p of i.paths_display) console.log("ignored_json\t" + JSON.stringify(p));
 		});
@@ -822,7 +927,11 @@ require_node() {
 }
 
 manifest_path() {
-	printf '%s/run-%s.json\n' "$(state_dir)" "$(ws_id)"
+	if [ -n "${HERDR_SWARM_MANIFEST_PATH:-}" ]; then
+		printf '%s\n' "$HERDR_SWARM_MANIFEST_PATH"
+	else
+		printf '%s/run-%s.json\n' "$(state_dir)" "$(ws_id)"
+	fi
 }
 
 # manifest_write: full manifest JSON on stdin → $(manifest_path). The order

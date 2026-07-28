@@ -580,6 +580,76 @@ test("kill between merge commit and swap: resume offers completion when base is 
 	assert.equal(run.slotRow(1).journal, null);
 });
 
+test("swap and resume use exact ignored preview/apply before removing a harvest generation", () => {
+	const run = mkRun();
+	commitIn(run.wt(1), "feat.txt");
+	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
+	let result = step(run, "merge", [1, run.fork], {
+		HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+	});
+	assert.equal(result.status, 99);
+	const hwt = run.slotRow(1).journal.worktree;
+	fs.appendFileSync(path.join(run.repo, ".git/info/exclude"), "hook-output.log\n");
+	fs.writeFileSync(path.join(hwt, "hook-output.log"), "ignored hook artifact\n");
+
+	result = step(run, "resume", ["complete", 1]);
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.ok(fs.existsSync(hwt), "ignored data keeps the generation after swap");
+	assert.ok(run.slotRow(1).journal, "journal remains until verified removal");
+	const approval = cleanupApproval(result.stdout);
+
+	result = step(run, "resume", [], {
+		HERDR_SWARM_CLEANUP_APPROVAL: approval,
+	});
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.equal(fs.existsSync(hwt), false);
+	assert.equal(run.slotRow(1).journal, null);
+	const used = fs
+		.readdirSync(run.sdir)
+		.filter((name) => name.startsWith("cleanup-used-") && name.endsWith(".json"));
+	assert.equal(used.length, 1, "approval was durably consumed exactly once");
+});
+
+test("harvest removal refuses every exact identity mismatch", () => {
+	for (const field of [
+		"repo_key",
+		"run_id",
+		"slot",
+		"path",
+		"generation",
+		"head",
+		"registration",
+		"symlink",
+	]) {
+		const run = mkRun();
+		commitIn(run.wt(1), "feat.txt");
+		h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
+		let result = step(run, "merge", [1, run.fork], {
+			HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+		});
+		assert.equal(result.status, 99);
+		const row = run.slotRow(1);
+		const journal = structuredClone(row.journal);
+		const hwt = journal.worktree;
+		h.git(run.repo, "update-ref", "refs/heads/main", journal.merge_commit_sha, run.fork);
+		if (field === "registration") {
+			h.git(hwt, "checkout", "-q", "-b", `foreign-${run.runId}`);
+		} else if (field === "symlink") {
+			const actual = `${hwt}-actual`;
+			fs.renameSync(hwt, actual);
+			fs.symlinkSync(actual, hwt, "dir");
+		} else {
+			journal.resource[field] =
+				field === "slot" ? "999" : `${journal.resource[field]}-wrong`;
+			patchSlot(run, 1, { journal });
+		}
+		result = step(run, "abort-merge", [1]);
+		assert.equal(result.status, EC.REFUSED, `${field}: ${result.stdout}\n${result.stderr}`);
+		assert.match(result.stderr, /identity|resource|symlink|registration/i, field);
+		assert.ok(fs.existsSync(hwt), `${field}: zero removal`);
+	}
+});
+
 test("kill between merge commit and swap: base moved -> dangling SHA reported loudly, worktree never deleted", () => {
 	const run = mkRun();
 	commitIn(run.wt(1), "feat.txt");
@@ -782,6 +852,77 @@ function linkedBaseCheckout(run) {
 	return dir;
 }
 
+function foreignHarvestWorktree(run, slot = 1, sha = run.fork) {
+	const dir = path.join(run.sdir, `harvest-${run.runId}-s${slot}`);
+	h.git(run.repo, "worktree", "add", "-q", "--detach", dir, sha);
+	fs.appendFileSync(path.join(run.repo, ".git/info/exclude"), "precious.secret\n");
+	fs.writeFileSync(path.join(dir, "precious.secret"), "foreign ignored data\n");
+	return dir;
+}
+
+test("abort-merge refuses a same-prefix foreign detached worktree and its ignored data", () => {
+	const run = mkRun();
+	const foreign = foreignHarvestWorktree(run);
+	patchSlot(run, 1, {
+		journal: {
+			locus: "detached",
+			expected_base_sha: run.fork,
+			merge_commit_sha: null,
+			worktree: foreign,
+		},
+	});
+	const result = step(run, "abort-merge", [1]);
+	assert.equal(result.status, EC.REFUSED, `${result.stdout}\n${result.stderr}`);
+	assert.match(result.stderr, /resource identity failed/);
+	assert.equal(fs.readFileSync(path.join(foreign, "precious.secret"), "utf8"), "foreign ignored data\n");
+	assert.match(h.git(run.repo, "worktree", "list").stdout, new RegExp(foreign));
+});
+
+test("resume scan refuses same-prefix foreign harvest cleanup after the base landed", () => {
+	const run = mkRun();
+	const msha = bareCommitOn(run.repo, run.fork, "landed merge");
+	h.git(run.repo, "update-ref", "refs/heads/main", msha, run.fork);
+	const foreign = foreignHarvestWorktree(run, 1, msha);
+	patchSlot(run, 1, {
+		journal: {
+			locus: "detached",
+			expected_base_sha: run.fork,
+			merge_commit_sha: msha,
+			worktree: foreign,
+		},
+	});
+	const result = step(run, "resume");
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	assert.match(result.stderr, /cleanup was refused/);
+	assert.ok(fs.existsSync(path.join(foreign, "precious.secret")));
+	assert.ok(run.slotRow(1).journal, "failed cleanup retains exact recovery journal");
+});
+
+test("Abort journal cleanup and leftover sweep both quarantine same-prefix foreign worktrees", () => {
+	for (const journaled of [true, false]) {
+		const run = mkRun();
+		const foreign = foreignHarvestWorktree(run, journaled ? 1 : 999);
+		if (journaled) {
+			patchSlot(run, 1, {
+				journal: {
+					locus: "detached",
+					expected_base_sha: run.fork,
+					merge_commit_sha: null,
+					worktree: foreign,
+				},
+			});
+		}
+		const result = spawnSync(
+			"bash",
+			[path.join(repoRoot, "scripts/abort.sh")],
+			{ cwd: run.repo, env: run.env, encoding: "utf8" },
+		);
+		assert.equal(result.status, 4, `${result.stdout}\n${result.stderr}`);
+		assert.ok(fs.existsSync(path.join(foreign, "precious.secret")));
+		assert.match(result.stderr, journaled ? /identity FAILED/ : /no exact live resource journal/);
+	}
+});
+
 test("resume scan never removes a user-tree-locus journal's worktree — that is the USER's checkout", () => {
 	const run = mkRun();
 	const userWt = linkedBaseCheckout(run);
@@ -845,7 +986,7 @@ test("resume complete never hands the user's checkout to swap_base's removal tai
 	);
 });
 
-test("swap_base refuses any journaled worktree outside the plugin's harvest- namespace", () => {
+test("swap_base refuses a journal lacking exact harvest resource identity before moving base", () => {
 	const run = mkRun();
 	const userWt = linkedBaseCheckout(run);
 	const msha = bareCommitOn(run.repo, run.fork);
@@ -862,8 +1003,13 @@ test("swap_base refuses any journaled worktree outside the plugin's harvest- nam
 	});
 	h.git(userWt, "checkout", "-q", "-b", "sidework");
 	const r = step(run, "resume", ["complete", 1]);
-	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	assert.match(r.stderr, /refusing to remove/, "the refusal is reported");
+	assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stderr, /identity failed before base swap/, "the refusal is reported");
+	assert.equal(
+		h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(),
+		run.fork,
+		"forged resource cannot move the base",
+	);
 	assert.ok(fs.existsSync(userWt), "foreign worktree kept");
 });
 

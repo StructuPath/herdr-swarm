@@ -554,6 +554,29 @@ test("every script that mutates a manifest-named slot worktree calls verify_slot
 	}
 });
 
+test("every harvest-worktree removal route uses the shared exact verifier/remover", () => {
+	const harvest = fs.readFileSync(
+		path.join(repoRoot, "scripts/harvest-step.sh"),
+		"utf8",
+	);
+	const abort = fs.readFileSync(path.join(repoRoot, "scripts/abort.sh"), "utf8");
+	const lib = fs.readFileSync(path.join(repoRoot, "scripts/lib.sh"), "utf8");
+	assert.doesNotMatch(harvest, /worktree remove "\$(?:hwt|wt|jwt|d)"/);
+	assert.doesNotMatch(abort, /worktree remove "\$(?:hwt|jwt|d)"/);
+	assert.ok(
+		(harvest.match(/remove_harvest_resource/g) || []).length >= 3,
+		"swap, resume, and abort-merge share the remover",
+	);
+	assert.match(abort, /remove_harvest_resource/);
+	assert.match(abort, /verify_harvest_resource[^\n]+"null"/);
+	assert.equal(
+		(lib.match(/git -C "\$SWARM_REPO" worktree remove "\$wt"/g) || []).length,
+		1,
+		"one audited harvest git-removal call exists",
+	);
+	assert.match(lib, /verify-harvest-removed/);
+});
+
 // The pane titles in herdr-plugin.toml ARE the cleanup sweep labels (pane
 // list reports them as "label"), and preflight.sh re-declares them as a
 // hardcoded set for abort's corrupt-manifest sweep. A rename on one side
