@@ -14,9 +14,9 @@
 #
 # Output protocol: machine-readable "key<TAB>value…" lines on stdout, human
 # messages on stderr, typed exit codes (HS_EC_*) so the renderer branches on
-# codes, never on prose. Every invocation takes the per-repo mutation lock —
-# the same "mutate-$(ws_id)" every launcher uses — so an abort can never reap
-# a worktree mid-merge.
+# codes, never on prose. Every invocation takes the physical-repository
+# mutation lock every launcher uses, so workspace aliases cannot race and an
+# abort can never reap a worktree mid-merge.
 #
 # Env contract (all optional):
 #   HERDR_SWARM_CONFIRM               discard's confirmation token; must equal
@@ -24,8 +24,8 @@
 #                                     user in the renderer, re-verified here —
 #                                     the renderer's prompt alone is UI, not a
 #                                     guard)
-#   HERDR_SWARM_ACK_IGNORED=1         archive: user acknowledged the
-#                                     ignored-file inventory
+#   HERDR_SWARM_CLEANUP_APPROVAL      archive: exact one-use JSON approval
+#                                     emitted by the ignored inventory preview
 #   HERDR_SWARM_HARVEST_WT_NO_HOOKS=1 disable repo hooks in the plugin-owned
 #                                     harvest worktree ONLY (hook-policy KTD:
 #                                     fresh worktrees lack node_modules, so
@@ -65,11 +65,6 @@ VERB="${1-}"
 }
 shift
 
-# One mutation lock per verb invocation (destructive-surface KTD): fan-out,
-# harvest verbs, abort, and prune all contend on this name.
-acquire_lock "mutate-$(ws_id)" || exit 1
-trap 'release_lock "mutate-$(ws_id)"' EXIT
-
 # --- Run + slot context ------------------------------------------------------
 
 # Manifest read up front: missing (2) or corrupt (3) refuses every verb with
@@ -93,6 +88,22 @@ IFS="$US" read -r RUN_ID REPO_ROOT BASE_REF FORK_SHA <<<"$CTX"
 # resolve through SWARM_REPO, whose source-time default was cwd-based.
 SWARM_REPO="$REPO_ROOT"
 export SWARM_REPO
+# Lock the physical repository identity, then immediately re-read and validate
+# every live/archived manifest generation. The unlocked read above is only
+# identity discovery and can never authorize a mutation.
+MUTATION_LOCK="$(repo_mutation_lock_name "$REPO_ROOT")" || exit 1
+acquire_lock "$MUTATION_LOCK" || exit 1
+trap 'release_lock "$MUTATION_LOCK"' EXIT
+DOC_LOCKED="$(manifest_read)" || exit $?
+LOCKED_CTX="$(manifest_run_context "$DOC_LOCKED")" || exit 1
+IFS="$US" read -r LOCKED_RUN LOCKED_REPO _ <<<"$LOCKED_CTX"
+if [ "$LOCKED_RUN" != "$RUN_ID" ] || [ "$LOCKED_REPO" != "$REPO_ROOT" ]; then
+	echo "herdr-swarm: manifest identity changed while acquiring the repository lock — refused." >&2
+	exit "$HS_EC_REFUSED"
+fi
+DOC="$DOC_LOCKED"
+SCAN="$(bookkeeping_scan "$REPO_ROOT")" || exit 1
+bookkeeping_assert_known "$SCAN" || exit $?
 # run_id is interpolated into the harvest worktree path ($(state_dir)/harvest-
 # $RUN_ID-s<slot>, fed straight to `git worktree add`/`remove`) and into the
 # backup ref namespace (refs/swarm-backups/$RUN_ID/<slot>). A run_id carrying
@@ -646,6 +657,11 @@ do_archive() {
 	read_slot "$1" || return $?
 	case "$SLOT_STATUS" in
 	merged | skipped | failed) ;;
+	archived)
+		finalize_run "$REPO_ROOT" "$RUN_ID" || return $?
+		printf 'archived\t%s\n' "$1"
+		return 0
+		;;
 	*)
 		echo "herdr-swarm: slot $1 is '$SLOT_STATUS' — only merged/skipped/failed slots can be archived." >&2
 		return "$HS_EC_REFUSED"
@@ -679,17 +695,44 @@ do_archive() {
 		# remove is not an error — just settle the bookkeeping.
 		manifest_update_slot "$1" '{"status":"archived"}' || return 1
 		printf 'archived\t%s\n' "$1"
+		finalize_run "$REPO_ROOT" "$RUN_ID" || return $?
 		return 0
 	fi
-	# Ignored files are the ONE class `worktree remove` deletes silently
-	# (spike (h)) — inventory first; the plugin's own task file is exempt.
-	local inv
-	inv="$(git -C "$SLOT_PATH" status --ignored --porcelain |
-		awk -v tf="$SWARM_TASK_FILE" '/^!! /{f=substr($0,4); if (f != tf) print f}')"
-	if [ -n "$inv" ] && [ "${HERDR_SWARM_ACK_IGNORED:-0}" != "1" ]; then
-		printf '%s\n' "$inv" | sed $'s/^/ignored\t/'
-		echo "herdr-swarm: slot $1 worktree holds ignored files that removal would silently delete — acknowledge to proceed." >&2
+	# Cleanup is preview/apply, not a process-global boolean. The recursive
+	# inventory is canonicalized as NUL-delimited path bytes and its digest is
+	# bound to repo/run/slot/physical worktree/operation. Apply re-verifies
+	# ownership and recomputes immediately before the first removal call.
+	local operation inventory count used rechecked why
+	operation="$(printf '%s' "${HERDR_SWARM_CLEANUP_APPROVAL:-}" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);if(a.operation_id)process.stdout.write(String(a.operation_id));}catch{}});
+	')"
+	[ -n "$operation" ] || operation="$(cleanup_operation_id)" || return 1
+	inventory="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_PATH" "$operation")" || return 1
+	count="$(cleanup_inventory_count "$inventory")" || return 1
+	if [ "$count" -gt 0 ]; then
+		used="$(cleanup_approval_validate "$inventory")" || {
+			print_cleanup_inventory "$inventory"
+			echo "herdr-swarm: slot $1 worktree holds ignored files; apply requires the exact one-use cleanup approval emitted by this preview." >&2
+			return "$HS_EC_IGNORED"
+		}
+	fi
+	if [ -n "${HERDR_SWARM_TEST_CLEANUP_READY_FILE:-}" ]; then : >"$HERDR_SWARM_TEST_CLEANUP_READY_FILE"; fi
+	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK:-}" ]; then
+		sleep "$HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK"
+	fi
+	if ! why="$(verify_slot_ownership "$RUN_ID" "$SLOT_BRANCH" "$SLOT_PATH")"; then
+		echo "herdr-swarm: slot $1 ownership changed before cleanup — $why; removal refused." >&2
+		return "$HS_EC_REFUSED"
+	fi
+	rechecked="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_PATH" "$operation")" || return 1
+	if [ "$(printf '%s' "$inventory" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')" != \
+		"$(printf '%s' "$rechecked" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')" ]; then
+		print_cleanup_inventory "$rechecked"
+		echo "herdr-swarm: cleanup inventory changed after preview — zero removal performed; review the new digest." >&2
 		return "$HS_EC_IGNORED"
+	fi
+	if [ "$count" -gt 0 ]; then
+		cleanup_approval_consume "$used" || return "$HS_EC_REFUSED"
 	fi
 	local out rc=0
 	if [ -n "$SLOT_WS" ]; then
@@ -722,8 +765,23 @@ do_archive() {
 			return 1
 		fi
 	fi
+	# Herdr success is not the disk authority (stale server responses and test
+	# doubles can leave the registered worktree behind). Re-verify and reconcile
+	# with plain git before declaring the slot archived/finalizable.
+	if [ -d "$SLOT_PATH" ]; then
+		if ! why="$(verify_slot_ownership "$RUN_ID" "$SLOT_BRANCH" "$SLOT_PATH")"; then
+			echo "herdr-swarm: slot $1 still exists after Herdr removal and ownership no longer matches — kept, not archived: $why" >&2
+			return "$HS_EC_REFUSED"
+		fi
+		out="$(git -C "$REPO_ROOT" worktree remove "$SLOT_PATH" 2>&1)" || {
+			if [ -n "$(git -C "$SLOT_PATH" status --porcelain 2>/dev/null)" ]; then return "$HS_EC_DIRTY"; fi
+			printf '%s\n' "$out" >&2
+			return 1
+		}
+	fi
 	manifest_update_slot "$1" '{"status":"archived"}' || return 1
 	printf 'archived\t%s\n' "$1"
+	finalize_run "$REPO_ROOT" "$RUN_ID" || return $?
 }
 
 do_abort_merge() {

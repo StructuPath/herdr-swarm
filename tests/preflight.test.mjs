@@ -99,7 +99,8 @@ test("every preflight refusal has a distinct exit code and an actionable message
 			code: 17,
 			msg: /harvest or abort/,
 			cwd: () => makeRepo(),
-			pre: () => fs.writeFileSync(manifestFile, sampleManifest()),
+			pre: (repo) =>
+				fs.writeFileSync(manifestFile, sampleManifest({ repo_root: repo })),
 		},
 		{
 			// 0.7.3, not 0.7.5: since issue #1 the gate is a FLOOR, and 0.7.5
@@ -136,7 +137,7 @@ test("every preflight refusal has a distinct exit code and an actionable message
 	for (const c of cases) {
 		const cwd = c.cwd();
 		fs.rmSync(manifestFile, { force: true });
-		if (c.pre) c.pre();
+		if (c.pre) c.pre(cwd);
 		const r = runPf(c.fn, freshEnv(c.env ?? {}), cwd);
 		assert.equal(
 			r.status,
@@ -221,13 +222,13 @@ test("detritus check prunes stale worktree registrations instead of flagging the
 	assert.ok(!list.includes("hs-wt-"), "stale registration pruned");
 });
 
-test("active-run check passes when every slot is archived", () => {
+test("all-archived live manifest remains active until idempotent finalization archives it", () => {
 	const repo = makeRepo();
-	const archived = JSON.parse(sampleManifest());
+	const archived = JSON.parse(sampleManifest({ repo_root: repo }));
 	for (const s of archived.slots) s.status = "archived";
 	fs.writeFileSync(manifestFile, JSON.stringify(archived));
 	const r = runPf("preflight_check_active_run", freshEnv(), repo);
-	assert.equal(r.status, 0, r.stderr);
+	assert.equal(r.status, 17, r.stderr);
 	fs.rmSync(manifestFile, { force: true });
 });
 
@@ -242,19 +243,35 @@ test("active-run check refuses a corrupt manifest with the corrupt code, not 'no
 test("HERDR_SWARM_MAX_SLOTS overrides the cap; garbage falls back to 6", () => {
 	const repo = makeRepo();
 	assert.equal(
-		runPf("preflight_check_slot_cap 3", freshEnv({ HERDR_SWARM_MAX_SLOTS: "2" }), repo).status,
+		runPf(
+			"preflight_check_slot_cap 3",
+			freshEnv({ HERDR_SWARM_MAX_SLOTS: "2" }),
+			repo,
+		).status,
 		19,
 	);
 	assert.equal(
-		runPf("preflight_check_slot_cap 2", freshEnv({ HERDR_SWARM_MAX_SLOTS: "2" }), repo).status,
+		runPf(
+			"preflight_check_slot_cap 2",
+			freshEnv({ HERDR_SWARM_MAX_SLOTS: "2" }),
+			repo,
+		).status,
 		0,
 	);
 	assert.equal(
-		runPf("preflight_check_slot_cap 7", freshEnv({ HERDR_SWARM_MAX_SLOTS: "banana" }), repo).status,
+		runPf(
+			"preflight_check_slot_cap 7",
+			freshEnv({ HERDR_SWARM_MAX_SLOTS: "banana" }),
+			repo,
+		).status,
 		19,
 	);
 	assert.equal(
-		runPf("preflight_check_slot_cap 6", freshEnv({ HERDR_SWARM_MAX_SLOTS: "banana" }), repo).status,
+		runPf(
+			"preflight_check_slot_cap 6",
+			freshEnv({ HERDR_SWARM_MAX_SLOTS: "banana" }),
+			repo,
+		).status,
 		0,
 	);
 });

@@ -206,13 +206,14 @@ export function renderStatus(rows, cols = 80) {
 		const counts = `${r.committed ?? "-"}/${r.uncommitted ?? "-"}`;
 		// state comes from herdr's agent_status — externally controlled text on
 		// the same footing as a branch name, so it sanitizes like one.
-		const line = ` ${pad(r.slot, 3)}${pad(sanitizeText(r.state ?? ""), 9)}${pad(counts, 8)}${pad(
-			sanitizeText(r.label ?? ""),
-			14,
-		)}${pad(sanitizeText(r.branch ?? ""), 28)}${sanitizeText(r.path ?? "-")}`.slice(
-			0,
-			cols,
-		);
+		const line =
+			` ${pad(r.slot, 3)}${pad(sanitizeText(r.state ?? ""), 9)}${pad(counts, 8)}${pad(
+				sanitizeText(r.label ?? ""),
+				14,
+			)}${pad(sanitizeText(r.branch ?? ""), 28)}${sanitizeText(r.path ?? "-")}`.slice(
+				0,
+				cols,
+			);
 		lines.push(
 			r.state === "blocked" ? `${ESC}[7m${ESC}[31m${line}${ESC}[0m` : line,
 		);
@@ -322,7 +323,10 @@ export class Renderer {
 		try {
 			// Three-dot range against the recorded fork SHA — see diffRange().
 			facts.committed = parseDiffStat(
-				await this.git(["diff", "--stat", diffRange(manifest.fork_sha)], row.path),
+				await this.git(
+					["diff", "--stat", diffRange(manifest.fork_sha)],
+					row.path,
+				),
 			);
 		} catch {
 			facts.committed = null;
@@ -379,7 +383,8 @@ export class Renderer {
 			gitFacts[row.slot] = factsList[i];
 		});
 		this.rows = sortSlots(reconcileSlots(m.slots, agents, gitFacts));
-		this.banner = agents === null ? "agent list unavailable — states shown as unknown" : "";
+		this.banner =
+			agents === null ? "agent list unavailable — states shown as unknown" : "";
 		this.paint();
 	}
 
@@ -559,7 +564,8 @@ export function renderHarvest(model, cols = 80) {
 			)}`
 		: " herdr-swarm harvest";
 	lines.push(`${ESC}[7m${title.slice(0, cols)}${ESC}[0m`);
-	if (model.banner) lines.push(` ! ${sanitizeText(model.banner)}`.slice(0, cols));
+	if (model.banner)
+		lines.push(` ! ${sanitizeText(model.banner)}`.slice(0, cols));
 	lines.push(
 		` ${pad("#", 3)}${pad("state", 17)}${pad("dirty", 7)}${pad("label", 14)}branch`,
 	);
@@ -570,7 +576,10 @@ export function renderHarvest(model, cols = 80) {
 		const line = ` ${pad(r.slot, 3)}${pad(sanitizeText(state ?? "?"), 17)}${pad(
 			p?.dirty ?? "-",
 			7,
-		)}${pad(sanitizeText(r.label ?? ""), 14)}${sanitizeText(r.branch ?? "")}`.slice(0, cols);
+		)}${pad(sanitizeText(r.label ?? ""), 14)}${sanitizeText(r.branch ?? "")}`.slice(
+			0,
+			cols,
+		);
 		// Dirty and error rows need the user before any merge can happen —
 		// same "loud" treatment blocked gets in status mode.
 		lines.push(
@@ -589,7 +598,9 @@ export function renderHarvest(model, cols = 80) {
 			lines.push(
 				` RESUME: slot ${o.slot} has a completed but un-swapped merge commit ${sanitizeText(String(o.sha)).slice(0, 10)}.`,
 			);
-			lines.push(`${ESC}[2m [y]complete the swap  [n]leave it journaled${ESC}[0m`);
+			lines.push(
+				`${ESC}[2m [y]complete the swap  [n]leave it journaled${ESC}[0m`,
+			);
 			break;
 		}
 		case "stale": {
@@ -618,7 +629,9 @@ export function renderHarvest(model, cols = 80) {
 			lines.push(
 				` DISCARD slot ${ph.slot}: a snapshot ref is written first, but this deletes uncommitted work.`,
 			);
-			lines.push(` Type the slot branch name to confirm, Enter to submit, Esc to cancel:`);
+			lines.push(
+				` Type the slot branch name to confirm, Enter to submit, Esc to cancel:`,
+			);
 			lines.push(` > ${sanitizeText(ph.typed)}`);
 			break;
 		case "confirm-user":
@@ -628,7 +641,9 @@ export function renderHarvest(model, cols = 80) {
 			lines.push(
 				` The tree was verified clean and will be re-verified at merge time.`,
 			);
-			lines.push(`${ESC}[2m [y]merge in my tree  [any other key]cancel${ESC}[0m`);
+			lines.push(
+				`${ESC}[2m [y]merge in my tree  [any other key]cancel${ESC}[0m`,
+			);
 			break;
 		case "conflict": {
 			lines.push(
@@ -773,7 +788,11 @@ export class HarvestRenderer {
 			return;
 		}
 		const m = parsed.manifest;
-		this.runInfo = { run_id: m.run_id, base_ref: m.base_ref, repo_root: m.repo_root };
+		this.runInfo = {
+			run_id: m.run_id,
+			base_ref: m.base_ref,
+			repo_root: m.repo_root,
+		};
 		const rows = [];
 		// Sequential on purpose: every preview verb takes the per-repo mutation
 		// lock, so concurrency here would only contend on that lock.
@@ -854,17 +873,24 @@ export class HarvestRenderer {
 		}
 	}
 
-	async doArchive(slot, ack = false) {
+	async doArchive(slot, approval = null) {
 		const r = await this.step(
 			"archive",
 			[slot],
-			ack ? { HERDR_SWARM_ACK_IGNORED: "1" } : {},
+			approval ? { HERDR_SWARM_CLEANUP_APPROVAL: approval } : {},
 		);
 		if (r.code === STEP_EC.IGNORED) {
 			this.phase = {
 				name: "ignored",
 				slot,
-				files: (r.out.ignored ?? []).map((v) => v[0]),
+				approval: r.out.cleanup_approval?.[0]?.[0] ?? null,
+				files: (r.out.ignored_json ?? []).map((v) => {
+					try {
+						return JSON.parse(v[0]);
+					} catch {
+						return v[0];
+					}
+				}),
 			};
 			this.paint();
 		} else if (r.code === STEP_EC.DIRTY) {
@@ -999,7 +1025,9 @@ export class HarvestRenderer {
 				if (ch === "y" || ch === "Y") {
 					const r = await this.step("resume", ["complete", offer.slot]);
 					this.banner =
-						r.code === 0 ? `slot ${offer.slot} swap completed` : this.lastErrLine(r);
+						r.code === 0
+							? `slot ${offer.slot} swap completed`
+							: this.lastErrLine(r);
 				}
 				if (ph.idx + 1 < ph.offers.length) {
 					this.phase = { ...ph, idx: ph.idx + 1 };
@@ -1030,12 +1058,16 @@ export class HarvestRenderer {
 			case "dirty":
 				if (ch === "w") {
 					const r = await this.step("commit-wip", [ph.slot]);
-					this.banner = r.code === 0 ? `slot ${ph.slot} committed as WIP` : this.lastErrLine(r);
+					this.banner =
+						r.code === 0
+							? `slot ${ph.slot} committed as WIP`
+							: this.lastErrLine(r);
 					this.phase = { name: "list" };
 					await this.reload();
 				} else if (ch === "s") {
 					const r = await this.step("skip", [ph.slot]);
-					this.banner = r.code === 0 ? `slot ${ph.slot} skipped` : this.lastErrLine(r);
+					this.banner =
+						r.code === 0 ? `slot ${ph.slot} skipped` : this.lastErrLine(r);
 					this.phase = { name: "list" };
 					await this.reload();
 				} else if (ch === "d") {
@@ -1062,7 +1094,9 @@ export class HarvestRenderer {
 				} else if (ch === "a") {
 					const r = await this.step("abort-merge", [ph.slot]);
 					this.banner =
-						r.code === 0 ? `slot ${ph.slot} merge aborted` : this.lastErrLine(r);
+						r.code === 0
+							? `slot ${ph.slot} merge aborted`
+							: this.lastErrLine(r);
 					this.phase = { name: "list" };
 					await this.reload();
 				} else if (ch === "b" || ch === "\x1b") {
@@ -1075,8 +1109,14 @@ export class HarvestRenderer {
 			case "ignored":
 				if (ch === "y" || ch === "Y") {
 					const slot = ph.slot;
+					const approval = ph.approval;
 					this.phase = { name: "list" };
-					await this.doArchive(slot, true);
+					if (!approval) {
+						this.banner = "cleanup approval missing — re-preview required";
+						this.paint();
+						break;
+					}
+					await this.doArchive(slot, approval);
 					await this.reload();
 				} else {
 					this.banner = `slot ${ph.slot} kept — worktree not removed`;
@@ -1107,7 +1147,12 @@ export class HarvestRenderer {
 	screen() {
 		const cols = process.stdout.columns || 80;
 		return renderHarvest(
-			{ runInfo: this.runInfo, banner: this.banner, phase: this.phase, rows: this.rows },
+			{
+				runInfo: this.runInfo,
+				banner: this.banner,
+				phase: this.phase,
+				rows: this.rows,
+			},
 			cols,
 		);
 	}
@@ -1179,7 +1224,10 @@ export class HarvestRenderer {
 		const dangling = r.out.resume_dangling ?? [];
 		if (dangling.length) {
 			this.banner = `DANGLING merge commit(s): ${dangling
-				.map((v) => `slot ${v[0]} @ ${String(v[1]).slice(0, 10)} (kept in ${v[2]})`)
+				.map(
+					(v) =>
+						`slot ${v[0]} @ ${String(v[1]).slice(0, 10)} (kept in ${v[2]})`,
+				)
 				.join("; ")}`;
 		}
 		if (offers.length) this.phase = { name: "resume", offers, idx: 0 };

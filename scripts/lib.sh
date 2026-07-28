@@ -162,7 +162,136 @@ pane_alive() {
 	[ -n "$1" ] && "$HERDR" pane read "$1" --lines 1 >/dev/null 2>&1
 }
 
-# --- Mutation lock -----------------------------------------------------------
+# --- Repository identity + mutation lock ------------------------------------
+# Physical git-common-dir identity is the ownership key. Workspace ids are
+# observations only: two Herdr workspaces pointed at one repository must
+# contend on one lock and discover one another's live manifests.
+safety_state() {
+	node "${PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/safety-state.mjs" "$@"
+}
+
+repo_identity_json() {
+	require_node || return 1
+	safety_state repo "$1"
+}
+
+repo_identity_field() {
+	local doc="$1" field="$2"
+	printf '%s' "$doc" | node -e '
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			const value = JSON.parse(d)[process.argv[1]];
+			if (typeof value !== "string" || value.length === 0) process.exit(1);
+			process.stdout.write(value);
+		});
+	' "$field"
+}
+
+repo_mutation_lock_name() {
+	local identity key
+	identity="$(repo_identity_json "$1")" || return 1
+	key="$(repo_identity_field "$identity" repo_key)" || return 1
+	printf 'mutate-repo-%s\n' "$key"
+}
+
+bookkeeping_scan() {
+	require_node || return 1
+	safety_state scan "$(state_dir)" "$1"
+}
+
+bookkeeping_assert_known() {
+	local scan="$1"
+	printf '%s' "$scan" | node -e '
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			const scan = JSON.parse(d);
+			if ((scan.errors || []).length === 0) return;
+			for (const error of scan.errors) console.error("herdr-swarm: bookkeeping_unknown: " + error);
+			process.exit(3);
+		});
+	'
+}
+
+active_index_write() {
+	local run_id="$1" repo_root="$2" mf identity key dst tmp
+	mf="$(manifest_path)" || return 1
+	identity="$(repo_identity_json "$repo_root")" || return 1
+	key="$(repo_identity_field "$identity" repo_key)" || return 1
+	dst="$(state_dir)/active-repo-$key.json"
+	tmp="$dst.tmp.$$"
+	node -e '
+		const fs = require("fs");
+		const [dst, runId, manifestPath, identity] = process.argv.slice(1);
+		const id = JSON.parse(identity);
+		const doc = { repo_key: id.repo_key, git_common_dir: id.git_common_dir,
+			run_id: runId, manifest_path: manifestPath };
+		fs.writeFileSync(dst, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+	' "$tmp" "$run_id" "$mf" "$identity" || {
+		rm -f "$tmp"
+		return 1
+	}
+	mv "$tmp" "$dst"
+}
+
+active_index_remove() {
+	local repo_root="$1" run_id="$2" identity key dst
+	identity="$(repo_identity_json "$repo_root")" || return 1
+	key="$(repo_identity_field "$identity" repo_key)" || return 1
+	dst="$(state_dir)/active-repo-$key.json"
+	[ -e "$dst" ] || return 0
+	node -e '
+		const fs = require("fs");
+		const [file, key, runId] = process.argv.slice(1);
+		const stat = fs.lstatSync(file);
+		if (!stat.isFile() || stat.isSymbolicLink()) process.exit(2);
+		const doc = JSON.parse(fs.readFileSync(file, "utf8"));
+		if (doc.repo_key !== key || doc.run_id !== runId) process.exit(2);
+		fs.unlinkSync(file);
+	' "$dst" "$key" "$run_id"
+}
+
+cleanup_operation_id() {
+	safety_state operation-id
+}
+
+slot_ignored_inventory() {
+	local repo_root="$1" run_id="$2" slot="$3" wt="$4" operation_id="$5" identity key common
+	identity="$(repo_identity_json "$repo_root")" || return 1
+	key="$(repo_identity_field "$identity" repo_key)" || return 1
+	common="$(repo_identity_field "$identity" git_common_dir)" || return 1
+	safety_state inventory "$repo_root" "$key" "$common" "$run_id" "$slot" "$wt" "$operation_id"
+}
+
+cleanup_inventory_count() {
+	printf '%s' "$1" | node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(String(JSON.parse(d).count)))'
+}
+
+print_cleanup_inventory() {
+	printf '%s' "$1" | node -e '
+		let d="";
+		process.stdin.on("data",c=>d+=c).on("end",()=>{
+			const i=JSON.parse(d);
+			console.log("cleanup_operation\t" + i.operation_id);
+			console.log("cleanup_digest\t" + i.digest);
+			const approval={approved:true};
+			for (const k of ["repo_key","git_common_dir","run_id","slot","worktree","operation_id","digest"]) approval[k]=i[k];
+			console.log("cleanup_approval\t" + JSON.stringify(approval));
+			for (const p of i.paths_display) console.log("ignored_json\t" + JSON.stringify(p));
+		});
+	'
+}
+
+cleanup_approval_validate() {
+	local inventory="$1" approval="${HERDR_SWARM_CLEANUP_APPROVAL:-}"
+	[ -n "$approval" ] || return 2
+	printf '%s' "$approval" | safety_state approval "$inventory" "$(state_dir)"
+}
+
+cleanup_approval_consume() {
+	local used="$1" approval="${HERDR_SWARM_CLEANUP_APPROVAL:-}"
+	printf '%s' "$approval" | safety_state consume "$used" >/dev/null
+}
+
 # One mkdir+PID-token lock per caller-supplied name (e.g. the per-repo
 # mutation lock shared by fan-out, harvest, abort, and prune — an abort must
 # never reap a worktree mid-merge). mkdir is the portable atomic lock; the
@@ -740,7 +869,11 @@ manifest_write() {
 manifest_read() {
 	local mf
 	mf="$(manifest_path)" || return 1
-	[ -f "$mf" ] || return "$MANIFEST_EC_MISSING"
+	[ -e "$mf" ] || return "$MANIFEST_EC_MISSING"
+	if [ -L "$mf" ] || [ ! -f "$mf" ]; then
+		echo "herdr-swarm: manifest $mf is not a regular non-symlink file (corrupt); .bak is recovery inventory only" >&2
+		return "$MANIFEST_EC_CORRUPT"
+	fi
 	if [ ! -s "$mf" ]; then
 		echo "herdr-swarm: manifest $mf is zero-length (corrupt); previous generation may be in $mf.bak" >&2
 		return "$MANIFEST_EC_CORRUPT"

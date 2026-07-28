@@ -45,18 +45,29 @@ function bareCommitOn(repo, sha, msg = "racer") {
 }
 
 const step = (run, verb, args = [], extraEnv = {}) =>
-	h.runScript(
-		"harvest-step.sh",
-		[verb, ...args.map(String)],
-		{ ...run.env, ...extraEnv },
-	);
+	h.runScript("harvest-step.sh", [verb, ...args.map(String)], {
+		...run.env,
+		...extraEnv,
+	});
+
+function cleanupApproval(stdout) {
+	const line = stdout
+		.split("\n")
+		.find((entry) => entry.startsWith("cleanup_approval\t"));
+	assert.ok(line, `cleanup approval missing from preview:\n${stdout}`);
+	return line.slice("cleanup_approval\t".length);
+}
 
 // Async variant for the interleave tests: the verb must be mid-flight while
 // the test mutates the repo.
 function stepAsync(run, verb, args = [], extraEnv = {}) {
 	const child = spawn(
 		"bash",
-		[path.join(repoRoot, "scripts", "harvest-step.sh"), verb, ...args.map(String)],
+		[
+			path.join(repoRoot, "scripts", "harvest-step.sh"),
+			verb,
+			...args.map(String),
+		],
 		{ env: { ...run.env, ...extraEnv } },
 	);
 	let out = "";
@@ -151,7 +162,8 @@ test("locus: base NOT checked out -> detached harvest worktree, base advanced by
 	assert.equal(h.git(run.repo, "rev-parse", "HEAD").stdout.trim(), run.fork);
 	// Reflog breadcrumb (KTD): the recovery trail for the atomic swap.
 	assert.match(
-		h.git(run.repo, "log", "-g", "-1", "--format=%gs", "refs/heads/main").stdout,
+		h.git(run.repo, "log", "-g", "-1", "--format=%gs", "refs/heads/main")
+			.stdout,
 		new RegExp(`swarm: harvest merge 1 \\(run ${run.runId}\\)`),
 	);
 	assert.ok(
@@ -162,7 +174,8 @@ test("locus: base NOT checked out -> detached harvest worktree, base advanced by
 	assert.equal(run.slotRow(1).journal, null);
 	// R10: archive keeps branches; merge must not delete them either.
 	assert.equal(
-		h.git(run.repo, "rev-parse", "--verify", `refs/heads/${run.branch(1)}`)
+		h
+			.git(run.repo, "rev-parse", "--verify", `refs/heads/${run.branch(1)}`)
 			.stdout.trim(),
 		tip,
 	);
@@ -255,7 +268,9 @@ test("sequencer state in ANY worktree refuses the merge before any mutation", ()
 	commitIn(run.wt(1), "feat.txt");
 	// MERGE_HEAD in a linked worktree's private git dir (not the main one) —
 	// the scan must cover worktrees/*, not just the common dir.
-	const wtGitDir = h.git(run.wt(1), "rev-parse", "--absolute-git-dir").stdout.trim();
+	const wtGitDir = h
+		.git(run.wt(1), "rev-parse", "--absolute-git-dir")
+		.stdout.trim();
 	fs.writeFileSync(path.join(wtGitDir, "MERGE_HEAD"), `${run.fork}\n`);
 	let r = step(run, "merge", [1, run.fork]);
 	assert.equal(r.status, EC.SEQUENCER, `${r.stdout}\n${r.stderr}`);
@@ -278,16 +293,28 @@ test("conflict in the detached locus: base and user checkout untouched, worktree
 	const run = mkRun();
 	// Conflicting edits to the same file on slot and base.
 	commitIn(run.wt(1), "README.md", "slot version\n", "slot edit");
-	const baseTip = commitIn(run.repo, "README.md", "base version\n", "base edit");
+	const baseTip = commitIn(
+		run.repo,
+		"README.md",
+		"base version\n",
+		"base edit",
+	);
 	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
 	const r = step(run, "merge", [1, baseTip]);
 	assert.equal(r.status, EC.CONFLICT, `${r.stdout}\n${r.stderr}`);
-	assert.match(r.stdout, /conflict_file\tREADME\.md/, "conflicted files listed");
+	assert.match(
+		r.stdout,
+		/conflict_file\tREADME\.md/,
+		"conflicted files listed",
+	);
 	const tree = /merge_tree\t(.*)/.exec(r.stdout)?.[1];
 	assert.ok(tree && fs.existsSync(tree), "merge tree left for inspection");
 	assert.ok(
 		fs.existsSync(
-			path.join(h.git(tree, "rev-parse", "--absolute-git-dir").stdout.trim(), "MERGE_HEAD"),
+			path.join(
+				h.git(tree, "rev-parse", "--absolute-git-dir").stdout.trim(),
+				"MERGE_HEAD",
+			),
 		),
 		"merge is genuinely in progress in the harvest worktree",
 	);
@@ -304,7 +331,11 @@ test("conflict in the detached locus: base and user checkout untouched, worktree
 	// Abort cleans up: worktree removed, journal cleared, base still put.
 	const a = step(run, "abort-merge", [1]);
 	assert.equal(a.status, 0, `${a.stdout}\n${a.stderr}`);
-	assert.equal(fs.existsSync(tree), false, "harvest worktree reaped after abort");
+	assert.equal(
+		fs.existsSync(tree),
+		false,
+		"harvest worktree reaped after abort",
+	);
 	assert.equal(run.slotRow(1).journal, null);
 	assert.equal(
 		h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(),
@@ -420,7 +451,7 @@ test("preview reports base_sha, locus, and the three-dot diffstat for a clean sl
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stdout, new RegExp(`base_sha\t${run.fork}`));
 	assert.match(r.stdout, /state\tclean/);
-	assert.match(r.stdout, new RegExp(`locus\tuser-tree\t`));
+	assert.match(r.stdout, /locus\tuser-tree\t/);
 	assert.match(r.stdout, /stat\t.*feat\.txt/);
 	// Detached once the user moves off base.
 	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
@@ -438,7 +469,13 @@ test("commit-wip commits tracked and untracked work as one WIP commit", () => {
 		h.git(run.wt(1), "log", "-1", "--format=%s").stdout.trim(),
 		`swarm: WIP s1 (run ${run.runId})`,
 	);
-	const files = h.git(run.wt(1), "show", "--name-only", "--format=", "HEAD").stdout;
+	const files = h.git(
+		run.wt(1),
+		"show",
+		"--name-only",
+		"--format=",
+		"HEAD",
+	).stdout;
 	assert.match(files, /new\.txt/, "untracked work is in the WIP commit");
 	assert.doesNotMatch(files, /swarm-task/, "task file never committed");
 });
@@ -450,7 +487,9 @@ test("snapshot captures untracked work in a backup ref without touching the real
 	const before = h.git(run.wt(1), "status", "--porcelain").stdout;
 	const r = step(run, "snapshot", [1]);
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	const m = /snapshot\t(refs\/swarm-backups\/\S+)\t([0-9a-f]{40})/.exec(r.stdout);
+	const m = /snapshot\t(refs\/swarm-backups\/\S+)\t([0-9a-f]{40})/.exec(
+		r.stdout,
+	);
 	assert.ok(m, `snapshot line missing in: ${r.stdout}`);
 	const [, ref, sha] = m;
 	assert.equal(ref, `refs/swarm-backups/${run.runId}/1`);
@@ -464,10 +503,7 @@ test("snapshot captures untracked work in a backup ref without touching the real
 		"precious\n",
 		"untracked content captured (git stash create would have skipped it)",
 	);
-	assert.equal(
-		h.git(run.repo, "show", `${sha}:README.md`).stdout,
-		"edited\n",
-	);
+	assert.equal(h.git(run.repo, "show", `${sha}:README.md`).stdout, "edited\n");
 	assert.throws(
 		() => h.git(run.repo, "show", `${sha}:.swarm-task.md`),
 		/git show.*failed/,
@@ -488,7 +524,10 @@ test("discard refuses without a snapshot, refuses a bad token, then discards wit
 	let r = step(run, "discard", [1], { HERDR_SWARM_CONFIRM: run.branch(1) });
 	assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stderr, /no recorded snapshot/);
-	assert.ok(fs.existsSync(path.join(run.wt(1), "untracked.txt")), "tree untouched");
+	assert.ok(
+		fs.existsSync(path.join(run.wt(1), "untracked.txt")),
+		"tree untouched",
+	);
 	assert.equal(step(run, "snapshot", [1]).status, 0);
 	// Renderer typed the wrong thing (or a UI bug): the verb re-verifies.
 	r = step(run, "discard", [1], { HERDR_SWARM_CONFIRM: "wrong-branch" });
@@ -516,7 +555,9 @@ test("kill between merge commit and swap: resume offers completion when base is 
 	commitIn(run.wt(1), "feat.txt");
 	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
 	// Deterministic crash seam right after the merge SHA is journaled.
-	let r = step(run, "merge", [1, run.fork], { HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1" });
+	let r = step(run, "merge", [1, run.fork], {
+		HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+	});
 	assert.equal(r.status, 99);
 	const msha = run.slotRow(1).journal.merge_commit_sha;
 	assert.match(msha, /^[0-9a-f]{40}$/);
@@ -543,7 +584,9 @@ test("kill between merge commit and swap: base moved -> dangling SHA reported lo
 	const run = mkRun();
 	commitIn(run.wt(1), "feat.txt");
 	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
-	let r = step(run, "merge", [1, run.fork], { HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1" });
+	let r = step(run, "merge", [1, run.fork], {
+		HERDR_SWARM_TEST_DIE_BEFORE_SWAP: "1",
+	});
 	assert.equal(r.status, 99);
 	const msha = run.slotRow(1).journal.merge_commit_sha;
 	const hwt = run.slotRow(1).journal.worktree;
@@ -553,12 +596,19 @@ test("kill between merge commit and swap: base moved -> dangling SHA reported lo
 	r = step(run, "resume");
 	assert.equal(r.status, 0);
 	assert.match(r.stdout, new RegExp(`resume_dangling\t1\t${msha}`));
-	assert.match(r.stderr, /will not be auto-deleted/, "loud, with the policy named");
+	assert.match(
+		r.stderr,
+		/will not be auto-deleted/,
+		"loud, with the policy named",
+	);
 	assert.ok(fs.existsSync(hwt), "harvest worktree kept");
 	// Completing anyway must fail the CAS and change nothing.
 	r = step(run, "resume", ["complete", 1]);
 	assert.equal(r.status, EC.SWAP);
-	assert.equal(h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(), racer);
+	assert.equal(
+		h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(),
+		racer,
+	);
 	assert.ok(fs.existsSync(hwt));
 });
 
@@ -569,7 +619,9 @@ test("two merges in one harvest re-check drift per merge: a stale expected SHA i
 	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
 	let r = step(run, "merge", [1, run.fork]);
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	const afterFirst = h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim();
+	const afterFirst = h
+		.git(run.repo, "rev-parse", "refs/heads/main")
+		.stdout.trim();
 	// Slot 2 with the PRE-first-merge SHA: the per-merge drift check refuses.
 	r = step(run, "merge", [2, run.fork]);
 	assert.equal(r.status, EC.DRIFT, `${r.stdout}\n${r.stderr}`);
@@ -598,18 +650,28 @@ test("archive: inventory prompt on an agent-created ignored file, none on the ta
 	fs.writeFileSync(path.join(run.wt(1), "debug.log"), "agent output\n");
 	let r = step(run, "archive", [1]);
 	assert.equal(r.status, EC.IGNORED, `${r.stdout}\n${r.stderr}`);
-	assert.match(r.stdout, /ignored\tdebug\.log/, "inventory names the file");
+	assert.match(
+		r.stdout,
+		/ignored_json\t"debug\.log"/,
+		"inventory names the file",
+	);
 	assert.equal(run.slotRow(1).status, "merged", "nothing archived yet");
 	assert.doesNotMatch(h.log(), /worktree remove/, "no removal before the ack");
-	// Acknowledged: removal proceeds via the herdr verb (workspace-scoped, no
-	// --force), manifest goes archived, branch survives.
-	r = step(run, "archive", [1], { HERDR_SWARM_ACK_IGNORED: "1" });
+	// Apply the exact digest-bound one-use approval emitted by preview.
+	const approval = cleanupApproval(r.stdout);
+	r = step(run, "archive", [1], { HERDR_SWARM_CLEANUP_APPROVAL: approval });
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 	assert.match(h.log(), /herdr worktree remove --workspace w11 --json/);
 	assert.doesNotMatch(h.log(), /--force/);
 	assert.equal(run.slotRow(1).status, "archived");
 	assert.equal(
-		spawnSync("git", ["-C", run.repo, "rev-parse", "--verify", `refs/heads/${run.branch(1)}`]).status,
+		spawnSync("git", [
+			"-C",
+			run.repo,
+			"rev-parse",
+			"--verify",
+			`refs/heads/${run.branch(1)}`,
+		]).status,
 		0,
 		"branch kept (R10: teardown decoupled from branch deletion)",
 	);
@@ -635,7 +697,11 @@ exit 0`,
 	let r = step(run, "archive", [1]);
 	assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stderr, /working/, "agent state named");
-	assert.doesNotMatch(h.log(), /worktree remove/, "spike (a): never reached the killing verb");
+	assert.doesNotMatch(
+		h.log(),
+		/worktree remove/,
+		"spike (a): never reached the killing verb",
+	);
 	// Dirty worktree: herdr refuses with the machine-readable code; the verb
 	// routes to the uncommitted-work flow, never message-parses.
 	h.writeStub(
@@ -653,7 +719,7 @@ exit 0`,
 	);
 	const run2 = mkRun({ status: "merged" });
 	fs.writeFileSync(path.join(run2.wt(1), "wip.txt"), "dirty\n");
-	r = step(run2, "archive", [1], { HERDR_SWARM_ACK_IGNORED: "1" });
+	r = step(run2, "archive", [1]);
 	assert.equal(r.status, EC.DIRTY, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stderr, /commit-WIP, skip, or discard/);
 	assert.equal(run2.slotRow(1).status, "merged", "not archived");
@@ -773,7 +839,10 @@ test("resume complete never hands the user's checkout to swap_base's removal tai
 		"the swap itself still completed",
 	);
 	assert.ok(fs.existsSync(userWt), "the user's checkout survived the swap");
-	assert.ok(fs.existsSync(path.join(userWt, "README.md")), "its files are intact");
+	assert.ok(
+		fs.existsSync(path.join(userWt, "README.md")),
+		"its files are intact",
+	);
 });
 
 test("swap_base refuses any journaled worktree outside the plugin's harvest- namespace", () => {
@@ -824,14 +893,15 @@ test("abort-merge keeps a harvest worktree whose HEAD is off base (merge commit 
 	assert.ok(fs.existsSync(hwt), "worktree holding the merge commit is kept");
 	assert.match(r.stderr, new RegExp(msha), "the recoverable SHA is reported");
 	assert.equal(
-		spawnSync("git", ["-C", run.repo, "cat-file", "-e", `${msha}^{commit}`]).status,
+		spawnSync("git", ["-C", run.repo, "cat-file", "-e", `${msha}^{commit}`])
+			.status,
 		0,
 		"the merge commit is still reachable",
 	);
 	assert.ok(run.slotRow(1).journal, "journal kept — the state stays surfaced");
 });
 
-test("a manifest run_id that escapes the path charset is refused before any git runs", () => {
+test("a manifest run_id that escapes the path charset is refused as unknown bookkeeping before any git mutation", () => {
 	const run = mkRun();
 	const p = path.join(run.sdir, "run-w9.json");
 	const doc = JSON.parse(fs.readFileSync(p, "utf8"));
@@ -843,9 +913,9 @@ test("a manifest run_id that escapes the path charset is refused before any git 
 	h.writeStub("git", 'echo "git $@" >> "$STUB_LOG"\nexec /usr/bin/git "$@"');
 	try {
 		const r = step(run, "preview", [1]);
-		assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
-		assert.match(r.stderr, /fails the path charset/);
-		assert.equal(h.log().trim(), "", "no git ran at all");
+		assert.equal(r.status, 3, `${r.stdout}\n${r.stderr}`);
+		assert.match(r.stderr, /bookkeeping_unknown/);
+		assert.deepEqual(mutatingGitCalls(h.log()), [], "no git mutation ran");
 	} finally {
 		fs.rmSync(path.join(h.stubDir, "git"), { force: true });
 	}
@@ -933,10 +1003,31 @@ function withGitCallLog(fn) {
 // Subcommand-precise, deliberately not a substring match: `merge-base` and
 // `worktree list` are read-only and would both trip a naive /merge|worktree/.
 const MUTATING_SUBCOMMANDS = new Set([
-	"add", "am", "branch", "checkout", "cherry-pick", "clean", "commit",
-	"commit-tree", "fetch", "init", "merge", "mv", "pull", "push", "read-tree",
-	"rebase", "reset", "restore", "revert", "rm", "stash", "switch", "tag",
-	"update-ref", "write-tree",
+	"add",
+	"am",
+	"branch",
+	"checkout",
+	"cherry-pick",
+	"clean",
+	"commit",
+	"commit-tree",
+	"fetch",
+	"init",
+	"merge",
+	"mv",
+	"pull",
+	"push",
+	"read-tree",
+	"rebase",
+	"reset",
+	"restore",
+	"revert",
+	"rm",
+	"stash",
+	"switch",
+	"tag",
+	"update-ref",
+	"write-tree",
 ]);
 function mutatingGitCalls(log) {
 	const out = [];
@@ -945,10 +1036,15 @@ function mutatingGitCalls(log) {
 		const argv = line.slice(4).trim().split(/\s+/);
 		let i = 0;
 		// Skip the global options every call site uses to name its target.
-		while (argv[i]?.startsWith("-")) i += argv[i] === "-C" || argv[i] === "-c" ? 2 : 1;
+		while (argv[i]?.startsWith("-"))
+			i += argv[i] === "-C" || argv[i] === "-c" ? 2 : 1;
 		const sub = argv[i];
 		if (sub === "worktree") {
-			if (["add", "remove", "prune", "lock", "move", "repair"].includes(argv[i + 1]))
+			if (
+				["add", "remove", "prune", "lock", "move", "repair"].includes(
+					argv[i + 1],
+				)
+			)
 				out.push(line);
 		} else if (MUTATING_SUBCOMMANDS.has(sub)) {
 			out.push(line);
@@ -969,7 +1065,7 @@ const SLOT_VERBS = [
 	["abort-merge", [1], {}],
 ];
 
-test("a slot branch outside swarm/<run>/* is refused by every slot verb, before any git mutation", () => {
+test("a slot branch outside swarm/<run>/* makes bookkeeping unknown for every slot verb before mutation", () => {
 	withGitCallLog(() => {
 		for (const [verb, args, env] of SLOT_VERBS) {
 			const run = mkRun({ status: "merged" });
@@ -977,9 +1073,13 @@ test("a slot branch outside swarm/<run>/* is refused by every slot verb, before 
 			// run never minted, so nothing about the slot is ours to touch.
 			patchSlot(run, 1, { branch: "swarm/some-other-run/s1" });
 			const r = step(run, verb, args, env);
-			assert.equal(r.status, EC.REFUSED, `${verb}: ${r.stdout}\n${r.stderr}`);
-			assert.match(r.stderr, /ownership check FAILED/, `${verb} says why`);
-			assert.match(r.stderr, /outside this run's namespace/, `${verb} names the mismatch`);
+			assert.equal(r.status, 3, `${verb}: ${r.stdout}\n${r.stderr}`);
+			assert.match(r.stderr, /bookkeeping_unknown/, `${verb} says why`);
+			assert.match(
+				r.stderr,
+				/outside the run namespace/,
+				`${verb} names the mismatch`,
+			);
 			assert.deepEqual(
 				mutatingGitCalls(h.log()),
 				[],
@@ -1000,12 +1100,16 @@ test("merge and discard refuse a foreign slot branch too (the two rm -rf-class v
 			backup_ref: base, // clears discard's snapshot precondition
 		});
 		const m = step(run, "merge", [1, base]);
-		assert.equal(m.status, EC.REFUSED, `${m.stdout}\n${m.stderr}`);
+		assert.equal(m.status, 3, `${m.stdout}\n${m.stderr}`);
 		const d = step(run, "discard", [1], {
 			HERDR_SWARM_CONFIRM: "swarm/some-other-run/s1",
 		});
-		assert.equal(d.status, EC.REFUSED, `${d.stdout}\n${d.stderr}`);
-		assert.deepEqual(mutatingGitCalls(h.log()), [], "no reset --hard, no clean -fd");
+		assert.equal(d.status, 3, `${d.stdout}\n${d.stderr}`);
+		assert.deepEqual(
+			mutatingGitCalls(h.log()),
+			[],
+			"no reset --hard, no clean -fd",
+		);
 	});
 });
 
@@ -1021,7 +1125,10 @@ test("a slot path that is a REAL worktree of a DIFFERENT branch is refused (pair
 		assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
 		assert.match(r.stderr, /is not a worktree of .* checked out on/);
 		assert.deepEqual(mutatingGitCalls(h.log()), []);
-		assert.ok(fs.existsSync(run.wt(2)), "slot 2's worktree survived slot 1's verb");
+		assert.ok(
+			fs.existsSync(run.wt(2)),
+			"slot 2's worktree survived slot 1's verb",
+		);
 	});
 });
 
@@ -1070,8 +1177,13 @@ test("STEP_EC is in lockstep with the HS_EC_* constants in harvest-step.sh", () 
 		"utf8",
 	);
 	const bash = {};
-	for (const m of src.matchAll(/^HS_EC_([A-Z]+)=(\d+)/gm)) bash[m[1]] = Number(m[2]);
-	assert.deepEqual(STEP_EC, bash, "renderer and verb script exit codes drifted");
+	for (const m of src.matchAll(/^HS_EC_([A-Z]+)=(\d+)/gm))
+		bash[m[1]] = Number(m[2]);
+	assert.deepEqual(
+		STEP_EC,
+		bash,
+		"renderer and verb script exit codes drifted",
+	);
 	assert.deepEqual(STEP_EC, EC, "this test file's own copy drifted");
 });
 
@@ -1221,7 +1333,10 @@ test("shellInto restores terminal state around the PTY handoff, including when t
 	const reenter = idx(([k, v]) => k === "w" && v.includes("\x1b[?1049h"));
 	assert.ok(leave >= 0 && rawOff > leave, "alt screen left, then raw mode off");
 	assert.ok(shell > rawOff, "shell spawns only after the terminal is sane");
-	assert.ok(rawOn > shell && reenter > rawOn, "raw mode and alt screen restored after exit");
+	assert.ok(
+		rawOn > shell && reenter > rawOn,
+		"raw mode and alt screen restored after exit",
+	);
 	assert.ok(
 		events.slice(reenter).some(([k, v]) => k === "w" && v.includes("CONFLICT")),
 		"conflict view repainted after the handoff",
@@ -1258,7 +1373,11 @@ test("HarvestRenderer against a real run: preview, drift re-preview + re-baselin
 	await r.doMerge(1);
 	assert.match(r.banner, /base moved/);
 	row = r.rows.find((x) => x.slot === 1);
-	assert.equal(row.preview.baseSha, racer, "previews re-baselined to the new base");
+	assert.equal(
+		row.preview.baseSha,
+		racer,
+		"previews re-baselined to the new base",
+	);
 	// Second attempt with the fresh SHA merges, then auto-archives (agent
 	// absent in the stub, only the task file in the worktree -> no prompt).
 	await r.doMerge(1);
@@ -1286,7 +1405,10 @@ test("selectSlot routes a user-tree locus through the confirm phase; 'y' merges,
 	);
 	await r.onKey("n");
 	assert.equal(r.phase.name, "list");
-	assert.equal(h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(), run.fork);
+	assert.equal(
+		h.git(run.repo, "rev-parse", "refs/heads/main").stdout.trim(),
+		run.fork,
+	);
 	await r.selectSlot(1);
 	await r.onKey("y");
 	assert.notEqual(
@@ -1311,15 +1433,26 @@ test("renderer discard flow: typed branch name gates it, snapshot lands before t
 	for (const ch of "wrong-name") await r.onKey(ch);
 	await r.onKey("\r");
 	assert.match(r.banner, /did not match/);
-	assert.ok(fs.existsSync(path.join(run.wt(1), "precious.txt")), "tree untouched");
-	assert.equal(run.slotRow(1).backup_ref, null, "no snapshot for a cancelled discard");
+	assert.ok(
+		fs.existsSync(path.join(run.wt(1), "precious.txt")),
+		"tree untouched",
+	);
+	assert.equal(
+		run.slotRow(1).backup_ref,
+		null,
+		"no snapshot for a cancelled discard",
+	);
 	await r.onKey("1");
 	await r.onKey("d");
 	for (const ch of run.branch(1)) await r.onKey(ch);
 	await r.onKey("\r");
 	assert.equal(fs.existsSync(path.join(run.wt(1), "precious.txt")), false);
 	const sha = run.slotRow(1).backup_ref;
-	assert.match(sha ?? "", /^[0-9a-f]{40}$/, "snapshot recorded before the discard ran");
+	assert.match(
+		sha ?? "",
+		/^[0-9a-f]{40}$/,
+		"snapshot recorded before the discard ran",
+	);
 	assert.equal(
 		h.git(run.repo, "show", `${sha}:precious.txt`).stdout,
 		"keep me\n",
@@ -1363,11 +1496,15 @@ exit 0`,
 test("harvest-pane.sh lingers without a manifest; with a real run it execs the harvest renderer end to end", () => {
 	h.writeHerdrStub();
 	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-nomf-"));
-	let r = spawnSync("bash", [path.join(repoRoot, "scripts", "harvest-pane.sh")], {
-		env: h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir }),
-		encoding: "utf8",
-		timeout: 1500,
-	});
+	let r = spawnSync(
+		"bash",
+		[path.join(repoRoot, "scripts", "harvest-pane.sh")],
+		{
+			env: h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir }),
+			encoding: "utf8",
+			timeout: 1500,
+		},
+	);
 	assert.match(r.stdout, /nothing to harvest/);
 	assert.equal(r.signal, "SIGTERM", "still lingering when the timeout hit");
 	// Real run: the pane must reach the harvest renderer's painted screen —

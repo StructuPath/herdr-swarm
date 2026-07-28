@@ -43,11 +43,6 @@ print_summary() {
 	echo "herdr-swarm: abort summary — panes closed $closed, worktrees removed $removed, kept $kept, already gone $gone, swarm branches remaining $branches_remaining (branches are deleted only by prune — R10)."
 }
 
-# The same per-repo mutation lock fan-out, harvest verbs, and prune contend
-# on: an abort must never reap a worktree mid-merge (destructive-surface KTD).
-acquire_lock "mutate-$(ws_id)" || exit 1
-trap 'release_lock "mutate-$(ws_id)"' EXIT
-
 rc=0
 DOC="$(manifest_read)" || rc=$?
 case "$rc" in
@@ -114,6 +109,50 @@ fi
 # was resolved before REPO_ROOT was known.
 SWARM_REPO="$REPO_ROOT"
 export SWARM_REPO
+# The unlocked manifest read above discovers identity only. Serialize on the
+# physical repository, re-read the exact live generation under that lock, and
+# refuse all deletion when any live/archived bookkeeping is unknown.
+MUTATION_LOCK="$(repo_mutation_lock_name "$REPO_ROOT")" || exit 1
+acquire_lock "$MUTATION_LOCK" || exit 1
+trap 'release_lock "$MUTATION_LOCK"' EXIT
+DOC_LOCKED="$(manifest_read)" || exit $?
+LOCKED_CTX="$(manifest_run_context "$DOC_LOCKED")" || exit 1
+IFS="$US" read -r LOCKED_RUN LOCKED_REPO _ <<<"$LOCKED_CTX"
+if [ "$LOCKED_RUN" != "$RUN_ID" ] || [ "$LOCKED_REPO" != "$REPO_ROOT" ]; then
+	echo "herdr-swarm: manifest identity changed while acquiring the repository lock — abort refused." >&2
+	print_summary
+	exit 3
+fi
+DOC="$DOC_LOCKED"
+SCAN="$(bookkeeping_scan "$REPO_ROOT")" || exit 1
+if ! bookkeeping_assert_known "$SCAN"; then
+	echo "herdr-swarm: abort REFUSES all destruction because repository bookkeeping is unknown." >&2
+	print_summary
+	exit 3
+fi
+
+# --- Optional read-only cleanup preview -------------------------------------
+# Preview inventories every owned slot and exits before pane close, worktree
+# removal, manifest update, exclude edit, or archival. One operation id is
+# expanded per slot so each approval is exact and one-use.
+if [ "${HERDR_SWARM_ABORT_PREVIEW:-}" = "yes" ]; then
+	PREVIEW_BASE="${HERDR_SWARM_CLEANUP_OPERATION_ID:-$(cleanup_operation_id)}"
+	printf '%s' "$DOC" | node -e '
+		let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+			for(const s of JSON.parse(d).slots||[]) if(s.status!=="archived")
+				console.log([s.slot,s.branch??"",s.path??""].join("\x1f"));
+		});
+	' | while IFS="$US" read -r pslot pbranch ppath; do
+		[ -n "$pslot" ] && [ -n "$ppath" ] && [ -d "$ppath" ] || continue
+		if verify_slot_ownership "$RUN_ID" "$pbranch" "$ppath" >/dev/null; then
+			pinv="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$pslot" "$ppath" "$PREVIEW_BASE-s$pslot")" || exit 1
+			print_cleanup_inventory "$pinv"
+		fi
+	done
+	echo "herdr-swarm: abort cleanup preview only — zero resources removed."
+	print_summary
+	exit 0
+fi
 
 # --- (1) Panes: tracked records first, then the label sweep ------------------
 
@@ -166,7 +205,7 @@ SLOT_LINES="$(printf '%s' "$DOC" | node -e '
 ')"
 
 reap_slot_worktree() {
-	local slot="$1" branch="$2" wtpath="$3" wsid="$4" wt="" herdr_ok=0 why
+	local slot="$1" branch="$2" wtpath="$3" wsid="$4" wt="" herdr_ok=0 why operation inventory count used rechecked before_digest after_digest
 	# Ownership before destruction, same shared verifier harvest-step.sh's
 	# read_slot uses (lib.sh) — the third instance of the drift pattern in
 	# docs/solutions/best-practices/cross-script-invariant-drift.md, closed in
@@ -217,6 +256,47 @@ reap_slot_worktree() {
 		echo "herdr-swarm: slot $slot KEPT — uncommitted work in $wt (its agent, if alive, is still running; use Harvest to commit-WIP/skip/discard, then abort again)." >&2
 		note_kept "slot $slot worktree $wt (uncommitted work)"
 		return 0
+	fi
+	operation="$(printf '%s' "${HERDR_SWARM_CLEANUP_APPROVAL:-}" | node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);if(a.operation_id)process.stdout.write(String(a.operation_id));}catch{}});
+	')"
+	[ -n "$operation" ] || operation="$(cleanup_operation_id)" || return 1
+	inventory="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$slot" "$wt" "$operation")" || {
+		note_kept "slot $slot worktree $wt (ignored inventory failed)"
+		return 0
+	}
+	count="$(cleanup_inventory_count "$inventory")" || return 1
+	if [ "$count" -gt 0 ]; then
+		used="$(cleanup_approval_validate "$inventory")" || {
+			print_cleanup_inventory "$inventory"
+			echo "herdr-swarm: slot $slot KEPT — ignored files require the exact one-use cleanup approval emitted by preview." >&2
+			note_kept "slot $slot worktree $wt (ignored files; cleanup digest not approved)"
+			return 0
+		}
+	fi
+	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK:-}" ]; then sleep "$HERDR_SWARM_TEST_PAUSE_BEFORE_CLEANUP_RECHECK"; fi
+	if ! why="$(verify_slot_ownership "$RUN_ID" "$branch" "$wt")"; then
+		echo "herdr-swarm: slot $slot KEPT — ownership changed immediately before removal: $why." >&2
+		note_kept "slot $slot worktree $wt (ownership changed before removal)"
+		return 0
+	fi
+	rechecked="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$slot" "$wt" "$operation")" || {
+		note_kept "slot $slot worktree $wt (ignored inventory recheck failed)"
+		return 0
+	}
+	before_digest="$(printf '%s' "$inventory" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')"
+	after_digest="$(printf '%s' "$rechecked" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).digest))')"
+	if [ "$before_digest" != "$after_digest" ]; then
+		print_cleanup_inventory "$rechecked"
+		echo "herdr-swarm: slot $slot KEPT — cleanup inventory changed after preview; zero removal performed." >&2
+		note_kept "slot $slot worktree $wt (cleanup inventory changed)"
+		return 0
+	fi
+	if [ "$count" -gt 0 ]; then
+		cleanup_approval_consume "$used" || {
+			note_kept "slot $slot worktree $wt (cleanup approval already consumed)"
+			return 0
+		}
 	fi
 	if [ -n "$wsid" ]; then
 		# The one-shot verb IS the stop mechanism here (spike (a)): it kills
@@ -386,21 +466,15 @@ if [ "$kept" -gt 0 ]; then
 	exit "$ABORT_EC_KEPT"
 fi
 
-# Rename, never delete: the archived manifest is the recovery record (and
-# prune's source for recorded base refs). The .bak follows its manifest.
-mf="$(manifest_path)"
-arch="$(state_dir)/archived-$RUN_ID.json"
-# run_id contains a timestamp+nonce, so a collision means a re-abort of the
-# same recovered run — keep both generations rather than clobbering.
-[ -e "$arch" ] && arch="$(state_dir)/archived-$RUN_ID.$$.json"
-if mv "$mf" "$arch" 2>/dev/null; then
-	if [ -f "$mf.bak" ]; then
-		mv "$mf.bak" "$arch.bak" 2>/dev/null || true
-	fi
-	echo "herdr-swarm: manifest archived to $arch."
-else
-	echo "herdr-swarm: warning: could not archive the manifest ($mf)." >&2
+# Exact-name, idempotent finalization is shared with full Harvest. Archive
+# failure is fatal: a successful exit may never claim a run finished while
+# its durable recovery record is still live or ambiguous.
+if ! final_out="$(finalize_run "$REPO_ROOT" "$RUN_ID")"; then
+	echo "herdr-swarm: abort cleanup finished but run finalization/archive FAILED; the run remains recoverable and this abort is incomplete." >&2
+	print_summary
+	exit 1
 fi
+[ -n "$final_out" ] && printf '%s\n' "$final_out"
 
 print_summary
 exit 0
