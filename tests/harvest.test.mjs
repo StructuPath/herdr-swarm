@@ -1661,3 +1661,61 @@ test("harvest-pane.sh lingers without a manifest; with a real run it execs the h
 	assert.match(r.stdout, new RegExp(`run:${run.runId}`));
 	assert.match(r.stdout, /clean/, "real preview rendered");
 });
+
+// ---- Recorded testing gaps (docs/residual-review-findings/main-27b3c92.md) --
+// The two do_archive/do_resume branches the original suite never exercised.
+
+test("resume scan reports a stale journal (crash before any merge commit) and clears nothing", () => {
+	h.writeHerdrStub();
+	const run = mkRun();
+	patchSlot(run, 1, {
+		journal: {
+			locus: "detached",
+			expected_base_sha: run.fork,
+			merge_commit_sha: null,
+			worktree: null,
+		},
+	});
+	const r = step(run, "resume");
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /resume_stale\t1/, "typed fact for the renderer");
+	assert.match(r.stderr, /journaled merge intent with no commit/);
+	assert.ok(
+		run.slotRow(1).journal,
+		"the scan is read-only for stale intents — abort-merge is the eraser",
+	);
+});
+
+test("archive proceeds on an IDLE agent: the herdr verb stops it and the slot archives", () => {
+	// A live agent matching this slot's terminal id, but idle: unlike
+	// 'working' (refused above), idle is safe — the herdr remove verb stops
+	// the idle agent, closes the grouped workspace, and removes the worktree.
+	h.writeStub(
+		"herdr",
+		`echo "herdr $@" >> "$STUB_LOG"
+if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
+  echo '{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"idle","pane_id":"w11:p1","terminal_id":"term_s1","workspace_id":"w11"}],"type":"agent_list"}}'
+  exit 0
+fi
+exit 0`,
+	);
+	const run = mkRun({ status: "merged" });
+	const r = step(run, "archive", [1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(h.log(), /herdr worktree remove --workspace w11 --json/);
+	assert.doesNotMatch(h.log(), /--force/);
+	assert.equal(run.slotRow(1).status, "archived");
+	assert.ok(!fs.existsSync(run.wt(1)), "worktree gone (git reconcile path)");
+	assert.equal(
+		spawnSync("git", [
+			"-C",
+			run.repo,
+			"rev-parse",
+			"--verify",
+			`refs/heads/${run.branch(1)}`,
+		]).status,
+		0,
+		"branch kept — archive never deletes branches",
+	);
+	h.writeHerdrStub(); // restore the default stub for later tests
+});

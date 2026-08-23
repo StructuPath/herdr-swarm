@@ -87,3 +87,18 @@ defect: the README's setup-hook section should warn against echoing secrets.
 - No fixture exercises two workspace ids against one repo (see residual 3).
 - Test fixtures under `mkdtempSync` are never cleaned up; a full run leaves
   ~1400 temp dirs.
+
+---
+
+## Status addendum — 2026-08-23
+
+Residuals 1 (scripted fan-out), 2 (slot ownership assertion), and 3
+(repo-keyed lock/generation resolution) were closed by the wave0 safety work.
+Residual 5 is addressed as a README warning next to the setup-hook docs.
+Residual 4 (renderer split) remains deliberately deferred.
+
+Of the recorded testing gaps: hostile-manifest fixtures, the two-workspace
+fixture, and the post-confirm clean-tree re-check landed with wave0; the
+`do_archive` idle-agent branch and a bash-level `resume_stale` scan test now
+live at the end of `tests/harvest.test.mjs`; harness temp dirs are swept on
+process exit (`tests/harness.mjs`, `HS_KEEP_TMP=1` to keep them).
