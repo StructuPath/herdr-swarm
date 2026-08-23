@@ -7,6 +7,8 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-23
+
 ### Added
 - Harvest preview now detects externally **squash-merged** (and
   cherry-pick-merged) slots: a clean slot whose content is already fully
