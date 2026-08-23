@@ -706,13 +706,23 @@ do_publish() {
 		echo "herdr-swarm: slot $1 has no commits past the fork point — nothing to publish." >&2
 		return "$HS_EC_REFUSED"
 	fi
+	# The branch must still contain the recorded fork point: a rewritten slot
+	# branch (reset onto foreign history) would otherwise publish commits this
+	# run never audited. Same authority prune uses — ancestry, not bookkeeping.
+	if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$FORK_SHA" "$tip"; then
+		echo "herdr-swarm: slot $1 branch no longer contains the recorded fork point $FORK_SHA — its history was rewritten; publish refused." >&2
+		return "$HS_EC_REFUSED"
+	fi
 	# Uncommitted work never travels; say so rather than silently publishing
 	# half a slot (commit-WIP first to include it).
 	if [ -n "$SLOT_PATH" ] && [ -d "$SLOT_PATH" ] &&
 		[ -n "$(git -C "$SLOT_PATH" status --porcelain 2>/dev/null)" ]; then
 		echo "herdr-swarm: note — slot $1 has uncommitted work; only committed work is published. Commit-WIP first to include it." >&2
 	fi
-	if ! out="$(git -C "$REPO_ROOT" push "$remote" "refs/heads/$SLOT_BRANCH:refs/heads/$SLOT_BRANCH" 2>&1)"; then
+	# Push the AUDITED SHA, not the branch name: if the agent commits again
+	# between the checks above and the push, the remote still receives exactly
+	# the tip that passed them (the branch-name form would race).
+	if ! out="$(git -C "$REPO_ROOT" push "$remote" "$tip:refs/heads/$SLOT_BRANCH" 2>&1)"; then
 		printf '%s\n' "$out" >&2
 		echo "herdr-swarm: publish of slot $1 to '$remote' was rejected — nothing was force-pushed; resolve the refusal above and retry." >&2
 		return "$HS_EC_REFUSED"

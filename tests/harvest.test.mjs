@@ -1828,3 +1828,20 @@ test("publish refuses: missing remote, empty slot, and non-fast-forward — remo
 		"remote branch untouched — publish never forces",
 	);
 });
+
+test("publish refuses a slot branch whose rewritten history lost the fork point", () => {
+	h.writeHerdrStub();
+	const run = mkRun();
+	addBareRemote(run);
+	// Rebuild the slot branch on an orphan root: commits exist, but the
+	// recorded fork point is no longer in its history.
+	h.git(run.wt(1), "checkout", "-q", "--orphan", "rebuilt");
+	fs.writeFileSync(path.join(run.wt(1), "alien.txt"), "foreign history\n");
+	h.git(run.wt(1), "add", "alien.txt");
+	h.git(run.wt(1), "commit", "-q", "-m", "alien root");
+	h.git(run.wt(1), "branch", "-f", run.branch(1));
+	h.git(run.wt(1), "checkout", "-q", run.branch(1));
+	const r = step(run, "publish", [1]);
+	assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stderr, /no longer contains the recorded fork point/);
+});
