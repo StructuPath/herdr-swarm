@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHarness, repoRoot } from "./harness.mjs";
+import { createHarness, repoRoot, mkdtemp } from "./harness.mjs";
 
 // Shared harness (tests/harness.mjs) — the herdr stub mirrors real 0.7.4 and
 // 0.7.5 JSON so wrapper tests exercise the true wire shapes.
@@ -247,7 +247,7 @@ test("herdr_agent_start drops --split-from on the 0.7.4 path", () => {
 // instead of one — and `agent start` never runs, because 0.7.5's --kind is a
 // closed whitelist with no arbitrary-argv member (spike l).
 test("herdr_agent_start on 0.7.5 splits, runs, and reports — never calls agent start", () => {
-	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const wt = mkdtemp("hs-wt075-");
 	const r = runLib(
 		`herdr_agent_start swarm-r1-s1 --workspace w9 --split-from w9:p1 --cwd ${wt} --no-focus -- claude --model opus`,
 		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
@@ -289,7 +289,7 @@ test("the 0.7.5 path refuses before splitting when the worktree cwd is missing",
 	assert.doesNotMatch(log(), /pane split/);
 	// And without an anchor pane, `pane split` would split the user's own
 	// focused pane (it has no --workspace).
-	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const wt = mkdtemp("hs-wt075-");
 	const noAnchor = runLib(`herdr_agent_start swarm-r1-s1 --cwd ${wt} -- claude`, env);
 	assert.notEqual(noAnchor.status, 0);
 	assert.match(noAnchor.stderr, /needs --split-from/);
@@ -297,7 +297,7 @@ test("the 0.7.5 path refuses before splitting when the worktree cwd is missing",
 });
 
 test("the 0.7.5 path refuses an untranslatable flag instead of silently dropping it", () => {
-	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const wt = mkdtemp("hs-wt075-");
 	const r = runLib(
 		`herdr_agent_start swarm-r1-s1 --split-from w9:p1 --cwd ${wt} --timeout 5000 -- claude`,
 		freshEnv({ STUB_HERDR_VERSION: "0.7.5" }),
@@ -308,7 +308,7 @@ test("the 0.7.5 path refuses an untranslatable flag instead of silently dropping
 });
 
 test("the 0.7.5 path closes the pane it opened when pane run fails", () => {
-	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const wt = mkdtemp("hs-wt075-");
 	// A pane the manifest never records is a pane no abort sweep can reap.
 	writeStub(
 		"herdr",
@@ -334,7 +334,7 @@ exit 0`,
 // Agent state is advisory (harvest never gates on it), so a status-only call
 // failing must never destroy a slot that is already running its work.
 test("the 0.7.5 path warns but still succeeds when report-agent fails", () => {
-	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt075-"));
+	const wt = mkdtemp("hs-wt075-");
 	writeStub(
 		"herdr",
 		`echo "herdr $@" >> "$STUB_LOG"

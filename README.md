@@ -276,7 +276,10 @@ shells into `node_modules/.bin` fails in the plugin-owned merge worktree —
 plugin config dir (`herdr plugin config-dir structupath.swarm`): fan-out runs
 it inside each new worktree before the agent starts (timeout
 `HERDR_SWARM_SETUP_TIMEOUT`, default 300s). A failing hook warns loudly and
-starts the agent anyway; output lands in the plugin state dir.
+starts the agent anyway; output lands in the plugin state dir. The hook's
+stdout and stderr are logged there **verbatim and indefinitely** — the state
+dir is `0700`, but don't `echo`/`set -x` secrets in `setup.sh`: a token
+printed during dependency install stays on disk until you delete the log.
 
 ## Safety model
 

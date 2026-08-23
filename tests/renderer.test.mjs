@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHarness, repoRoot, sampleManifest } from "./harness.mjs";
+import { createHarness, repoRoot, sampleManifest, mkdtemp } from "./harness.mjs";
 import {
 	diffRange,
 	HarvestRenderer,
@@ -221,14 +221,14 @@ status) printf 'M a\\n?? b\\n?? c\\n' ;;
 esac
 exit 0`,
 	);
-	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-"));
+	const wt = mkdtemp("hs-wt-");
 	const env = h.freshEnv();
 	const r = quiet(mkRenderer(env));
 	r.gitBin = path.join(h.stubDir, "git");
 	const manifest = JSON.parse(sampleManifest());
 	// repo_root must be a real dir: the branch check runs there first, and a
 	// spawn failure would short-circuit as branchMissing before the diff.
-	manifest.repo_root = fs.mkdtempSync(path.join(os.tmpdir(), "hs-root-"));
+	manifest.repo_root = mkdtemp("hs-root-");
 	const row = { ...manifest.slots[1], path: wt };
 	const facts = await r.gitFactsFor(manifest, row);
 	const sha = "a".repeat(40);
@@ -253,7 +253,7 @@ test("gitFactsFor flags a deleted branch as branchMissing", async () => {
 if [ "$1" = rev-parse ]; then exit 1; fi
 exit 0`,
 	);
-	const wt = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-"));
+	const wt = mkdtemp("hs-wt-");
 	const r = quiet(mkRenderer(h.freshEnv()));
 	r.gitBin = path.join(h.stubDir, "git");
 	const manifest = JSON.parse(sampleManifest());
@@ -270,7 +270,7 @@ test("tick against a real worktree shows committed and uncommitted counts togeth
 	fs.rmSync(path.join(h.stubDir, "git"), { force: true });
 	const repo = h.makeRepo();
 	const fork = h.git(repo, "rev-parse", "HEAD").stdout.trim();
-	const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")), "s2");
+	const wt = path.join(mkdtemp("hs-wt-"), "s2");
 	h.git(repo, "worktree", "add", "-q", "-b", "swarm/r-t/s2", wt);
 	fs.writeFileSync(path.join(wt, "done.txt"), "work\n");
 	h.git(wt, "add", "done.txt");
@@ -283,7 +283,7 @@ test("tick against a real worktree shows committed and uncommitted counts togeth
 	manifest.slots[1].branch = "swarm/r-t/s2";
 	// Dedicated state dir: shared-state coupling between tests is exactly the
 	// kind of order dependence this suite must not have.
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-live-"));
+	const sdir = mkdtemp("hs-live-");
 	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir });
 	fs.writeFileSync(path.join(sdir, "run-w9.json"), JSON.stringify(manifest));
 	const r = quiet(mkRenderer(env));
@@ -313,7 +313,7 @@ test("renderer performs zero fs writes across a full poll cycle", async () => {
 	// Belt: read-only manifest + read-only state dir make any write attempt
 	// throw. Suspenders: spy every mutating fs call the renderer's module
 	// object exposes and require none fire.
-	const roDir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-ro-"));
+	const roDir = mkdtemp("hs-ro-");
 	const mf = path.join(roDir, "run-w9.json");
 	const content = sampleManifest();
 	fs.writeFileSync(mf, content);
@@ -519,7 +519,7 @@ exit 0`,
 
 test("tick shows typed banners for missing and corrupt manifests without crashing", async () => {
 	h.writeHerdrStub();
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-banner-"));
+	const sdir = mkdtemp("hs-banner-");
 	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir });
 	const r = quiet(mkRenderer(env));
 	await r.tick();
@@ -574,7 +574,7 @@ test("status-pane.sh lingers with a friendly message instead of flash-closing", 
 	h.writeHerdrStub();
 	// Missing manifest: the pane must say so and stay open (sleep), never
 	// exit instantly — an instant exit closes the pane before it is readable.
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-nomf-"));
+	const sdir = mkdtemp("hs-nomf-");
 	const r = spawnSync(
 		"bash",
 		[path.join(repoRoot, "scripts", "status-pane.sh")],
@@ -591,7 +591,7 @@ test("status-pane.sh lingers with a friendly message instead of flash-closing", 
 test("status-pane.sh execs the renderer with the resolved context (end to end)", () => {
 	h.writeHerdrStub();
 	fs.rmSync(path.join(h.stubDir, "git"), { force: true });
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-e2e-"));
+	const sdir = mkdtemp("hs-e2e-");
 	const repo = h.makeRepo();
 	const fork = h.git(repo, "rev-parse", "HEAD").stdout.trim();
 	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir });
@@ -632,7 +632,7 @@ const mkHarvest = (env = h.freshEnv()) => {
 test("harvest step is bounded: a hung verb is killed, busy clears, banner explains", async () => {
 	// Unbounded, this verb would hold `busy` forever — and busy masks every
 	// key INCLUDING ^C (run()'s SIGINT handler), so the pane becomes a brick.
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-slow-"));
+	const dir = mkdtemp("hs-slow-");
 	const script = path.join(dir, "slow-step.sh");
 	fs.writeFileSync(script, "#!/usr/bin/env bash\nsleep 30\n");
 	fs.chmodSync(script, 0o755);

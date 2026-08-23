@@ -4,7 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHarness, repoRoot, sampleManifest } from "./harness.mjs";
+import { createHarness, repoRoot, sampleManifest, mkdtemp } from "./harness.mjs";
 
 const h = createHarness();
 const {
@@ -128,7 +128,7 @@ function resetState() {
 function setup(extraEnv = {}) {
 	resetState();
 	const repo = makeRepo();
-	const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wtroot-"));
+	const wtRoot = mkdtemp("hs-wtroot-");
 	const env = freshEnv({
 		STUB_REPO: repo,
 		STUB_WT_ROOT: wtRoot,
@@ -227,7 +227,7 @@ test("presets: missing config yields the two built-in defaults", () => {
 });
 
 test("presets: config file parsed — comments/blanks skipped, kind carried, args returned", () => {
-	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
+	const cfg = mkdtemp("hs-cfg-");
 	fs.writeFileSync(
 		path.join(cfg, "presets.conf"),
 		"# my presets\n\nfast|argv|claude --model haiku\nslow|custom-kind|codex --slow\n",
@@ -243,7 +243,7 @@ test("presets: config file parsed — comments/blanks skipped, kind carried, arg
 });
 
 test("presets: an invalid name fails the whole catalog loudly, never skips", () => {
-	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
+	const cfg = mkdtemp("hs-cfg-");
 	fs.writeFileSync(
 		path.join(cfg, "presets.conf"),
 		"ok|argv|echo hi\nbad name|argv|echo boom\n",
@@ -509,7 +509,7 @@ test("stub 0.7.3 refuses fan-out in the pane before any create (R13)", () => {
 // command becomes a running slot on 0.7.5, so R2 survives the version that
 // deleted the arbitrary-argv `agent start`.
 test("stub 0.7.5: fan-out completes end-to-end with an arbitrary command as the slot agent", () => {
-	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
+	const cfg = mkdtemp("hs-cfg-");
 	// Not one of herdr's ~14 integration kinds — exactly the case 0.7.5's
 	// --kind whitelist cannot express.
 	fs.writeFileSync(
@@ -663,7 +663,7 @@ test("per-slot override lands in .swarm-task.md with the standing footer, exclud
 });
 
 test("a configured preset's argv reaches agent start verbatim", () => {
-	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
+	const cfg = mkdtemp("hs-cfg-");
 	fs.writeFileSync(
 		path.join(cfg, "presets.conf"),
 		"fast|argv|echo hello-fast\n",
@@ -788,7 +788,7 @@ test("detritus delete: an archived run recording the branch is named as the harv
 
 test("setup.sh hook runs in each worktree; failure warns but slots still start", () => {
 	// Success path: the hook drops a marker; every worktree must have it.
-	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cfg-"));
+	const cfg = mkdtemp("hs-cfg-");
 	fs.writeFileSync(path.join(cfg, "setup.sh"), "echo ok > .setup-ran\n");
 	{
 		const { env, repo } = setup({ HERDR_PLUGIN_CONFIG_DIR: cfg });
@@ -843,7 +843,7 @@ test("fan-out targets the workspace's repo, not the process cwd", () => {
 	const headB = git(repoB, "rev-parse", "HEAD").stdout.trim();
 	assert.notEqual(headA, headB, "fixture repos must not share a HEAD");
 
-	const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hs-wtroot-"));
+	const wtRoot = mkdtemp("hs-wtroot-");
 	const env = freshEnv({
 		STUB_REPO: repoA,
 		STUB_WT_ROOT: wtRoot,
@@ -1019,7 +1019,7 @@ test("env-driven: an unknown preset name is refused, with the name in the messag
 
 test("env-driven: TASK_FILE contents land in every slot with the standing footer, and beat TASK", () => {
 	const taskFile = path.join(
-		fs.mkdtempSync(path.join(os.tmpdir(), "hs-task-")),
+		mkdtemp("hs-task-"),
 		"brief.md",
 	);
 	fs.writeFileSync(taskFile, "Line one of the brief\nLine two of the brief\n");
