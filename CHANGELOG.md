@@ -8,6 +8,13 @@ Notable changes to the Swarm plugin. Format follows
 ## [Unreleased]
 
 ### Added
+- Harvest preview now detects externally **squash-merged** (and
+  cherry-pick-merged) slots: a clean slot whose content is already fully
+  contained in base is marked merged (`squash_merged`) instead of
+  conflicting on re-merge. Uses `git merge-tree --write-tree` containment
+  (git >= 2.38); older gits keep the previous skip-by-hand behavior. Prune
+  still deliberately keeps such branches — its ancestry test cannot see
+  squashes.
 - CI now runs the full test suite on macOS as well as Linux, and gates every
   script with shellcheck at default severity.
 - Test coverage for the last two recorded gaps: archiving a slot whose agent

@@ -919,15 +919,17 @@ export class HarvestRenderer {
 				await this.doMerge(slot);
 			}
 		} else if (
-			// "empty" (auto-skipped: nothing past the fork) and "external_merged"
-			// (the user merged it themselves) are terminal too — the preview verb
+			// "empty" (auto-skipped: nothing past the fork), "external_merged"
+			// (the user merged it themselves), and "squash_merged" (content in
+			// base with no ancestry trail) are terminal too — the preview verb
 			// already wrote skipped/merged to the manifest. Omitting them left the
 			// only route to archiving those slots a manual re-preview.
 			p.state === "merged" ||
 			p.state === "skipped" ||
 			p.state === "failed" ||
 			p.state === "empty" ||
-			p.state === "external_merged"
+			p.state === "external_merged" ||
+			p.state === "squash_merged"
 		) {
 			await this.doArchive(slot);
 			await this.reload();
