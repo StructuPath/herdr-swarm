@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHarness, sampleManifest } from "./harness.mjs";
+import { createHarness, sampleManifest, mkdtemp } from "./harness.mjs";
 
 const h = createHarness();
 h.writeHerdrStub();
@@ -32,7 +32,7 @@ test("every preflight refusal has a distinct exit code and an actionable message
 			fn: "preflight_check_repo",
 			code: 10,
 			msg: /not a git repository/,
-			cwd: () => fs.mkdtempSync(path.join(os.tmpdir(), "hs-norepo-")),
+			cwd: () => mkdtemp("hs-norepo-"),
 		},
 		{
 			name: "detached HEAD",
@@ -200,7 +200,7 @@ test("argv check reports every broken slot in one refusal", () => {
 test("detritus check lists leftover swarm worktrees by path", () => {
 	const repo = makeRepo();
 	git(repo, "branch", "swarm/r0/s1");
-	const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")), "wt");
+	const wt = path.join(mkdtemp("hs-wt-"), "wt");
 	git(repo, "worktree", "add", "-q", wt, "swarm/r0/s1");
 	const r = runPf("preflight_check_detritus", freshEnv(), repo);
 	assert.equal(r.status, 14, r.stderr);
@@ -209,7 +209,7 @@ test("detritus check lists leftover swarm worktrees by path", () => {
 
 test("detritus check prunes stale worktree registrations instead of flagging them", () => {
 	const repo = makeRepo();
-	const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")), "wt");
+	const wt = path.join(mkdtemp("hs-wt-"), "wt");
 	// A worktree whose directory was deleted by hand leaves only a stale
 	// registration; on a non-swarm branch that must be pruned and passed,
 	// not surfaced as detritus. (A swarm-branch leftover would still refuse

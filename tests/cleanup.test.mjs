@@ -8,13 +8,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
-	commitIn,
-	createHarness,
-	gitIdent,
-	makeFannedOutRun,
-	repoRoot,
-} from "./harness.mjs";
+import { commitIn, createHarness, gitIdent, makeFannedOutRun, repoRoot, mkdtemp } from "./harness.mjs";
 
 const h = createHarness();
 h.writeHerdrStub();
@@ -240,7 +234,7 @@ test("crash abort (manifest present, herdr agents gone) completes, reaps both sl
 	commitIn(r.wt(2), "b.txt");
 	// Foreign branch + worktree: ownership rule says abort may never touch them.
 	const fwt = path.join(
-		fs.mkdtempSync(path.join(os.tmpdir(), "hs-fwt-")),
+		mkdtemp("hs-fwt-"),
 		"fx",
 	);
 	h.git(r.repo, "worktree", "add", "-q", "-b", "feature-x", fwt, r.fork);
@@ -442,7 +436,7 @@ test("abort on an untested herdr (0.8.0) warns about the version and still compl
 
 test("no active run: abort no-ops with a message and still prints the summary", () => {
 	const repo = h.makeRepo();
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-cl-"));
+	const sdir = mkdtemp("hs-cl-");
 	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir, ...gitIdent });
 	const a = spawnSync("bash", [path.join(repoRoot, "scripts", "abort.sh")], {
 		env,
@@ -464,7 +458,7 @@ test("no active run: abort no-ops with a message and still prints the summary", 
 function mkPruneRepo() {
 	const repo = h.makeRepo();
 	const fork = h.git(repo, "rev-parse", "HEAD").stdout.trim();
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-pr-"));
+	const sdir = mkdtemp("hs-pr-");
 	const env = h.freshEnv({ HERDR_PLUGIN_STATE_DIR: sdir, ...gitIdent });
 	return { repo, fork, sdir, env };
 }

@@ -24,6 +24,46 @@ export const gitIdent = {
 	GIT_COMMITTER_EMAIL: "hs@test.invalid",
 };
 
+// Every harness-made temp dir is tracked here and swept when the test process
+// exits (node --test = one process per file, so the sweep is per-file). A full
+// run otherwise strands well over a thousand fixture dirs under os.tmpdir().
+// HS_KEEP_TMP=1 keeps everything for post-mortem inspection.
+const tempDirs = [];
+export function mkdtemp(prefix) {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	tempDirs.push(dir);
+	return dir;
+}
+// Fixtures deliberately drop write permission in places (read-only state-dir
+// tests); restore it so the sweep can finish.
+function makeWritable(dir) {
+	try {
+		fs.chmodSync(dir, 0o700);
+	} catch {}
+	let entries;
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const e of entries) {
+		if (e.isDirectory()) makeWritable(path.join(dir, e.name));
+	}
+}
+process.on("exit", () => {
+	if (process.env.HS_KEEP_TMP) return;
+	for (const dir of tempDirs) {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+		} catch {
+			try {
+				makeWritable(dir);
+				fs.rmSync(dir, { recursive: true, force: true });
+			} catch {}
+		}
+	}
+});
+
 // Module-scope (not per-harness): stateless — fixed identity env, no stub or
 // state dir involved — and needed by the shared fixtures below.
 function git(cwd, ...args) {
@@ -66,13 +106,13 @@ export function makeFannedOutRun(h, opts = {}) {
 	const repo = h.makeRepo();
 	const runId = `${opts.prefix ?? "r"}${++runSeq}`;
 	const fork = git(repo, "rev-parse", "HEAD").stdout.trim();
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-run-"));
+	const sdir = mkdtemp("hs-run-");
 	fs.appendFileSync(path.join(repo, ".git/info/exclude"), ".swarm-task.md\n");
 	const slots = [];
 	for (let i = 1; i <= nslots; i++) {
 		const branch = `swarm/${runId}/s${i}`;
 		const wt = path.join(
-			fs.mkdtempSync(path.join(os.tmpdir(), "hs-wt-")),
+			mkdtemp("hs-wt-"),
 			`s${i}`,
 		);
 		git(repo, "worktree", "add", "-q", "-b", branch, wt, fork);
@@ -184,8 +224,8 @@ export function sampleManifest(overrides = {}) {
 }
 
 export function createHarness() {
-	const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-stub-"));
-	const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-state-"));
+	const stubDir = mkdtemp("hs-stub-");
+	const stateDir = mkdtemp("hs-state-");
 	const logFile = path.join(stubDir, "calls.log");
 
 	function writeStub(name, body) {
@@ -284,7 +324,7 @@ exit 0`,
 	// for repo-state checks; pass it as opts.cwd to runLib. {empty: true}
 	// leaves HEAD unborn (git init, no commit).
 	function makeRepo(opts = {}) {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-repo-"));
+		const dir = mkdtemp("hs-repo-");
 		git(dir, "init", "-q", "-b", "main");
 		if (!opts.empty) {
 			fs.writeFileSync(path.join(dir, "README.md"), "seed\n");

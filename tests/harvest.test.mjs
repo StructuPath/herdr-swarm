@@ -9,12 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
-	commitIn,
-	createHarness,
-	makeFannedOutRun,
-	repoRoot,
-} from "./harness.mjs";
+import { commitIn, createHarness, makeFannedOutRun, repoRoot, mkdtemp } from "./harness.mjs";
 
 const h = createHarness();
 h.writeHerdrStub();
@@ -845,7 +840,7 @@ function patchSlot(run, slot, patch) {
 function linkedBaseCheckout(run) {
 	h.git(run.repo, "checkout", "-q", "-b", "elsewhere");
 	const dir = path.join(
-		fs.mkdtempSync(path.join(os.tmpdir(), "hs-userwt-")),
+		mkdtemp("hs-userwt-"),
 		"base",
 	);
 	h.git(run.repo, "worktree", "add", "-q", dir, "main");
@@ -1283,7 +1278,7 @@ test("a slot path outside the repo entirely is refused", () => {
 		const run = mkRun({ status: "merged" });
 		// Exists, so the `[ -d ]` checks would wave it straight through to
 		// `git worktree remove` — the exact shape finding 2 describes.
-		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hs-foreign-"));
+		const outside = mkdtemp("hs-foreign-");
 		fs.writeFileSync(path.join(outside, "precious.txt"), "user data\n");
 		patchSlot(run, 1, { path: outside });
 		const r = step(run, "archive", [1]);
@@ -1641,7 +1636,7 @@ exit 0`,
 
 test("harvest-pane.sh lingers without a manifest; with a real run it execs the harvest renderer end to end", () => {
 	h.writeHerdrStub();
-	const sdir = fs.mkdtempSync(path.join(os.tmpdir(), "hs-nomf-"));
+	const sdir = mkdtemp("hs-nomf-");
 	let r = spawnSync(
 		"bash",
 		[path.join(repoRoot, "scripts", "harvest-pane.sh")],
