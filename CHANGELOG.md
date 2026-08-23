@@ -7,6 +7,12 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+### Changed
+- `bin/renderer.mjs` is now a thin mode-dispatch/re-export entrypoint over
+  three modules split along the seam the test files already used:
+  `renderer-shared.mjs` (pure helpers), `renderer-status.mjs`, and
+  `renderer-harvest.mjs`. No behavior change; import paths are unchanged.
+
 ### Added
 - **PR-based harvest**: the new `publish` verb (`harvest-step.sh publish
   <slot>`, or `p` + slot digit in the harvest pane) pushes a slot's branch
