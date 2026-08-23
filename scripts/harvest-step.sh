@@ -721,7 +721,12 @@ do_publish() {
 	fi
 	# Push the AUDITED SHA, not the branch name: if the agent commits again
 	# between the checks above and the push, the remote still receives exactly
-	# the tip that passed them (the branch-name form would race).
+	# the tip that passed them (the branch-name form would race). The seam
+	# below holds the verb in that window so the race is testable.
+	if [ -n "${HERDR_SWARM_TEST_PUBLISH_READY_FILE:-}" ]; then : >"$HERDR_SWARM_TEST_PUBLISH_READY_FILE"; fi
+	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_PUBLISH:-}" ]; then
+		sleep "$HERDR_SWARM_TEST_PAUSE_BEFORE_PUBLISH"
+	fi
 	if ! out="$(git -C "$REPO_ROOT" push "$remote" "$tip:refs/heads/$SLOT_BRANCH" 2>&1)"; then
 		printf '%s\n' "$out" >&2
 		echo "herdr-swarm: publish of slot $1 to '$remote' was rejected — nothing was force-pushed; resolve the refusal above and retry." >&2

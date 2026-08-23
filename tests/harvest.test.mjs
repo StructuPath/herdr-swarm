@@ -1845,3 +1845,29 @@ test("publish refuses a slot branch whose rewritten history lost the fork point"
 	assert.equal(r.status, EC.REFUSED, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stderr, /no longer contains the recorded fork point/);
 });
+
+test("publish pushes the audited tip even when the branch advances mid-flight", async () => {
+	h.writeHerdrStub();
+	const run = mkRun();
+	const bare = addBareRemote(run);
+	const audited = commitIn(run.wt(1), "one.txt", "one\n", "audited work");
+	const ready = path.join(h.stateDir, "publish-ready");
+	const done = stepAsync(run, "publish", [1], {
+		HERDR_SWARM_TEST_PUBLISH_READY_FILE: ready,
+		HERDR_SWARM_TEST_PAUSE_BEFORE_PUBLISH: "2",
+	});
+	// The verb has captured and validated its tip once the ready file exists;
+	// advance the branch inside the capture-to-push window.
+	await until(() => fs.existsSync(ready));
+	const racer = commitIn(run.wt(1), "two.txt", "two\n", "raced in");
+	const r = await done;
+	assert.equal(r.code, 0, `${r.out}\n${r.err}`);
+	assert.notEqual(racer, audited);
+	assert.equal(
+		h.git(run.repo, "ls-remote", bare, `refs/heads/${run.branch(1)}`)
+			.stdout.split("\t")[0],
+		audited,
+		"the remote received exactly the audited tip, not the mid-flight commit",
+	);
+	assert.deepEqual(run.slotRow(1).published, { remote: "origin", sha: audited });
+});
