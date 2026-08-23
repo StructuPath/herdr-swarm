@@ -1719,3 +1719,41 @@ exit 0`,
 	);
 	h.writeHerdrStub(); // restore the default stub for later tests
 });
+
+// ---- Squash-merge detection (deferred follow-up, now shipped) ---------------
+// A squash-merged slot has no ancestry trail, so the external_merged check
+// cannot see it; merge-tree containment can.
+
+test("preview detects an externally squash-merged slot and marks it merged", () => {
+	h.writeHerdrStub();
+	const run = mkRun();
+	commitIn(run.wt(1), "feat.txt", "squashed content\n", "slot work");
+	// The user squash-merges the slot themselves: content lands, ancestry
+	// does not.
+	h.git(run.repo, "merge", "--squash", run.branch(1));
+	h.git(run.repo, "commit", "-q", "-m", "squash of s1");
+	const r = step(run, "preview", [1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /state\tsquash_merged/);
+	assert.equal(run.slotRow(1).status, "merged");
+	// Never re-merged: base tip is still the user's own squash commit.
+	assert.match(
+		h.git(run.repo, "log", "-1", "--format=%s", "main").stdout,
+		/squash of s1/,
+	);
+});
+
+test("preview never squash-detects a slot that still has unlanded commits", () => {
+	h.writeHerdrStub();
+	const run = mkRun();
+	commitIn(run.wt(1), "first.txt", "landed\n", "landed work");
+	h.git(run.repo, "merge", "--squash", run.branch(1));
+	h.git(run.repo, "commit", "-q", "-m", "squash of first half");
+	// New committed work after the squash: the slot still has something to
+	// contribute, so it must stay an ordinary clean slot.
+	commitIn(run.wt(1), "second.txt", "not landed\n", "later work");
+	const r = step(run, "preview", [1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /state\tclean/);
+	assert.equal(run.slotRow(1).status, "running", "not marked merged");
+});

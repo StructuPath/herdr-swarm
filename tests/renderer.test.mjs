@@ -705,10 +705,10 @@ test("the resume queue hands off to the stale queue instead of dropping it", asy
 	assert.deepEqual(r.phase.slots, [4]);
 });
 
-test("terminal preview states — empty and external_merged included — archive", async () => {
-	// The preview verb already wrote skipped/merged to the manifest for these
-	// two; without them the only route to archiving was a manual re-preview.
-	for (const state of ["merged", "skipped", "failed", "empty", "external_merged"]) {
+test("terminal preview states — empty, external_merged, squash_merged included — archive", async () => {
+	// The preview verb already wrote skipped/merged to the manifest for
+	// these; without them the only route to archiving was a manual re-preview.
+	for (const state of ["merged", "skipped", "failed", "empty", "external_merged", "squash_merged"]) {
 		const r = mkHarvest();
 		r.rows = [
 			{ slot: 1, label: "s1", branch: "b", status: "merged", preview: { state, dirty: 0 } },

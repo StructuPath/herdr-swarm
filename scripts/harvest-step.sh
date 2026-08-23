@@ -306,6 +306,20 @@ swap_base() {
 	printf 'merged\t%s\n' "$new"
 }
 
+# A squash- or cherry-pick-merged slot leaves no ancestry trail, but its
+# CONTENT is already in base: a real merge of tip into base would change
+# nothing. `git merge-tree --write-tree` (git >= 2.38) proves that without
+# touching any worktree — the merged tree equals base's own tree exactly when
+# the slot has nothing left to contribute. Conflicts and older gits exit
+# nonzero here, which callers treat as "not proven": those slots fall through
+# to the normal clean flow and the documented sharp edge still applies.
+squash_merged_into_base() {
+	local tip="$1" base="$2" merged
+	merged="$(git -C "$REPO_ROOT" merge-tree --write-tree "$base" "$tip" 2>/dev/null)" || return 1
+	[ "$(git -C "$REPO_ROOT" rev-parse --verify --quiet "$merged^{tree}" 2>/dev/null)" = \
+		"$(git -C "$REPO_ROOT" rev-parse "$base^{tree}")" ]
+}
+
 require_slot_arg() {
 	case "${1-}" in
 	'' | *[!0-9]*)
@@ -364,6 +378,18 @@ do_preview() {
 		# The user merged this slot themselves — mark merged instead of
 		# re-merging into "Already up to date" (plan: externally-merged detect).
 		printf 'state\texternal_merged\n'
+		manifest_update_slot "$1" '{"status":"merged"}' || return 1
+		_preview_report_idle
+		return 0
+	fi
+	if [ "$n" -eq 0 ] && [ "$tip" != "$FORK_SHA" ] &&
+		squash_merged_into_base "$tip" "$base"; then
+		# The user squash- or cherry-pick-merged this slot themselves: no
+		# ancestry, but a merge would change nothing. Detected, not re-merged —
+		# re-merging a squashed slot is exactly the conflict the sharp edge
+		# used to warn about. Prune still keeps the branch (its ancestry test
+		# cannot see squashes); that remains the conservative call.
+		printf 'state\tsquash_merged\n'
 		manifest_update_slot "$1" '{"status":"merged"}' || return 1
 		_preview_report_idle
 		return 0

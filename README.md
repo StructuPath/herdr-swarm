@@ -305,9 +305,14 @@ printed during dependency install stays on disk until you delete the log.
 
 ## Sharp edges
 
-- **Squash merges are invisible.** A slot you squash-merged yourself still
-  shows as pending and will conflict on re-merge — skip it by hand. Fast-
-  forward and plain external merges *are* auto-detected via ancestry.
+- **Squash merges are detected, but prune still keeps their branches.** A
+  clean slot whose content is already fully contained in base (you squash- or
+  cherry-pick-merged it yourself) is auto-detected via `git merge-tree`
+  containment (git >= 2.38; older gits fall back to the old behavior: skip it
+  by hand) and marked merged instead of conflicting on re-merge. Fast-forward
+  and plain external merges are auto-detected via ancestry. Prune's ancestry
+  test cannot see squashes, so a squash-merged branch is deliberately kept as
+  "unmerged" — delete it by hand once you're sure.
 - **Ignored files are not in commits or discard snapshots.** Every slot or
   detached-harvest worktree removal recursively inventories them and keeps the
   resource by default. Deletion requires the exact one-use preview approval;
