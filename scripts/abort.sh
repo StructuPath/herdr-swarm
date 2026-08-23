@@ -123,7 +123,7 @@ if [ "${HERDR_SWARM_ABORT_PREVIEW:-}" = "yes" ]; then
 				console.log([s.slot,s.branch??"",s.path??""].join("\x1f"));
 		});
 	' | while IFS="$US" read -r pslot pbranch ppath; do
-		[ -n "$pslot" ] && [ -n "$ppath" ] && [ -d "$ppath" ] || continue
+		if [ -z "$pslot" ] || [ -z "$ppath" ] || [ ! -d "$ppath" ]; then continue; fi
 		if verify_slot_ownership "$RUN_ID" "$pbranch" "$ppath" >/dev/null; then
 			pinv="$(slot_ignored_inventory "$REPO_ROOT" "$RUN_ID" "$pslot" "$ppath" "$PREVIEW_BASE-s$pslot")" || exit 1
 			print_cleanup_inventory "$pinv"

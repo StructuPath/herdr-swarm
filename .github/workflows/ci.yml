@@ -9,8 +9,14 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is a supported platform (herdr-plugin.toml) with a BSD
+        # userland and an older /bin/bash — run the full suite there too.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         # v4.2.2
@@ -26,3 +32,14 @@ jobs:
         run: bash -n scripts/*.sh
       - name: Validate plugin manifest
         run: node scripts/check-manifest.mjs
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Shellcheck all scripts
+        # -x follows the lib.sh sourcing; default severity (style) is the bar.
+        run: shellcheck -x scripts/*.sh
