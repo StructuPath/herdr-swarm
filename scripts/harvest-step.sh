@@ -10,7 +10,8 @@
 #
 # Verbs: preview <slot> | commit-wip <slot> | snapshot <slot> |
 #        discard <slot> | skip <slot> | merge <slot> <expected-base-sha> |
-#        resume [complete <slot>] | archive <slot> | abort-merge <slot>
+#        resume [complete <slot>] | archive <slot> | abort-merge <slot> |
+#        publish <slot>
 #
 # Output protocol: machine-readable "key<TAB>value…" lines on stdout, human
 # messages on stderr, typed exit codes (HS_EC_*) so the renderer branches on
@@ -26,6 +27,8 @@
 #                                     guard)
 #   HERDR_SWARM_CLEANUP_APPROVAL      archive: exact one-use JSON approval
 #                                     emitted by the ignored inventory preview
+#   HERDR_SWARM_PUBLISH_REMOTE        publish: remote to push the slot branch
+#                                     to (default: origin)
 #   HERDR_SWARM_HARVEST_WT_NO_HOOKS=1 disable repo hooks in the plugin-owned
 #                                     harvest worktree ONLY (hook-policy KTD:
 #                                     fresh worktrees lack node_modules, so
@@ -679,6 +682,49 @@ do_resume() {
 	return 0
 }
 
+# do_publish: PR-based harvest — hand the slot's committed work to the forge
+# instead of merging locally. A plain same-name push of the slot branch to the
+# configured remote, NEVER --force: a rejected non-fast-forward means the
+# remote branch moved under someone else's hands, which needs a human, not a
+# flag. Publish mutates no local ref and touches no worktree, so it composes
+# with the rest of the flow: once the forge merge lands and base is updated,
+# the next preview detects it (ancestry for merge commits, tree containment
+# for squashes) and the slot proceeds to archive as usual — no new terminal
+# state exists on purpose.
+do_publish() {
+	read_slot "$1" || return $?
+	local remote="${HERDR_SWARM_PUBLISH_REMOTE:-origin}" tip out patch
+	if ! git -C "$REPO_ROOT" remote get-url "$remote" >/dev/null 2>&1; then
+		echo "herdr-swarm: remote '$remote' is not configured in this repository — add it, or point HERDR_SWARM_PUBLISH_REMOTE at the remote to publish to." >&2
+		return "$HS_EC_REFUSED"
+	fi
+	tip="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$SLOT_BRANCH")" || {
+		echo "herdr-swarm: slot $1 has no branch to publish." >&2
+		return "$HS_EC_REFUSED"
+	}
+	if [ "$tip" = "$FORK_SHA" ]; then
+		echo "herdr-swarm: slot $1 has no commits past the fork point — nothing to publish." >&2
+		return "$HS_EC_REFUSED"
+	fi
+	# Uncommitted work never travels; say so rather than silently publishing
+	# half a slot (commit-WIP first to include it).
+	if [ -n "$SLOT_PATH" ] && [ -d "$SLOT_PATH" ] &&
+		[ -n "$(git -C "$SLOT_PATH" status --porcelain 2>/dev/null)" ]; then
+		echo "herdr-swarm: note — slot $1 has uncommitted work; only committed work is published. Commit-WIP first to include it." >&2
+	fi
+	if ! out="$(git -C "$REPO_ROOT" push "$remote" "refs/heads/$SLOT_BRANCH:refs/heads/$SLOT_BRANCH" 2>&1)"; then
+		printf '%s\n' "$out" >&2
+		echo "herdr-swarm: publish of slot $1 to '$remote' was rejected — nothing was force-pushed; resolve the refusal above and retry." >&2
+		return "$HS_EC_REFUSED"
+	fi
+	patch="$(node -e '
+		const [remote, sha] = process.argv.slice(1);
+		process.stdout.write(JSON.stringify({ published: { remote, sha } }));
+	' "$remote" "$tip")" || return 1
+	manifest_update_slot "$1" "$patch" || return 1
+	printf 'published\t%s\t%s\t%s\n' "$1" "$remote" "$tip"
+}
+
 do_archive() {
 	read_slot "$1" || return $?
 	case "$SLOT_STATUS" in
@@ -908,6 +954,10 @@ archive)
 abort-merge)
 	require_slot_arg "${1-}" || exit 1
 	do_abort_merge "$1"
+	;;
+publish)
+	require_slot_arg "${1-}" || exit 1
+	do_publish "$1"
 	;;
 *)
 	echo "herdr-swarm: unknown harvest verb '$VERB'" >&2

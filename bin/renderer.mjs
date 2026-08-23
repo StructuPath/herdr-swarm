@@ -665,13 +665,22 @@ export function renderHarvest(model, cols = 80) {
 			for (const f of ph.files ?? []) lines.push(`   ${sanitizeText(f)}`);
 			lines.push(`${ESC}[2m [y]archive anyway  [n]keep the worktree${ESC}[0m`);
 			break;
+		case "publish-pick":
+			lines.push(
+				` PUBLISH: push which slot's branch to the remote (plain push, never force)?`,
+			);
+			lines.push(
+				` The forge merge is auto-detected on a later re-preview once base updates.`,
+			);
+			lines.push(`${ESC}[2m [1-9]slot  [Esc]cancel${ESC}[0m`);
+			break;
 		default: {
 			// Any row still carrying a journal wedges every merge (sequencer_scan
 			// / the merge verb's own refusal), so the escape hatch has to be
 			// reachable from the resting phase — not only from conflict.
 			const j = (model.rows ?? []).find((r) => r.journal);
 			lines.push(
-				`${ESC}[2m 1-9:select slot (merge/prompt)  r:re-preview${
+				`${ESC}[2m 1-9:select slot (merge/prompt)  p:publish to remote  r:re-preview${
 					j ? `  a:abort stale merge (slot ${j.slot})` : ""
 				}  q:quit${ESC}[0m`,
 			);
@@ -1108,6 +1117,28 @@ export class HarvestRenderer {
 					this.paint();
 				}
 				break;
+			case "publish-pick":
+				if (ch >= "1" && ch <= "9") {
+					const slot = Number(ch);
+					this.phase = { name: "list" };
+					if (!this.rows.find((r) => r.slot === slot)) {
+						this.banner = `no slot ${slot} in this run`;
+						this.paint();
+						break;
+					}
+					const r = await this.step("publish", [slot]);
+					if (r.code === 0) {
+						const [, remote, sha] = r.out.published?.[0] ?? [];
+						this.banner = `slot ${slot} published to ${remote ?? "remote"} (${String(sha ?? "").slice(0, 10)})`;
+					} else {
+						this.banner = this.lastErrLine(r);
+					}
+					await this.reload();
+				} else if (ch === "b" || ch === "\x1b") {
+					this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
 			case "ignored":
 				if (ch === "y" || ch === "Y") {
 					const slot = ph.slot;
@@ -1128,7 +1159,10 @@ export class HarvestRenderer {
 				break;
 			default:
 				if (ch >= "1" && ch <= "9") await this.selectSlot(Number(ch));
-				else if (ch === "r") {
+				else if (ch === "p") {
+					this.phase = { name: "publish-pick" };
+					this.paint();
+				} else if (ch === "r") {
 					this.banner = "";
 					await this.reload();
 				} else if (ch === "a") {

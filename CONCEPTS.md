@@ -54,6 +54,13 @@ at a time, with the user choosing order. Distinct from anything automatic:
 nothing merges without an explicit per-Slot decision, and the base ref is
 re-checked for drift before every merge rather than once per session.
 
+### Publish
+The PR-based alternative to a local merge: pushing a Slot's branch to a
+configured remote (plain push, never force) so review and merge happen on the
+forge. Publish deliberately introduces no new terminal state — once the forge
+merge lands and base updates, the ordinary preview detection (ancestry or
+squash containment) settles the Slot.
+
 ### Locus
 Where a merge physically executes. Two cases, and the distinction is
 load-bearing: when the base branch is not checked out anywhere, the merge runs

@@ -757,3 +757,30 @@ test("agent-supplied state text cannot smuggle escapes into any rendered view", 
 	assert.ok(!resume.includes("\x1b]"), `escape survived the resume view:\n${resume}`);
 	assert.ok(!resume.includes("\x07"));
 });
+
+test("publish flow: p opens the picker, a digit routes through step('publish'), Esc cancels", async () => {
+	const r = mkHarvest();
+	r.rows = [{ slot: 1, label: "s1", branch: "b", status: "running", preview: { state: "clean", dirty: 0 } }];
+	await r.onKey("p");
+	assert.equal(r.phase.name, "publish-pick");
+	await r.onKey("1");
+	assert.deepEqual(r.calls, [["publish", 1]], "routed through step(), not raw git");
+	assert.equal(r.phase.name, "list");
+	// Esc cancels without a verb.
+	await r.onKey("p");
+	await r.onKey("\x1b");
+	assert.equal(r.phase.name, "list");
+	assert.deepEqual(r.calls, [["publish", 1]], "cancel runs nothing");
+	// A digit with no matching slot runs nothing and says so.
+	await r.onKey("p");
+	await r.onKey("7");
+	assert.deepEqual(r.calls, [["publish", 1]]);
+	assert.match(r.banner, /no slot 7/);
+});
+
+test("publish-pick phase renders its prompt and the list footer advertises p", () => {
+	const model = { runInfo: { run_id: "r1", base_ref: "refs/heads/main" }, rows: [], phase: { name: "publish-pick" } };
+	assert.match(renderHarvest(model, 100), /PUBLISH: push which slot/);
+	const list = renderHarvest({ ...model, phase: { name: "list" } }, 120);
+	assert.match(list, /p:publish to remote/);
+});

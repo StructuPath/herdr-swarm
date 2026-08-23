@@ -7,6 +7,14 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+### Added
+- **PR-based harvest**: the new `publish` verb (`harvest-step.sh publish
+  <slot>`, or `p` + slot digit in the harvest pane) pushes a slot's branch
+  to a remote (default `origin`, `HERDR_SWARM_PUBLISH_REMOTE` to override)
+  so review and merge happen on the forge — plain push, never `--force`.
+  The forge merge is auto-detected by the next re-preview via the existing
+  ancestry/squash-containment checks, so no new terminal state exists.
+
 ## [0.2.0] — 2026-08-23
 
 ### Added
