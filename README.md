@@ -89,6 +89,14 @@ add your own, see below):
      branch-name confirmation; a snapshot ref is written first).
    - *Conflict or hook failure* — classified distinctly; `s` shells into the
      merge tree, `a` aborts the merge (`git merge --abort`), `b` backs out.
+   - *Publish (PR-based harvest)* — `p` then a slot digit pushes that slot's
+     branch to a remote (default `origin`, override with
+     `HERDR_SWARM_PUBLISH_REMOTE`) instead of merging locally — plain push,
+     never `--force`; a non-fast-forward rejection is surfaced, not overridden.
+     Open the pull request on your forge as usual; once its merge lands and
+     base updates, the next re-preview auto-detects it (ancestry for merge
+     commits, tree containment for squashes) and the slot proceeds to archive.
+     Scriptable as `harvest-step.sh publish <slot>`.
    - *Archive* — after merge/skip, the worktree is removed (branch kept).
      Recursive ignored-file inventory is byte-safe and requires the exact
      digest-bound, one-use approval before ignored data can be removed. The
