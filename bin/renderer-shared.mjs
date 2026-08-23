@@ -81,10 +81,14 @@ export function reconcileSlots(manifestSlots, agents, gitFacts) {
 		} else if (row.status === "running") {
 			// Match by terminal_id first (stable across pane moves), pane_id as
 			// the fallback for rows recorded before the terminal id was known.
-			const live = (agents || []).find(
-				(a) =>
-					(row.terminal_id && a.terminal_id === row.terminal_id) ||
-					(row.pane_id && a.pane_id === row.pane_id),
+			// Pane matching is ONLY for rows recorded before the terminal id was
+			// known: with a terminal id present, an OR would let whatever agent
+			// now occupies the pane shadow (or stand in for) the slot's own
+			// agent, showing another agent's state on this row.
+			const live = (agents || []).find((a) =>
+				row.terminal_id
+					? a.terminal_id === row.terminal_id
+					: row.pane_id && a.pane_id === row.pane_id,
 			);
 			state = live ? String(live.agent_status || "unknown") : "unknown";
 		} else {

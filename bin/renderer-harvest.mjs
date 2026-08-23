@@ -490,9 +490,22 @@ export class HarvestRenderer {
 	}
 
 	async onKey(ch) {
-		// busy: a destructive verb is in flight — every key (including ^C, see
-		// run()'s SIGINT handler) is masked until it returns.
-		if (this.busy) return;
+		// busy masks per-verb; keyInFlight masks the whole handler. Several
+		// handlers run MORE than one verb with awaits between them (merge →
+		// archive → reload; snapshot → discard → reload), and run() dispatches
+		// each stdin chunk as its own async task — without an operation-level
+		// guard a key landing between two verbs would interleave two handlers
+		// mutating phase/rows/banner.
+		if (this.busy || this.keyInFlight) return;
+		this.keyInFlight = true;
+		try {
+			await this.handleKey(ch);
+		} finally {
+			this.keyInFlight = false;
+		}
+	}
+
+	async handleKey(ch) {
 		const ph = this.phase;
 		if (ph.name === "discard") {
 			// Line-input mode for the typed confirmation.

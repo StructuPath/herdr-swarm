@@ -319,7 +319,7 @@ export class Renderer {
 			this.paint();
 		});
 		while (true) {
-			const before = JSON.stringify([this.rows, this.banner]);
+			const before = JSON.stringify([this.rows, this.banner, this.runInfo]);
 			try {
 				await this.tick();
 			} catch {
@@ -327,7 +327,7 @@ export class Renderer {
 				this.banner = "status poll failed — retrying";
 				this.paint();
 			}
-			const after = JSON.stringify([this.rows, this.banner]);
+			const after = JSON.stringify([this.rows, this.banner, this.runInfo]);
 			this.idleTicks = after === before ? this.idleTicks + 1 : 0;
 			await new Promise((r) =>
 				setTimeout(r, pollDelay(this.intervalMs, this.idleTicks)),

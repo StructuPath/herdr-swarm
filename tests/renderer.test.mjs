@@ -81,6 +81,29 @@ test("reconcile: running slot whose agent vanished renders unknown, never stuck 
 	assert.equal(rows[0].state, "unknown");
 });
 
+test("reconcile: an imposter agent in the slot's pane never shadows the recorded terminal", () => {
+	// The slot's own agent is gone; a DIFFERENT agent now occupies its pane.
+	// With a terminal id recorded, the row must go unknown — not display the
+	// imposter's state as if it were the slot's.
+	const [, running] = slots();
+	const rows = reconcileSlots(
+		[running],
+		[liveAgent({ terminal_id: "term_imposter", agent_status: "working" })],
+		{ 2: {} },
+	);
+	assert.equal(rows[0].state, "unknown");
+});
+
+test("reconcile: a legacy row with no terminal id still matches its agent by pane", () => {
+	const [, running] = slots();
+	const rows = reconcileSlots(
+		[{ ...running, terminal_id: null }],
+		[liveAgent({ agent_status: "idle" })],
+		{ 2: {} },
+	);
+	assert.equal(rows[0].state, "idle");
+});
+
 test("reconcile: unqueryable agent list (null) renders unknown, never the manifest's raw running", () => {
 	const [, running] = slots();
 	const rows = reconcileSlots([running], null, { 2: {} });
