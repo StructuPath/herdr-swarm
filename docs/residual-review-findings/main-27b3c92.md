@@ -95,7 +95,11 @@ defect: the README's setup-hook section should warn against echoing secrets.
 Residuals 1 (scripted fan-out), 2 (slot ownership assertion), and 3
 (repo-keyed lock/generation resolution) were closed by the wave0 safety work.
 Residual 5 is addressed as a README warning next to the setup-hook docs.
-Residual 4 (renderer split) remains deliberately deferred.
+Residual 4 (renderer split) was closed on 2026-08-23: harvest mode grew twice
+in one release (squash detection, publish), which was the deferral's stated
+revisit trigger — bin/renderer.mjs is now the mode-dispatch/re-export
+entrypoint over renderer-shared.mjs, renderer-status.mjs, and
+renderer-harvest.mjs.
 
 Of the recorded testing gaps: hostile-manifest fixtures, the two-workspace
 fixture, and the post-confirm clean-tree re-check landed with wave0; the
