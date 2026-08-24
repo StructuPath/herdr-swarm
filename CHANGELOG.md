@@ -7,11 +7,24 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-24
+
 ### Changed
 - `bin/renderer.mjs` is now a thin mode-dispatch/re-export entrypoint over
   three modules split along the seam the test files already used:
   `renderer-shared.mjs` (pure helpers), `renderer-status.mjs`, and
-  `renderer-harvest.mjs`. No behavior change; import paths are unchanged.
+  `renderer-harvest.mjs`. Import paths are unchanged.
+
+### Fixed
+- Status pane: a slot row with a recorded terminal id can no longer display
+  the state of a different agent that happens to occupy its pane; the pane
+  fallback now applies only to rows recorded before their terminal id was
+  known.
+- Harvest pane: input masking now spans a whole key handler rather than one
+  verb, so a key landing between the verbs of a multi-step operation
+  (merge→archive→reload, snapshot→discard) can no longer interleave two
+  state-machine mutations.
+- Status pane: metadata-only manifest changes now reset the poll backoff.
 
 ### Added
 - **PR-based harvest**: the new `publish` verb (`harvest-step.sh publish
