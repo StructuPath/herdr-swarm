@@ -16,7 +16,7 @@ export const repoRoot = path.resolve(
 // Scripts under test make real commits (WIP, snapshot, merge, revert); the
 // harness env has GIT_CONFIG_GLOBAL=/dev/null, so identity must ride in
 // explicitly or every commit-producing path dies on "unable to auto-detect
-// email". Spread into freshEnv overrides by tests that shell out to git.
+// email". Shared by git() and freshEnv(), including Git children of stubs.
 export const gitIdent = {
 	GIT_AUTHOR_NAME: "hs-test",
 	GIT_AUTHOR_EMAIL: "hs@test.invalid",
@@ -243,6 +243,7 @@ export function createHarness() {
 			// commit signing from ~/.gitconfig would hang a headless run.
 			GIT_CONFIG_GLOBAL: "/dev/null",
 			GIT_CONFIG_SYSTEM: "/dev/null",
+			...gitIdent,
 			STUB_LOG: logFile,
 			HERDR_BIN_PATH: path.join(stubDir, "herdr"),
 			HERDR_PLUGIN_ROOT: repoRoot,

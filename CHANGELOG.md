@@ -8,6 +8,9 @@ Notable changes to the Swarm plugin. Format follows
 ## [Unreleased]
 
 ### Fixed
+- The shared test environment now supplies its fixture Git identity to stub
+  subprocesses too, avoiding hostname-based identity detection during commits
+  and reflog writes when user/system Git configuration is disabled (#11).
 - Harvest now reconciles the completed slot's plugin-reported state before
   automatic archive. On Herdr's pane-backed path, a successful merge could
   previously leave the slot marked working and unnecessarily block cleanup.
