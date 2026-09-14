@@ -1,6 +1,6 @@
 # Swarm readiness
 
-The plugin remains version 0.3.0; fixes on this branch are recorded under
+The plugin targets version 0.4.0; changes on this branch are recorded under
 Unreleased in the changelog. The manifest still requires Herdr >=0.7.4.
 
 ## Repeatable validation
@@ -49,5 +49,6 @@ push, default user session, or production repository was used by the smoke run.
    setup-hook failure currently warns and still starts the agent.
 3. Keep conflict resolution review-first. The resolver-agent document in
    `docs/plans/` describes future work, not a shipped feature.
-4. Treat `publish` as a branch push for forge review, not automatic PR creation
-   or merging. The orchestrator remains responsible for the final review.
+4. Use `publish-pr` for an explicit draft GitHub handoff with SHA-bound supplied
+   evidence, and `pr-status` for a current CI snapshot. Ordinary `publish` still
+   only pushes. The orchestrator remains responsible for the final review.

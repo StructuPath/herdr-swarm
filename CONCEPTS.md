@@ -61,6 +61,19 @@ forge. Publish deliberately introduces no new terminal state — once the forge
 merge lands and base updates, the ordinary preview detection (ancestry or
 squash containment) settles the Slot.
 
+### Draft PR handoff
+An opt-in extension of Publish that creates a draft GitHub pull request for
+the exact repository, slot branch, and recorded base branch, or reuses that
+same PR. Supplied validation is bound to the published commit, not inferred
+from an agent's completion state. Reuse preserves the existing PR body; it
+does not replace earlier evidence or turn a review-ready PR back into a draft.
+
+### CI snapshot
+A read of GitHub's checks for the PR's current head, reported alongside the
+local slot head so callers can identify drift. Empty checks mean not run.
+Passing checks are observations, not approval to merge or proof that all
+required checks exist.
+
 ### Locus
 Where a merge physically executes. Two cases, and the distinction is
 load-bearing: when the base branch is not checked out anywhere, the merge runs

@@ -19,6 +19,13 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- Opt-in `publish-pr <slot>` harvest verb (`g`, then slot in the pane) pushes
+  the audited commit and creates/reuses its exact GitHub draft PR. Existing
+  `publish` remains push-only. Optional SHA-bound validation JSON or Browser
+  QA results contribute only typed check names/statuses to a new draft.
+- `pr-status <slot>` (`c`, then slot) reads PR/CI state with explicit no-checks,
+  unknown, failure, and local/remote head-drift reporting. No automatic merge,
+  force push, or existing PR-body rewrite is performed.
 - `npm run doctor` checks Node, Git, and the selected Herdr binary without
   creating plugin state or contacting a running session; incompatible versions
   include an explicit `HERDR_BIN_PATH` remedy.

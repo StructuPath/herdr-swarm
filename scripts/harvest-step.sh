@@ -11,7 +11,7 @@
 # Verbs: preview <slot> | commit-wip <slot> | snapshot <slot> |
 #        discard <slot> | skip <slot> | merge <slot> <expected-base-sha> |
 #        resume [complete <slot>] | archive <slot> | abort-merge <slot> |
-#        publish <slot>
+#        publish <slot> | publish-pr <slot> | pr-status <slot>
 #
 # Output protocol: machine-readable "key<TAB>value…" lines on stdout, human
 # messages on stderr, typed exit codes (HS_EC_*) so the renderer branches on
@@ -67,6 +67,8 @@ VERB="${1-}"
 	exit 1
 }
 shift
+
+case "$VERB" in publish-pr | pr-status) clear_git_routing_env ;; esac
 
 # --- Run + slot context ------------------------------------------------------
 
@@ -694,6 +696,7 @@ do_resume() {
 do_publish() {
 	read_slot "$1" || return $?
 	local remote="${HERDR_SWARM_PUBLISH_REMOTE:-origin}" tip out patch
+	local expected="${2-}" destination="${3:-${HERDR_SWARM_PUBLISH_REMOTE:-origin}}"
 	if ! git -C "$REPO_ROOT" remote get-url "$remote" >/dev/null 2>&1; then
 		echo "herdr-swarm: remote '$remote' is not configured in this repository — add it, or point HERDR_SWARM_PUBLISH_REMOTE at the remote to publish to." >&2
 		return "$HS_EC_REFUSED"
@@ -705,6 +708,10 @@ do_publish() {
 	if [ "$tip" = "$FORK_SHA" ]; then
 		echo "herdr-swarm: slot $1 has no commits past the fork point — nothing to publish." >&2
 		return "$HS_EC_REFUSED"
+	fi
+	if [ -n "$expected" ] && [ "$tip" != "$expected" ]; then
+		echo "herdr-swarm: slot head moved after PR/evidence preparation — re-run publish-pr." >&2
+		return "$HS_EC_DRIFT"
 	fi
 	# The branch must still contain the recorded fork point: a rewritten slot
 	# branch (reset onto foreign history) would otherwise publish commits this
@@ -727,7 +734,7 @@ do_publish() {
 	if [ -n "${HERDR_SWARM_TEST_PAUSE_BEFORE_PUBLISH:-}" ]; then
 		sleep "$HERDR_SWARM_TEST_PAUSE_BEFORE_PUBLISH"
 	fi
-	if ! out="$(git -C "$REPO_ROOT" push "$remote" "$tip:refs/heads/$SLOT_BRANCH" 2>&1)"; then
+	if ! out="$(git -C "$REPO_ROOT" push "$destination" "$tip:refs/heads/$SLOT_BRANCH" 2>&1)"; then
 		printf '%s\n' "$out" >&2
 		echo "herdr-swarm: publish of slot $1 to '$remote' was rejected — nothing was force-pushed; resolve the refusal above and retry." >&2
 		return "$HS_EC_REFUSED"
@@ -738,6 +745,21 @@ do_publish() {
 	' "$remote" "$tip")" || return 1
 	manifest_update_slot "$1" "$patch" || return 1
 	printf 'published\t%s\t%s\t%s\n' "$1" "$remote" "$tip"
+}
+
+do_publish_pr() {
+	read_slot "$1" || return $?
+	local plan expected destination
+	plan="$(node "$PLUGIN_ROOT/scripts/pr-handoff.mjs" prepare "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_BRANCH" "$BASE_BRANCH" "$FORK_SHA")" || return "$HS_EC_REFUSED"
+	expected="$(printf '%s' "$plan" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).sha));')" || return 1
+	destination="$(printf '%s' "$plan" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).push_url));')" || return 1
+	do_publish "$1" "$expected" "$destination" || return $?
+	printf '%s' "$plan" | node "$PLUGIN_ROOT/scripts/pr-handoff.mjs" handoff
+}
+
+do_pr_status() {
+	read_slot "$1" || return $?
+	node "$PLUGIN_ROOT/scripts/pr-handoff.mjs" status "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_BRANCH" "$BASE_BRANCH" "$FORK_SHA"
 }
 
 do_archive() {
@@ -974,6 +996,14 @@ abort-merge)
 publish)
 	require_slot_arg "${1-}" || exit 1
 	do_publish "$1"
+	;;
+publish-pr)
+	require_slot_arg "${1-}" || exit 1
+	do_publish_pr "$1"
+	;;
+pr-status)
+	require_slot_arg "${1-}" || exit 1
+	do_pr_status "$1"
 	;;
 *)
 	echo "herdr-swarm: unknown harvest verb '$VERB'" >&2
