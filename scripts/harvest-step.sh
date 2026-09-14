@@ -755,7 +755,8 @@ do_archive() {
 		;;
 	esac
 	# Settled check: spike (a) — the herdr remove verb silently KILLS a live
-	# agent, so archiving is allowed only when the agent is absent or idle.
+	# agent, so archiving is allowed only when absent or settled. Herdr 0.8.2
+	# reports unseen background idle agents as done (same underlying state).
 	local agents st
 	# shellcheck disable=SC2119  # wrapper takes optional args; none needed here
 	agents="$(herdr_agent_list 2>/dev/null || true)"
@@ -771,7 +772,7 @@ do_archive() {
 		});
 	' "$SLOT_TERMINAL" "$SLOT_PANE")"
 	case "$st" in
-	absent | idle) ;;
+	absent | idle | done) ;;
 	*)
 		echo "herdr-swarm: slot $1 agent is '$st' — archiving would kill it (worktree removal stops live agents, spike (a)); wait for idle or stop it first." >&2
 		return "$HS_EC_REFUSED"
