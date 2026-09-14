@@ -1530,6 +1530,36 @@ test("HarvestRenderer against a real run: preview, drift re-preview + re-baselin
 	);
 });
 
+test("renderer reconciles pane-backed working state before automatic archive", async () => {
+	const run = mkRun();
+	run.env.STUB_HERDR_VERSION = "0.7.5";
+	commitIn(run.wt(1), "completed.txt");
+	// Mirror the captured agent-list shape, with the plugin's report acting
+	// as the state source exactly as on the pane-backed Herdr path.
+	h.writeStub("herdr", `
+echo "herdr $@" >> "$STUB_LOG"
+if [ "$1" = "--version" ]; then echo 'herdr 0.7.5'; exit 0; fi
+if [ "$1 $2" = 'agent list' ]; then
+  state=working
+  if grep -q 'pane report-agent w11:p1 .*--state idle' "$STUB_LOG"; then state=idle; fi
+  printf '{"result":{"agents":[{"pane_id":"w11:p1","terminal_id":"term_s1","agent_status":"%s"}]}}\\n' "$state"
+  exit 0
+fi
+if [ "$1 $2" = 'pane list' ]; then echo '{"result":{"panes":[]}}'; exit 0; fi
+exit 0
+`);
+	try {
+		const r = new HarvestRenderer(run.env);
+		r.write = () => {};
+		await r.refresh();
+		await r.doMerge(1);
+		assert.equal(run.slotRow(1).status, "archived", r.banner);
+		assert.equal(fs.existsSync(run.wt(1)), false);
+	} finally {
+		h.writeHerdrStub();
+	}
+});
+
 test("selectSlot routes a user-tree locus through the confirm phase; 'y' merges, anything else cancels", async () => {
 	h.writeHerdrStub();
 	const run = mkRun();
@@ -1686,39 +1716,41 @@ test("resume scan reports a stale journal (crash before any merge commit) and cl
 	);
 });
 
-test("archive proceeds on an IDLE agent: the herdr verb stops it and the slot archives", () => {
-	// A live agent matching this slot's terminal id, but idle: unlike
-	// 'working' (refused above), idle is safe — the herdr remove verb stops
-	// the idle agent, closes the grouped workspace, and removes the worktree.
-	h.writeStub(
-		"herdr",
-		`echo "herdr $@" >> "$STUB_LOG"
-if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
-  echo '{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"idle","pane_id":"w11:p1","terminal_id":"term_s1","workspace_id":"w11"}],"type":"agent_list"}}'
-  exit 0
-fi
-exit 0`,
-	);
-	const run = mkRun({ status: "merged" });
-	const r = step(run, "archive", [1]);
-	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
-	assert.match(h.log(), /herdr worktree remove --workspace w11 --json/);
-	assert.doesNotMatch(h.log(), /--force/);
-	assert.equal(run.slotRow(1).status, "archived");
-	assert.ok(!fs.existsSync(run.wt(1)), "worktree gone (git reconcile path)");
-	assert.equal(
-		spawnSync("git", [
-			"-C",
-			run.repo,
-			"rev-parse",
-			"--verify",
-			`refs/heads/${run.branch(1)}`,
-		]).status,
-		0,
-		"branch kept — archive never deletes branches",
-	);
-	h.writeHerdrStub(); // restore the default stub for later tests
-});
+for (const settledState of ["idle", "done"]) {
+	test(`archive proceeds on ${settledState} agents: the slot archives and branch survives`, () => {
+		// A live agent matching this slot's terminal id, but idle: unlike
+		// 'working' (refused above), idle is safe — the herdr remove verb stops
+		// the idle agent, closes the grouped workspace, and removes the worktree.
+		h.writeStub(
+			"herdr",
+			`echo "herdr $@" >> "$STUB_LOG"
+	if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
+	  echo '{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"${settledState}","pane_id":"w11:p1","terminal_id":"term_s1","workspace_id":"w11"}],"type":"agent_list"}}'
+	  exit 0
+	fi
+	exit 0`,
+		);
+		const run = mkRun({ status: "merged" });
+		const r = step(run, "archive", [1]);
+		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+		assert.match(h.log(), /herdr worktree remove --workspace w11 --json/);
+		assert.doesNotMatch(h.log(), /--force/);
+		assert.equal(run.slotRow(1).status, "archived");
+		assert.ok(!fs.existsSync(run.wt(1)), "worktree gone (git reconcile path)");
+		assert.equal(
+			spawnSync("git", [
+				"-C",
+				run.repo,
+				"rev-parse",
+				"--verify",
+				`refs/heads/${run.branch(1)}`,
+			]).status,
+			0,
+			"branch kept — archive never deletes branches",
+		);
+		h.writeHerdrStub(); // restore the default stub for later tests
+	});
+}
 
 // ---- Squash-merge detection (deferred follow-up, now shipped) ---------------
 // A squash-merged slot has no ancestry trail, so the external_merged check

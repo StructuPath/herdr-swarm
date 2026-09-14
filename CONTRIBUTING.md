@@ -9,14 +9,21 @@ rules below exist to keep destructive paths guarded.
 ```sh
 git clone https://github.com/StructuPath/herdr-swarm
 herdr plugin link ./herdr-swarm   # disk edits stay live
-npm test
+npm run validate
 ```
 
-There is no build step and there are no npm dependencies. `npm test` runs
-`node --test` over `tests/`; CI additionally runs `bash -n scripts/*.sh`,
+There is no compiled output and there are no npm dependencies. `npm run build`
+checks the manifest and parses every shell script and Node module separately.
+`npm run doctor` checks local runtime prerequisites without contacting a session.
+`npm run validate` runs build checks, ShellCheck, and the tests. `npm test` runs
+`node --test` over `tests/`; CI additionally runs a shell syntax command,
 `shellcheck -x scripts/*.sh` (default severity — the tree is fully clean;
 keep it that way), and `node scripts/check-manifest.mjs`, on both Linux and
 macOS.
+
+For manual syntax checks, use `for script in scripts/*.sh; do bash -n "$script" || exit 1; done`.
+Passing the glob directly to `bash -n` only checks the first script; later paths
+become its arguments. The build command avoids this gap and checks Node syntax too.
 
 ## Test conventions
 

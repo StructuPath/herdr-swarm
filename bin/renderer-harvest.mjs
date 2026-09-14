@@ -363,7 +363,12 @@ export class HarvestRenderer {
 		const r = await this.step("merge", [slot, row.preview.baseSha]);
 		if (r.code === 0) {
 			this.banner = `slot ${slot} merged`;
-			await this.doArchive(slot);
+			// Pane-backed slots retain their plugin-reported working state until
+			// a terminal-state preview reconciles it. Refresh before archive so
+			// its unchanged settled-agent guard sees the completed harvest.
+			const settled = await this.step("preview", [slot]);
+			if (settled.code === 0) await this.doArchive(slot);
+			else this.banner = `slot ${slot} merged; ${this.lastErrLine(settled)}`;
 			// Re-baseline: every remaining preview must diff and merge against
 			// the NEW base SHA (R7: drift re-checked before every merge).
 			await this.reload();

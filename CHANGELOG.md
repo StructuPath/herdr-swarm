@@ -7,6 +7,26 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- Harvest now reconciles the completed slot's plugin-reported state before
+  automatic archive. On Herdr's pane-backed path, a successful merge could
+  previously leave the slot marked working and unnecessarily block cleanup.
+  Archive still verifies agent state and worktree contents before removal.
+- Archive recognizes Herdr 0.8.2's `done` state (an unseen background idle
+  agent) as settled, instead of refusing cleanup until its tab is focused.
+
+### Added
+- `npm run doctor` checks Node, Git, and the selected Herdr binary without
+  creating plugin state or contacting a running session; incompatible versions
+  include an explicit `HERDR_BIN_PATH` remedy.
+- `npm run build` checks the manifest and every shell/Node source individually;
+  `npm run validate` combines these checks with ShellCheck and the test suite.
+  This avoids the first-file-only behavior of `bash -n scripts/*.sh`.
+
+### Documented
+- The suite website is the canonical Swarm guide, and installation diagnostics
+  now distinguish prerequisite checks from live workflow verification.
+
 ## [0.3.0] — 2026-08-24
 
 ### Changed

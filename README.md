@@ -9,7 +9,7 @@ at a time. Agents commit locally and never push; the orchestrator merges.
 
 ![herdr-swarm demo: fan out 3 agents, harvest the winner](assets/herdr-swarm-demo.gif)
 
-**Docs:** the [StructuPath Herdr Plugins wiki](https://github.com/StructuPath/herdr-browser/wiki)
+**Docs:** the [StructuPath Herdr Suite guide](https://herdr.structupath.ai/docs/swarm/)
 is the practical guide to this plugin and its three siblings (Browser, Guard,
 Conductor).
 
@@ -27,8 +27,9 @@ Conductor).
     `working` when the slot starts, `idle` once a harvest preview finds the
     slot finished. Nothing polls in between, so a 0.7.5 slot that finishes on
     its own still reads `working` until you open harvest. This is cosmetic:
-    committed work is harvestable regardless, and nothing in the plugin gates
-    on agent state.
+    committed work is mergeable regardless. Archive separately requires a
+    settled agent (`idle`, `done`, or absent) before removing its worktree;
+    harvest refreshes the completed slot's reported state before auto-archive.
   - On **0.7.5+**, `pane run` hands the slot's argv to the pane's **shell**,
     not to `exec` — a preset containing shell metacharacters is interpreted
     there, unlike on 0.7.4. Presets are your own config, but keep them to a
@@ -56,6 +57,23 @@ git clone https://github.com/StructuPath/herdr-swarm
 herdr plugin link ./herdr-swarm
 npm test
 ```
+
+Check the installation before starting agents with `npm run doctor`. It probes
+Node, Git, and the selected Herdr binary without opening a session or writing
+plugin state. If multiple Herdr installations are present, use
+`HERDR_BIN_PATH=/absolute/path/to/herdr npm run doctor` and pass that same
+override to plugin scripts. A successful version check is not a live workflow
+test; newer-than-tested versions still warn. Confirm that the selected preset's
+agent command is installed and authenticated separately.
+
+Maintainers can run `npm run validate` for manifest/version checks, syntax checks
+of **every** shell script and Node module, ShellCheck, and the real-git test
+suite. ShellCheck must be installed separately. `npm run build` runs just the
+manifest and syntax checks; this interpreted plugin has no compiled output or
+npm dependencies.
+
+See [readiness and live workflow evidence](docs/readiness.md) for the tested
+scope and prioritized follow-up work.
 
 ## Quick start
 
@@ -341,8 +359,7 @@ want a truly clean slate. Plugin logs:
 
 ## Publishing
 
-Public and marketplace-listed: the repo carries the `herdr-plugin` topic, so it
-auto-lists on the Herdr marketplace. Install with `herdr plugin install
+Install from the public repository with `herdr plugin install
 StructuPath/herdr-swarm`, or `herdr plugin link` a local clone for dev (disk edits
 stay live).
 

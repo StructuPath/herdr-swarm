@@ -5,6 +5,10 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
+    "build": "node scripts/check-manifest.mjs && node scripts/check-source.mjs",
+    "doctor": "bash scripts/doctor.sh",
+    "lint": "shellcheck -x scripts/*.sh",
+    "validate": "npm run build && npm run lint && npm test",
     "test": "node --test"
   }
 }
