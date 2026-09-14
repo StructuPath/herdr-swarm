@@ -1549,6 +1549,8 @@ if [ "$1 $2" = 'pane list' ]; then echo '{"result":{"panes":[]}}'; exit 0; fi
 exit 0
 `);
 	try {
+		const observed = h.runLib("herdr_agent_list", run.env);
+		assert.equal(JSON.parse(observed.stdout).result.agents[0].agent_status, "working");
 		const r = new HarvestRenderer(run.env);
 		r.write = () => {};
 		await r.refresh();
