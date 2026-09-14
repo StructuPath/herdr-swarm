@@ -124,6 +124,11 @@ require_herdr() {
 	fi
 }
 
+# Diagnostics use the same binary selection as every runtime wrapper.
+herdr_binary_path() {
+	command -v "$HERDR" || printf '%s\n' "$HERDR"
+}
+
 # Portable timeout (macOS lacks GNU timeout): poll the child and SIGKILL it
 # after SECONDS (exit 137). Done in-shell (no background watchdog) so a dying
 # script can never orphan a sleep that holds the caller's stdout pipe open.

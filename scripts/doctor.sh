@@ -17,7 +17,7 @@ else
 	failed=1
 fi
 
-if git_version="$(git --version 2>/dev/null)"; then
+if git_version="$(git -C "$(dirname "$0")" --version 2>/dev/null)"; then
 	printf 'OK %s\n' "$git_version"
 	if ! version_ge "${git_version#git version }" 2.38; then
 		echo 'WARN Git >=2.38 is recommended for squash-merge detection.' >&2
@@ -27,7 +27,7 @@ else
 	failed=1
 fi
 
-printf 'Herdr binary: %s\n' "$(command -v "$HERDR" || printf '%s' "$HERDR")"
+printf 'Herdr binary: %s\n' "$(herdr_binary_path)"
 if version_gate gated; then
 	echo "OK Herdr fan-out version requirement (>=0.7.4; newest tested $HERDR_SWARM_MAX_TESTED)."
 else
