@@ -129,6 +129,20 @@ herdr_binary_path() {
 	command -v "$HERDR" || printf '%s\n' "$HERDR"
 }
 
+# New forge handoffs must resolve the named worktree, not inherited Git
+# routing/config injection. Keep identity, credential, and user config settings.
+clear_git_routing_env() {
+	local key
+	for key in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+		GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
+		GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS; do
+		unset "$key"
+	done
+	while IFS= read -r key; do
+		case "$key" in GIT_CONFIG_KEY_* | GIT_CONFIG_VALUE_*) unset "$key" ;; esac
+	done < <(compgen -e)
+}
+
 # Portable timeout (macOS lacks GNU timeout): poll the child and SIGKILL it
 # after SECONDS (exit 137). Done in-shell (no background watchdog) so a dying
 # script can never orphan a sleep that holds the caller's stdout pipe open.

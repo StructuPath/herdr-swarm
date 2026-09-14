@@ -115,6 +115,8 @@ add your own, see below):
      base updates, the next re-preview auto-detects it (ancestry for merge
      commits, tree containment for squashes) and the slot proceeds to archive.
      Scriptable as `harvest-step.sh publish <slot>`.
+     For the optional GitHub draft handoff, use `g` then a slot digit or
+     `publish-pr <slot>`; `c` then a digit reads its current CI status.
    - *Archive* — after merge/skip, the worktree is removed (branch kept).
      Recursive ignored-file inventory is byte-safe and requires the exact
      digest-bound, one-use approval before ignored data can be removed. The
@@ -264,6 +266,33 @@ type = "plugin_action"
 command = "structupath.swarm.fanout"
 description = "swarm fan-out"
 ```
+
+## GitHub draft PR handoff
+
+Swarm 0.4 adds two opt-in harvest verbs and pane shortcuts:
+
+- `bash scripts/harvest-step.sh publish-pr 1` (pane: `g`, then slot) performs
+  the existing audited-commit push, then creates a **draft** GitHub PR or reuses
+  the exact matching PR. `publish` and the `p` shortcut still only push.
+- `bash scripts/harvest-step.sh pr-status 1` (pane: `c`, then slot) reads the
+  PR state and current CI summary; it never merges, pushes, or edits GitHub.
+
+Install and authenticate `gh` first. The selected
+`HERDR_SWARM_PUBLISH_REMOTE` (default `origin`) must have exactly one fetch and
+push URL pointing to the same GitHub.com repository. Fork handoffs and GitHub
+Enterprise hosts are outside this first release. The PR base is the run's
+recorded base branch; the head is the slot's existing `swarm/<run>/<slot>` branch.
+
+Supply `HERDR_SWARM_VALIDATION_FILE=/absolute/path/result.json` to include a
+SHA-bound validation summary. It accepts either the explicit checks format or a
+Browser QA `result.json`. Without it, the draft says validation was **not run**.
+Swarm does not execute validation commands or authenticate supplied evidence.
+PR bodies contain only run/slot identifiers, commit SHAs, and whitelisted check
+names/statuses; task text, logs, screenshots, browser URLs, and local paths are
+not copied.
+
+See [GitHub handoff contract and recovery](docs/github-handoff.md) for the file
+schema, Console integration output, and failure handling.
 
 ## Presets
 

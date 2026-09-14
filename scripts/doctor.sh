@@ -36,5 +36,10 @@ else
 fi
 
 echo 'Agent prerequisites: check your selected preset binaries and authentication before fan-out.'
+if command -v gh >/dev/null 2>&1; then
+	echo 'Optional GitHub handoff: gh is installed; publish-pr/pr-status also require repository access.'
+else
+	echo 'Optional GitHub handoff: install gh for publish-pr/pr-status (ordinary publish does not need it).'
+fi
 echo 'This checks local prerequisites only; it does not exercise a Herdr session or start agents.'
 exit "$failed"

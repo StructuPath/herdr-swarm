@@ -234,6 +234,48 @@ export function createHarness() {
 		fs.chmodSync(p, 0o755);
 	}
 
+	// GitHub CLI fixture uses fields captured from gh pr list/view. Git writes
+	// still run against real local repositories; this only replaces the forge.
+	function writeGithubStub() {
+		const script = path.join(stubDir, "github-stub.mjs");
+		fs.writeFileSync(script, `
+import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.STUB_LOG, JSON.stringify(["gh", ...args]) + "\\n");
+const file = process.env.STUB_GITHUB_STATE;
+const data = JSON.parse(fs.readFileSync(file, "utf8"));
+if (data.expectedHost && process.env.GH_HOST !== data.expectedHost) process.exit(1);
+const option = (name) => args[args.indexOf(name) + 1];
+if (args[0] !== "pr") process.exit(1);
+if (args[1] === "list") {
+  if (data.listError) process.exit(1);
+  if (data.advance) {
+    const result = spawnSync("git", ["-C", data.advance.repo, "update-ref", data.advance.ref, data.advance.sha], { encoding: "utf8" });
+    if (result.status !== 0) process.exit(1);
+    delete data.advance;
+    fs.writeFileSync(file, JSON.stringify(data));
+  }
+  process.stdout.write(data.malformed ? "{" : JSON.stringify(data.prs));
+} else if (args[1] === "create") {
+  if (data.createError && !data.createThenError) process.exit(1);
+  data.body = fs.readFileSync(option("--body-file"), "utf8");
+  data.prs.push({ number: 7, url: "https://github.com/" + data.repository + "/pull/7",
+    state: "OPEN", isDraft: args.includes("--draft"), headRefName: data.branch,
+    headRefOid: data.sha, baseRefName: data.base,
+    headRepository: { nameWithOwner: data.repository }, isCrossRepository: false,
+    body: data.body, statusCheckRollup: data.checks ?? [] });
+  fs.writeFileSync(file, JSON.stringify(data));
+  if (data.createThenError) process.exit(1);
+  console.log(data.prs.at(-1).url);
+} else if (args[1] === "view") {
+  if (data.viewError) process.exit(1);
+  console.log(JSON.stringify(data.view ?? data.prs.find(pr => String(pr.number) === args[2])));
+} else process.exit(1);
+`);
+		writeStub("gh", `exec node '${script}' "$@"`);
+	}
+
 	function freshEnv(overrides = {}) {
 		fs.writeFileSync(logFile, "");
 		return {
@@ -340,6 +382,7 @@ exit 0`,
 		stateDir,
 		logFile,
 		writeStub,
+		writeGithubStub,
 		freshEnv,
 		runScript,
 		runLib,

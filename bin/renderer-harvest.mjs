@@ -180,6 +180,13 @@ export function renderHarvest(model, cols = 80) {
 			);
 			lines.push(`${ESC}[2m [1-9]slot  [Esc]cancel${ESC}[0m`);
 			break;
+		case "github-pick":
+			lines.push(ph.operation === "publish-pr"
+				? " GITHUB DRAFT: push a slot and create/reuse its exact matching PR?"
+				: " GITHUB CI: inspect which slot's PR? (read-only)");
+			lines.push(" Validation comes from HERDR_SWARM_VALIDATION_FILE; absent means not run.");
+			lines.push(`${ESC}[2m [1-9]slot  [Esc]cancel${ESC}[0m`);
+			break;
 		default: {
 			// Any row still carrying a journal wedges every merge (sequencer_scan
 			// / the merge verb's own refusal), so the escape hatch has to be
@@ -190,6 +197,7 @@ export function renderHarvest(model, cols = 80) {
 					j ? `  a:abort stale merge (slot ${j.slot})` : ""
 				}  q:quit${ESC}[0m`,
 			);
+			lines.push(`${ESC}[2m g:draft GitHub PR  c:read GitHub CI${ESC}[0m`);
 		}
 	}
 	return lines.join("\n");
@@ -663,6 +671,32 @@ export class HarvestRenderer {
 					this.paint();
 				}
 				break;
+			case "github-pick":
+				if (ch >= "1" && ch <= "9") {
+					const slot = Number(ch);
+					this.phase = { name: "list" };
+					if (!this.rows.some((row) => row.slot === slot)) {
+						this.banner = `no slot ${slot} in this run`;
+						this.paint();
+						break;
+					}
+					const result = await this.step(ph.operation, [slot]);
+					if (result.code !== 0) this.banner = this.lastErrLine(result);
+					else {
+						try {
+							const key = ph.operation === "publish-pr" ? "pull_request" : "ci_status";
+							const value = JSON.parse(result.out[key]?.[0]?.[0]);
+							this.banner = ph.operation === "publish-pr"
+								? `${value.reused ? "reused" : "draft created"}: ${value.url}${value.reused ? " (existing body preserved)" : ""}`
+								: `CI ${value.status}${value.matches_local_head === false ? " (remote head differs from local)" : ""}${value.url ? `: ${value.url}` : ""}`;
+						} catch { this.banner = "GitHub response was malformed; inspect the PR before retrying."; }
+					}
+					this.paint();
+				} else if (ch === "b" || ch === "\x1b") {
+					this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
 			case "ignored":
 				if (ch === "y" || ch === "Y") {
 					const slot = ph.slot;
@@ -685,6 +719,9 @@ export class HarvestRenderer {
 				if (ch >= "1" && ch <= "9") await this.selectSlot(Number(ch));
 				else if (ch === "p") {
 					this.phase = { name: "publish-pick" };
+					this.paint();
+				} else if (ch === "g" || ch === "c") {
+					this.phase = { name: "github-pick", operation: ch === "g" ? "publish-pr" : "pr-status" };
 					this.paint();
 				} else if (ch === "r") {
 					this.banner = "";
