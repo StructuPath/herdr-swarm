@@ -294,6 +294,34 @@ not copied.
 See [GitHub handoff contract and recovery](docs/github-handoff.md) for the file
 schema, Console integration output, and failure handling.
 
+### Strict candidate handoff (opt-in development path)
+
+For a selected **clean** slot HEAD, keep validation, Browser QA, and the
+operator's review in three separate regular files. Validation checks must all
+pass; Browser QA must pass for that same SHA; the review must approve the exact
+run ID, slot, and SHA. Preview the readiness gaps locally before publishing:
+
+```sh
+export HERDR_SWARM_CANDIDATE_VALIDATION_FILE=/absolute/private/checks.json
+export HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE=/absolute/private/browser-qa/result.json
+export HERDR_SWARM_CANDIDATE_REVIEW_FILE=/absolute/private/operator-review.json
+bash scripts/harvest-step.sh candidate-status 1
+# Only after reviewing the selected slot, evidence, and operator decision:
+bash scripts/harvest-step.sh publish-candidate-pr 1
+```
+
+`candidate-status` emits one `candidate_status<TAB>JSON` record and performs no
+push or GitHub call. Save that output for the local Console's read-only
+`candidateStatus` observation if desired; it is not an approval token.
+`publish-candidate-pr` rechecks all three files and the slot HEAD before any
+network effect, then pushes the audited SHA and creates or reuses a draft PR.
+A reused PR retains its existing body, which may describe stale evidence:
+inspect the PR separately. Neither command merges or applies a candidate.
+These files are caller-supplied observations, not authenticated attestations.
+The legacy `publish-pr` / `g` shortcut still accepts optional validation and
+does **not** impose these strict gates. See the
+[strict file schemas and refusal behavior](docs/github-handoff.md#strict-operator-selected-candidate-handoff).
+
 ## Presets
 
 Each slot runs the argv of a named preset. Config file:
