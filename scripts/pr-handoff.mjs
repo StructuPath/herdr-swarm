@@ -27,12 +27,12 @@ function command(binary, args, cwd) {
 	return result.stdout.trim();
 }
 
-function readEvidenceFile(filename) {
+function readEvidenceFile(filename, label = "Evidence") {
 	const limit = 1024 * 1024;
 	const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
 	try {
 		const stat = fs.fstatSync(fd);
-		if (!stat.isFile() || stat.size > limit) refuse("Validation evidence must be a regular JSON file no larger than 1 MiB.");
+		if (!stat.isFile() || stat.size > limit) refuse(`${label} must be a regular JSON file no larger than 1 MiB.`);
 		const bytes = Buffer.alloc(limit + 1);
 		let length = 0;
 		while (length < bytes.length) {
@@ -40,7 +40,7 @@ function readEvidenceFile(filename) {
 			if (read === 0) break;
 			length += read;
 		}
-		if (length > limit) refuse("Validation evidence exceeded 1 MiB while reading.");
+		if (length > limit) refuse(`${label} exceeded 1 MiB while reading.`);
 		return bytes.subarray(0, length).toString("utf8");
 	} finally { fs.closeSync(fd); }
 }
@@ -53,9 +53,7 @@ function githubRepository(url) {
 	return `${match[1]}/${match[2]}`;
 }
 
-export function validationEvidence(filename, sha) {
-	if (!filename) return { source: "none", head_sha: sha, checks: [{ name: "validation", status: "not_run" }] };
-	const value = JSON.parse(readEvidenceFile(filename));
+function parseValidationEvidence(value, sha) {
 	if (value?.kind === "herdr-browser-qa") {
 		const summary = value.summary;
 		if (value.schemaVersion !== 1 || value.git?.commit !== sha || value.git?.dirty !== false || value.git?.changedDuringRun !== false) {
@@ -94,10 +92,142 @@ export function validationEvidence(filename, sha) {
 	return { source: "supplied", head_sha: sha, checks };
 }
 
-function context(args) {
+export function validationEvidence(filename, sha) {
+	if (!filename) return { source: "none", head_sha: sha, checks: [{ name: "validation", status: "not_run" }] };
+	return parseValidationEvidence(JSON.parse(readEvidenceFile(filename, "Validation evidence")), sha);
+}
+
+class CandidateEvidenceError extends Error {
+	constructor(issue, message) {
+		super(message);
+		this.issue = issue;
+	}
+}
+
+function candidateRefuse(issue, message) {
+	throw new CandidateEvidenceError(issue, message);
+}
+
+function candidateValidation(filename, sha) {
+	if (!filename) candidateRefuse("validation_missing", "Candidate handoff requires a validation evidence file.");
+	let value;
+	try { value = JSON.parse(readEvidenceFile(filename, "Candidate validation evidence")); }
+	catch (error) {
+		if (error instanceof CandidateEvidenceError) throw error;
+		candidateRefuse("validation_invalid", `Candidate validation evidence is invalid: ${error.message}`);
+	}
+	if (value?.schema_version !== 1 || !Array.isArray(value.checks)) candidateRefuse("validation_invalid", "Candidate validation evidence must use the typed checks schema.");
+	if (value.head_sha !== sha) candidateRefuse("validation_stale", "Candidate validation evidence does not match the selected slot HEAD.");
+	let evidence;
+	try { evidence = parseValidationEvidence(value, sha); }
+	catch (error) { candidateRefuse("validation_invalid", error.message); }
+	if (evidence.source !== "supplied") candidateRefuse("validation_invalid", "Candidate validation evidence must use the typed checks schema, separately from Browser QA.");
+	if (evidence.checks.some(check => check.status !== "passed")) candidateRefuse("validation_failed", "Every candidate validation check must have passed.");
+	return evidence;
+}
+
+function candidateBrowserQa(filename, sha) {
+	if (!filename) candidateRefuse("browser_qa_missing", "Candidate handoff requires a separate Browser QA evidence file.");
+	let value;
+	try { value = JSON.parse(readEvidenceFile(filename, "Candidate Browser QA evidence")); }
+	catch (error) {
+		if (error instanceof CandidateEvidenceError) throw error;
+		candidateRefuse("browser_qa_invalid", `Candidate Browser QA evidence is invalid: ${error.message}`);
+	}
+	if (value?.schemaVersion !== 1 || value?.kind !== "herdr-browser-qa") candidateRefuse("browser_qa_invalid", "Candidate Browser QA evidence must be a schemaVersion 1 herdr-browser-qa report.");
+	if (value.git?.commit !== sha) candidateRefuse("browser_qa_stale", "Candidate Browser QA evidence does not match the selected slot HEAD.");
+	let evidence;
+	try { evidence = parseValidationEvidence(value, sha); }
+	catch (error) { candidateRefuse("browser_qa_invalid", error.message); }
+	if (evidence.checks.some(check => check.status !== "passed")) candidateRefuse("browser_qa_failed", "Candidate Browser QA must have passed.");
+	return evidence;
+}
+
+function candidateReview(filename, plan) {
+	if (!filename) candidateRefuse("review_missing", "Candidate handoff requires an explicit operator review file.");
+	let value;
+	try { value = JSON.parse(readEvidenceFile(filename, "Candidate operator review")); }
+	catch (error) {
+		if (error instanceof CandidateEvidenceError) throw error;
+		candidateRefuse("review_invalid", `Candidate operator review is invalid: ${error.message}`);
+	}
+	if (value?.schema_version !== 1 || value?.kind !== "herdr-swarm-operator-review" || !["approved", "rejected"].includes(value?.decision)) {
+		candidateRefuse("review_invalid", "Candidate operator review schema is invalid.");
+	}
+	if (value.head_sha !== plan.sha || value.run_id !== plan.run || value.slot !== plan.slot) {
+		candidateRefuse("review_stale", "Candidate operator review does not match the selected run, slot, and HEAD.");
+	}
+	if (value.decision !== "approved") candidateRefuse("review_rejected", "The operator did not approve this candidate handoff.");
+	return { decision: "approved" };
+}
+
+function candidateEvidence(plan) {
+	return {
+		run_id: plan.run,
+		slot: plan.slot,
+		head_sha: plan.sha,
+		validation: candidateValidation(process.env.HERDR_SWARM_CANDIDATE_VALIDATION_FILE, plan.sha),
+		browser_qa: candidateBrowserQa(process.env.HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE, plan.sha),
+		operator_review: candidateReview(process.env.HERDR_SWARM_CANDIDATE_REVIEW_FILE, plan),
+	};
+}
+
+function candidateLocusIssues(plan, slotPath) {
+	if (!slotPath) refuse("Candidate handoff requires the selected slot worktree.");
+	const git = (...values) => command("git", ["-C", slotPath, ...values], plan.root);
+	const issues = [];
+	if (git("rev-parse", "--verify", "HEAD") !== plan.sha) issues.push("slot_head_mismatch");
+	if (git("status", "--porcelain")) issues.push("slot_dirty");
+	return issues;
+}
+
+function candidateStatus(plan, slotPath) {
+	const issues = candidateLocusIssues(plan, slotPath);
+
+	const inspect = (load, prefix) => {
+		try {
+			load();
+			return "passed";
+		} catch (error) {
+			if (!(error instanceof CandidateEvidenceError)) throw error;
+			issues.push(error.issue);
+			return error.issue.slice(prefix.length + 1);
+		}
+	};
+	const validationStatus = inspect(() => candidateValidation(process.env.HERDR_SWARM_CANDIDATE_VALIDATION_FILE, plan.sha), "validation");
+	const browserQaStatus = inspect(() => candidateBrowserQa(process.env.HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE, plan.sha), "browser_qa");
+	let reviewDecision;
+	try {
+		reviewDecision = candidateReview(process.env.HERDR_SWARM_CANDIDATE_REVIEW_FILE, plan).decision;
+	} catch (error) {
+		if (!(error instanceof CandidateEvidenceError)) throw error;
+		issues.push(error.issue);
+		reviewDecision = error.issue === "review_rejected" ? "rejected" : error.issue.slice("review_".length);
+	}
+	return {
+		schema_version: 1,
+		run_id: plan.run,
+		slot: plan.slot,
+		head_sha: plan.sha,
+		ready: issues.length === 0,
+		issues,
+		validation_status: validationStatus,
+		browser_qa_status: browserQaStatus,
+		review_decision: reviewDecision,
+	};
+}
+
+function localContext(args) {
 	const [root, run, slot, branch, base, fork] = args;
 	if (!root || !/^[A-Za-z0-9_-]+$/.test(run) || !/^[0-9]+$/.test(slot) || !branch?.startsWith(`swarm/${run}/`) || !base || !SHA.test(fork)) refuse("Invalid handoff context.");
-	const git = (...values) => command("git", ["-C", root, ...values], root);
+	const sha = command("git", ["-C", root, "rev-parse", "--verify", `refs/heads/${branch}`], root);
+	if (!SHA.test(sha)) refuse("Cannot resolve slot commit.");
+	return { root, run, slot: Number(slot), branch, base, fork, sha };
+}
+
+function context(args) {
+	const plan = localContext(args);
+	const git = (...values) => command("git", ["-C", plan.root, ...values], plan.root);
 	const remote = process.env.HERDR_SWARM_PUBLISH_REMOTE || "origin";
 	if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(remote)) refuse("PR handoff requires a named Git remote.");
 	const push = git("remote", "get-url", "--push", "--all", remote).split("\n");
@@ -105,9 +235,7 @@ function context(args) {
 	if (push.length !== 1 || fetch.length !== 1) refuse("PR handoff requires exactly one fetch and push URL.");
 	const repository = githubRepository(push[0]);
 	if (githubRepository(fetch[0]).toLowerCase() !== repository.toLowerCase()) refuse("Fetch and push remotes must identify the same GitHub repository.");
-	const sha = git("rev-parse", "--verify", `refs/heads/${branch}`);
-	if (!SHA.test(sha)) refuse("Cannot resolve slot commit.");
-	return { root, run, slot: Number(slot), branch, base, fork, sha, remote, repository, push_url: push[0] };
+	return { ...plan, remote, repository, push_url: push[0] };
 }
 
 function gh(plan, args) {
@@ -138,21 +266,41 @@ function matchingPr(plan) {
 }
 
 function body(plan) {
-	return [
+	const lines = [
 		`Swarm slot ${plan.slot} from run \`${plan.run}\`.`, "",
 		`Published commit: \`${plan.sha}\``,
 		`Fork commit: \`${plan.fork}\``, "",
-		"Validation summary (caller-supplied evidence, not an authenticated attestation):", "",
-		...plan.validation.checks.map((check) => `- ${check.name}: **${check.status}**`), "",
-		"No validation commands were run by this handoff. Browser QA observations do not prove the served application was built from this commit.",
-		"Review this draft and CI before deciding whether to merge. No automatic merge is configured.", "",
-	].join("\n");
+	];
+	if (plan.candidate) {
+		lines.push(
+			"Candidate validation (caller-supplied evidence, not an authenticated attestation):", "",
+			...plan.candidate.validation.checks.map((check) => `- ${check.name}: **${check.status}**`), "",
+			"Browser QA (separate caller-supplied evidence):", "",
+			...plan.candidate.browser_qa.checks.map((check) => `- ${check.name}: **${check.status}**`), "",
+			`Operator review decision for this run, slot, and commit: **${plan.candidate.operator_review.decision}**`, "",
+			"No validation or Browser QA commands were run by this handoff. Browser QA observations do not prove the served application was built from this commit.",
+			"QA, Console, and this evidence record have no merge or apply authority. Review this draft and CI before deciding whether to merge. No automatic merge is configured.", "",
+		);
+	} else {
+		lines.push(
+			"Validation summary (caller-supplied evidence, not an authenticated attestation):", "",
+			...plan.validation.checks.map((check) => `- ${check.name}: **${check.status}**`), "",
+			"No validation commands were run by this handoff. Browser QA observations do not prove the served application was built from this commit.",
+			"Review this draft and CI before deciding whether to merge. No automatic merge is configured.", "",
+		);
+	}
+	return lines.join("\n");
 }
 
 function prResult(plan, pr, reused) {
-	return { schema_version: 1, repository: plan.repository, number: pr.number, url: pr.url,
+	const result = { schema_version: 1, repository: plan.repository, number: pr.number, url: pr.url,
 		state: pr.state, draft: pr.isDraft, head_sha: pr.headRefOid, base: plan.base, branch: plan.branch,
 		reused, validation_attached: !reused, validation: plan.validation ?? null };
+	if (plan.candidate) {
+		result.candidate_evidence_attached = !reused;
+		result.candidate = plan.candidate;
+	}
+	return result;
 }
 
 export function ciSummary(checks) {
@@ -173,9 +321,19 @@ export function ciSummary(checks) {
 }
 
 function main(mode, args) {
-	if (mode === "prepare") {
+	if (mode === "candidate-status") {
+		const plan = localContext(args);
+		process.stdout.write(`candidate_status\t${JSON.stringify(candidateStatus(plan, args[6]))}\n`);
+	} else if (mode === "prepare" || mode === "prepare-candidate") {
 		const plan = context(args);
-		plan.validation = validationEvidence(process.env.HERDR_SWARM_VALIDATION_FILE, plan.sha);
+		if (mode === "prepare-candidate") {
+			const locusIssues = candidateLocusIssues(plan, args[6]);
+			if (locusIssues.length) refuse("Candidate handoff requires the selected slot worktree to be clean and at its recorded HEAD.");
+			plan.candidate = candidateEvidence(plan);
+			plan.validation = plan.candidate.validation;
+		} else {
+			plan.validation = validationEvidence(process.env.HERDR_SWARM_VALIDATION_FILE, plan.sha);
+		}
 		const pr = matchingPr(plan);
 		if (pr && pr.state !== "OPEN") refuse("The exact matching PR is closed or merged; inspect it manually before retrying.");
 		process.stdout.write(JSON.stringify(plan));

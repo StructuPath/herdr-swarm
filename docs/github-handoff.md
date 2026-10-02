@@ -8,25 +8,39 @@ five manifest actions remain unchanged; these are new `harvest-step.sh` verbs.
 From a configured Swarm run:
 
 ```sh
-# Push committed slot work, then create/reuse its exact matching draft PR.
+# Legacy mode: push committed slot work, then create/reuse its exact draft PR.
 HERDR_SWARM_VALIDATION_FILE=/absolute/path/result.json \
   bash scripts/harvest-step.sh publish-pr 1
+
+# Strict candidate mode: all three files are required and revalidated here.
+HERDR_SWARM_CANDIDATE_VALIDATION_FILE=/absolute/path/checks.json \
+HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE=/absolute/path/browser-qa.json \
+HERDR_SWARM_CANDIDATE_REVIEW_FILE=/absolute/path/operator-review.json \
+  bash scripts/harvest-step.sh publish-candidate-pr 1
+
+# Read candidate readiness locally, without GitHub access or mutations.
+bash scripts/harvest-step.sh candidate-status 1
 
 # Read the PR's current head and CI state.
 bash scripts/harvest-step.sh pr-status 1
 ```
 
-The harvest pane exposes `g`, then a slot digit, for draft handoff and `c`, then
-a slot digit, for CI status. Selecting the slot in the draft prompt authorizes
-the push/PR creation. `p` and `publish` retain their existing push-only behavior.
-Scripts use the same workspace/repository context as other harvest verbs.
+The harvest pane exposes `g`, then a slot digit, for the legacy draft handoff
+and `c`, then a slot digit, for CI status. Selecting the slot in the draft
+prompt authorizes that push/PR creation. Strict candidate handoff is deliberately
+an explicit CLI verb: selecting its slot and supplying all three evidence files
+authorizes only a push and draft-PR create/reuse. `p` and `publish` retain their
+existing push-only behavior. Scripts use the same workspace/repository context
+as other harvest verbs.
 
-Requirements: Node >=20, Git, authenticated `gh` with access to the destination,
-and an active Swarm run with owned slot resources. `HERDR_SWARM_PUBLISH_REMOTE`
-defaults to `origin`. It must name a Git remote with exactly one fetch and push
-URL identifying the same GitHub.com repository (ordinary HTTPS or SSH, without
-embedded credentials). Fork destinations, multiple push URLs, and Enterprise
-hosts are not supported yet. No remote/auth/CI configuration is changed.
+Creating or inspecting a PR requires Node >=20, Git, authenticated `gh` with
+access to the destination, and an active Swarm run with owned slot resources.
+The local `candidate-status` preview requires only Node, Git, and the active
+run. `HERDR_SWARM_PUBLISH_REMOTE` defaults to `origin`. It must name a Git remote
+with exactly one fetch and push URL identifying the same GitHub.com repository
+(ordinary HTTPS or SSH, without embedded credentials). Fork destinations,
+multiple push URLs, and Enterprise hosts are not supported yet. No
+remote/auth/CI configuration is changed.
 
 The PR base is the manifest's recorded base branch. The head is the slot branch.
 The existing ownership, fork ancestry, non-empty-work, and non-force-push guards
@@ -77,6 +91,68 @@ Both formats are caller-supplied observations, not authenticated attestations.
 Failed or pending checks can be attached to a draft; Swarm does not mislabel them
 or treat them as approval.
 
+
+## Strict operator-selected candidate handoff
+
+`publish-candidate-pr <slot>` is an additional opt-in mode; it does not change
+the behavior of `publish-pr`. It requires the selected slot worktree to be Git
+clean and at the selected branch HEAD. Before any `gh` invocation, push, or PR
+creation, it reads and revalidates three separate files:
+
+1. `HERDR_SWARM_CANDIDATE_VALIDATION_FILE` uses the explicit `schema_version: 1`
+   checks format above. Its `head_sha` must equal the selected HEAD, and every
+   check must be `passed`.
+2. `HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE` is a Browser QA `result.json` in the
+   strict format above. Its commit must equal the same HEAD and its derived
+   `browser-qa` check must be `passed`. The checks file cannot substitute for
+   this file, or vice versa.
+3. `HERDR_SWARM_CANDIDATE_REVIEW_FILE` records the operator's decision:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "herdr-swarm-operator-review",
+  "run_id": "run-id",
+  "slot": 1,
+  "head_sha": "0123456789012345678901234567890123456789",
+  "decision": "approved"
+}
+```
+
+The review `run_id`, numeric `slot`, and `head_sha` must exactly match the
+selected candidate. `decision` is `approved` or `rejected`; only `approved`
+permits handoff. A missing, malformed, stale, failed, pending, not-run, or
+rejected input refuses before a network effect. The branch and worktree are
+checked again before push, and the push still names the audited SHA rather than
+the moving branch name.
+
+All three inputs use the same bounded, regular-file, no-symlink reader described
+above. They remain caller-supplied observations, not cryptographic attestations.
+Only typed check names/statuses and the review decision are copied to a newly
+created draft. Browser QA, Console, and the review record have no merge or apply
+authority. This mode never auto-merges, auto-applies, or force-pushes.
+
+`candidate-status <slot>` is a local, read-only preview. It rereads the current
+files and worktree and emits:
+
+```text
+candidate_status<TAB>{"schema_version":1,"run_id":"run-id","slot":1,"head_sha":"...","ready":false,"issues":["validation_missing","browser_qa_missing","review_missing"],"validation_status":"missing","browser_qa_status":"missing","review_decision":"missing"}
+```
+
+Validation and Browser QA statuses are `passed`, `missing`, `stale`, `failed`,
+or `invalid`. Review decisions are `approved`, `missing`, `stale`, `rejected`,
+or `invalid`. Issue codes are `slot_head_mismatch`, `slot_dirty`,
+`validation_missing`, `validation_stale`, `validation_failed`,
+`validation_invalid`, `browser_qa_missing`, `browser_qa_stale`,
+`browser_qa_failed`, `browser_qa_invalid`, `review_missing`, `review_stale`,
+`review_rejected`, and `review_invalid`.
+
+The preview does not invoke `gh`, push, create, edit, merge, or apply anything.
+It binds only run ID, slot, and full HEAD SHA; it intentionally omits local
+repository and evidence paths. Saved preview output is display information,
+not authority. `publish-candidate-pr` always rereads the files and rechecks the
+clean selected HEAD instead of trusting a saved preview.
+
 ## Retry and existing PRs
 
 Discovery requires exact repository/head/base identity and excludes fork PRs.
@@ -108,6 +184,19 @@ pull_request<TAB>{"schema_version":1,"repository":"owner/repo","number":7,"url":
 ```
 
 Validation sources are `none`, `supplied`, or `browser_qa`.
+
+Successful `publish-candidate-pr` uses the same `published` and `pull_request`
+records. The latter additionally has `candidate_evidence_attached` and a
+whitelisted `candidate` object:
+
+```text
+pull_request<TAB>{"schema_version":1,"repository":"owner/repo","number":7,"url":"https://github.com/owner/repo/pull/7","state":"OPEN","draft":true,"head_sha":"...","base":"main","branch":"swarm/run/slot","reused":false,"validation_attached":true,"validation":{"source":"supplied","head_sha":"...","checks":[{"name":"unit-tests","status":"passed"}]},"candidate_evidence_attached":true,"candidate":{"run_id":"run-id","slot":1,"head_sha":"...","validation":{"source":"supplied","head_sha":"...","checks":[{"name":"unit-tests","status":"passed"}]},"browser_qa":{"source":"browser_qa","head_sha":"...","checks":[{"name":"browser-qa","status":"passed"}]},"operator_review":{"decision":"approved"}}}
+```
+
+On reuse, the existing PR body is preserved, so both
+`validation_attached` and `candidate_evidence_attached` are false. The output
+still reports the newly revalidated supplied evidence but does not claim it was
+written to the existing body.
 
 `pr-status` emits `ci_status` with schema version, repository, number, URL, PR
 state/draft status, `head_sha`, `local_head_sha`, `matches_local_head`, `status`,

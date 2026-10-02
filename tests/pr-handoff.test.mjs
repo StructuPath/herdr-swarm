@@ -45,6 +45,41 @@ function output(result, key) {
 	return JSON.parse(line.slice(key.length + 1));
 }
 
+function candidateFiles(run) {
+	const validationFile = path.join(run.sdir, "candidate-validation.json");
+	const browserQaFile = path.join(run.sdir, "candidate-browser-qa.json");
+	const reviewFile = path.join(run.sdir, "candidate-review.json");
+	const validation = { schema_version: 1, head_sha: run.sha, checks: [{ name: "tests", status: "passed" }, { name: "typecheck", status: "passed" }] };
+	const browserQa = {
+		schemaVersion: 1,
+		kind: "herdr-browser-qa",
+		status: "passed",
+		git: { commit: run.sha, dirty: false, changedDuringRun: false },
+		scenario: { policy: { failOnConsoleError: true, failOnPageError: true, failOnFailedRequest: true } },
+		cleanup: { status: "passed" },
+		summary: { viewports: 1, passed: 1, failed: 0, assertions: 1, consoleErrors: 0, pageErrors: 0, failedRequests: 0 },
+		runs: [{ status: "passed", steps: [{ index: 0, type: "assertVisible", status: "passed" }], consoleErrors: [], pageErrors: [], failedRequests: [], unresolvedRequests: 0, url: "https://private.invalid/candidate" }],
+	};
+	const review = { schema_version: 1, kind: "herdr-swarm-operator-review", run_id: run.runId, slot: 1, head_sha: run.sha, decision: "approved" };
+	const write = () => {
+		fs.writeFileSync(validationFile, JSON.stringify(validation));
+		fs.writeFileSync(browserQaFile, JSON.stringify(browserQa));
+		fs.writeFileSync(reviewFile, JSON.stringify(review));
+	};
+	write();
+	return {
+		validation,
+		browserQa,
+		review,
+		write,
+		env: {
+			HERDR_SWARM_CANDIDATE_VALIDATION_FILE: validationFile,
+			HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE: browserQaFile,
+			HERDR_SWARM_CANDIDATE_REVIEW_FILE: reviewFile,
+		},
+	};
+}
+
 test("draft handoff publishes audited commit, reports not-run evidence, and reuses exact PR without editing", () => {
 	const run = fixture();
 	const first = output(run.step("publish-pr"), "pull_request");
@@ -62,6 +97,89 @@ test("draft handoff publishes audited commit, reports not-run evidence, and reus
 	const log = fs.readFileSync(h.logFile, "utf8");
 	assert.equal(log.split('\n').filter(line => line.includes('"create"')).length, 1);
 	assert.doesNotMatch(log, /--force|"merge"|"edit"/);
+});
+
+test("candidate preview is read-only, binds clean HEAD, and reports every omitted evidence source", () => {
+	const run = fixture();
+	fs.writeFileSync(h.logFile, "");
+	const status = output(run.step("candidate-status"), "candidate_status");
+	assert.deepEqual(status, {
+		schema_version: 1,
+		run_id: run.runId,
+		slot: 1,
+		head_sha: run.sha,
+		ready: false,
+		issues: ["validation_missing", "browser_qa_missing", "review_missing"],
+		validation_status: "missing",
+		browser_qa_status: "missing",
+		review_decision: "missing",
+	});
+	assert.doesNotMatch(h.log(), /git-push|\["gh"/);
+});
+
+test("strict candidate handoff requires separately passing SHA-bound evidence and operator approval before network effects", () => {
+	const run = fixture();
+	const evidence = candidateFiles(run);
+	const refuseBeforeNetwork = (env) => {
+		fs.writeFileSync(h.logFile, "");
+		const result = run.step("publish-candidate-pr", env);
+		assert.equal(result.status, 36, `${result.stdout}\n${result.stderr}`);
+		assert.doesNotMatch(h.log(), /git-push|\["gh"/);
+	};
+
+	refuseBeforeNetwork({});
+
+	evidence.validation.head_sha = run.fork;
+	evidence.write();
+	let status = output(run.step("candidate-status", evidence.env), "candidate_status");
+	assert.equal(status.validation_status, "stale");
+	assert.deepEqual(status.issues, ["validation_stale"]);
+	refuseBeforeNetwork(evidence.env);
+
+	evidence.validation.head_sha = run.sha;
+	evidence.validation.checks[0].status = "failed";
+	evidence.write();
+	refuseBeforeNetwork(evidence.env);
+
+	evidence.validation.checks[0].status = "passed";
+	evidence.browserQa.git.commit = run.fork;
+	evidence.write();
+	refuseBeforeNetwork(evidence.env);
+
+	evidence.browserQa.git.commit = run.sha;
+	evidence.browserQa.cleanup.status = "failed";
+	evidence.write();
+	refuseBeforeNetwork(evidence.env);
+
+	evidence.browserQa.cleanup.status = "passed";
+	evidence.review.head_sha = run.fork;
+	evidence.write();
+	status = output(run.step("candidate-status", evidence.env), "candidate_status");
+	assert.equal(status.review_decision, "stale");
+	assert.deepEqual(status.issues, ["review_stale"]);
+	refuseBeforeNetwork(evidence.env);
+
+	evidence.review.head_sha = run.sha;
+	evidence.review.decision = "rejected";
+	evidence.write();
+	refuseBeforeNetwork(evidence.env);
+
+	evidence.review.decision = "approved";
+	evidence.write();
+	fs.writeFileSync(path.join(run.wt(1), "uncommitted.txt"), "dirty\n");
+	refuseBeforeNetwork(evidence.env);
+	fs.rmSync(path.join(run.wt(1), "uncommitted.txt"));
+
+	const result = output(run.step("publish-candidate-pr", evidence.env), "pull_request");
+	assert.equal(result.draft, true);
+	assert.equal(result.candidate_evidence_attached, true);
+	assert.equal(result.candidate.head_sha, run.sha);
+	assert.deepEqual(result.candidate.validation.checks, evidence.validation.checks);
+	assert.deepEqual(result.candidate.browser_qa.checks, [{ name: "browser-qa", status: "passed" }]);
+	assert.deepEqual(result.candidate.operator_review, { decision: "approved" });
+	assert.match(run.data().body, /Candidate validation[\s\S]*Browser QA[\s\S]*Operator review decision/);
+	assert.match(run.data().body, /no merge or apply authority/);
+	assert.doesNotMatch(run.data().body, /private\.invalid|candidate-validation\.json|\/tmp\//);
 });
 
 test("typed validation publishes only whitelisted names/statuses and rejects stale evidence before push", () => {
