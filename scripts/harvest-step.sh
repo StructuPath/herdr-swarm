@@ -11,7 +11,8 @@
 # Verbs: preview <slot> | commit-wip <slot> | snapshot <slot> |
 #        discard <slot> | skip <slot> | merge <slot> <expected-base-sha> |
 #        resume [complete <slot>] | archive <slot> | abort-merge <slot> |
-#        publish <slot> | publish-pr <slot> | pr-status <slot>
+#        publish <slot> | publish-pr <slot> | publish-candidate-pr <slot> |
+#        candidate-status <slot> | pr-status <slot>
 #
 # Output protocol: machine-readable "key<TAB>value…" lines on stdout, human
 # messages on stderr, typed exit codes (HS_EC_*) so the renderer branches on
@@ -29,6 +30,8 @@
 #                                     emitted by the ignored inventory preview
 #   HERDR_SWARM_PUBLISH_REMOTE        publish: remote to push the slot branch
 #                                     to (default: origin)
+#   HERDR_SWARM_CANDIDATE_VALIDATION_FILE / _BROWSER_QA_FILE /
+#   _REVIEW_FILE                       strict candidate handoff evidence
 #   HERDR_SWARM_HARVEST_WT_NO_HOOKS=1 disable repo hooks in the plugin-owned
 #                                     harvest worktree ONLY (hook-policy KTD:
 #                                     fresh worktrees lack node_modules, so
@@ -68,7 +71,7 @@ VERB="${1-}"
 }
 shift
 
-case "$VERB" in publish-pr | pr-status) clear_git_routing_env ;; esac
+case "$VERB" in publish-pr | publish-candidate-pr | candidate-status | pr-status) clear_git_routing_env ;; esac
 
 # --- Run + slot context ------------------------------------------------------
 
@@ -695,8 +698,8 @@ do_resume() {
 # state exists on purpose.
 do_publish() {
 	read_slot "$1" || return $?
-	local remote="${HERDR_SWARM_PUBLISH_REMOTE:-origin}" tip out patch
-	local expected="${2-}" destination="${3:-${HERDR_SWARM_PUBLISH_REMOTE:-origin}}"
+	local remote="${HERDR_SWARM_PUBLISH_REMOTE:-origin}" tip out patch dirty
+	local expected="${2-}" destination="${3:-${HERDR_SWARM_PUBLISH_REMOTE:-origin}}" require_clean="${4-}"
 	if ! git -C "$REPO_ROOT" remote get-url "$remote" >/dev/null 2>&1; then
 		echo "herdr-swarm: remote '$remote' is not configured in this repository — add it, or point HERDR_SWARM_PUBLISH_REMOTE at the remote to publish to." >&2
 		return "$HS_EC_REFUSED"
@@ -710,7 +713,7 @@ do_publish() {
 		return "$HS_EC_REFUSED"
 	fi
 	if [ -n "$expected" ] && [ "$tip" != "$expected" ]; then
-		echo "herdr-swarm: slot head moved after PR/evidence preparation — re-run publish-pr." >&2
+		echo "herdr-swarm: slot head moved after PR/evidence preparation — re-run the selected handoff." >&2
 		return "$HS_EC_DRIFT"
 	fi
 	# The branch must still contain the recorded fork point: a rewritten slot
@@ -720,10 +723,16 @@ do_publish() {
 		echo "herdr-swarm: slot $1 branch no longer contains the recorded fork point $FORK_SHA — its history was rewritten; publish refused." >&2
 		return "$HS_EC_REFUSED"
 	fi
-	# Uncommitted work never travels; say so rather than silently publishing
-	# half a slot (commit-WIP first to include it).
-	if [ -n "$SLOT_PATH" ] && [ -d "$SLOT_PATH" ] &&
-		[ -n "$(git -C "$SLOT_PATH" status --porcelain 2>/dev/null)" ]; then
+	# Ordinary publish remains commit-only and warns about uncommitted work.
+	# Strict candidate handoff requires the selected worktree to remain clean.
+	dirty=""
+	if [ -n "$SLOT_PATH" ] && [ -d "$SLOT_PATH" ]; then
+		dirty="$(git -C "$SLOT_PATH" status --porcelain 2>/dev/null)" || return "$HS_EC_REFUSED"
+	fi
+	if [ "$require_clean" = "strict" ] && { [ -z "$SLOT_PATH" ] || [ ! -d "$SLOT_PATH" ] || [ -n "$dirty" ]; }; then
+		echo "herdr-swarm: candidate handoff requires the selected slot worktree to remain clean — commit or discard changes, regenerate evidence, and retry." >&2
+		return "$HS_EC_REFUSED"
+	elif [ -n "$dirty" ]; then
 		echo "herdr-swarm: note — slot $1 has uncommitted work; only committed work is published. Commit-WIP first to include it." >&2
 	fi
 	# Push the AUDITED SHA, not the branch name: if the agent commits again
@@ -755,6 +764,21 @@ do_publish_pr() {
 	destination="$(printf '%s' "$plan" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).push_url));')" || return 1
 	do_publish "$1" "$expected" "$destination" || return $?
 	printf '%s' "$plan" | node "$PLUGIN_ROOT/scripts/pr-handoff.mjs" handoff
+}
+
+do_publish_candidate_pr() {
+	read_slot "$1" || return $?
+	local plan expected destination
+	plan="$(node "$PLUGIN_ROOT/scripts/pr-handoff.mjs" prepare-candidate "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_BRANCH" "$BASE_BRANCH" "$FORK_SHA" "$SLOT_PATH")" || return "$HS_EC_REFUSED"
+	expected="$(printf '%s' "$plan" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).sha));')" || return 1
+	destination="$(printf '%s' "$plan" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).push_url));')" || return 1
+	do_publish "$1" "$expected" "$destination" strict || return $?
+	printf '%s' "$plan" | node "$PLUGIN_ROOT/scripts/pr-handoff.mjs" handoff
+}
+
+do_candidate_status() {
+	read_slot "$1" || return $?
+	node "$PLUGIN_ROOT/scripts/pr-handoff.mjs" candidate-status "$REPO_ROOT" "$RUN_ID" "$1" "$SLOT_BRANCH" "$BASE_BRANCH" "$FORK_SHA" "$SLOT_PATH"
 }
 
 do_pr_status() {
@@ -1000,6 +1024,14 @@ publish)
 publish-pr)
 	require_slot_arg "${1-}" || exit 1
 	do_publish_pr "$1"
+	;;
+publish-candidate-pr)
+	require_slot_arg "${1-}" || exit 1
+	do_publish_candidate_pr "$1"
+	;;
+candidate-status)
+	require_slot_arg "${1-}" || exit 1
+	do_candidate_status "$1"
 	;;
 pr-status)
 	require_slot_arg "${1-}" || exit 1
