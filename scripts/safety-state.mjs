@@ -338,6 +338,15 @@ function verifyHarvestRemoved(repo, binding) {
 		throw new Error("harvest resource registration still exists after removal");
 }
 
+function emptyRegularFile(file) {
+	try {
+		const stat = fs.lstatSync(file);
+		return stat.isFile() && stat.size === 0;
+	} catch {
+		return false;
+	}
+}
+
 function canonicalInventory(repo, binding) {
 	const output = git(
 		repo,
@@ -350,7 +359,12 @@ function canonicalInventory(repo, binding) {
 		if (output[i] !== 0) continue;
 		const item = output.subarray(start, i);
 		start = i + 1;
+		// The two plugin-owned files in every slot root: the task file, and the
+		// finish marker — but the marker only while it is what we asked for,
+		// an EMPTY regular file. Anything an agent wrote into it is content,
+		// and content leaves only through the exact approval like any other.
 		if (item.length === 0 || item.equals(Buffer.from(".swarm-task.md"))) continue;
+		if (item.equals(Buffer.from(".swarm-done")) && emptyRegularFile(path.join(repo, ".swarm-done"))) continue;
 		paths.push(Buffer.from(item));
 	}
 	paths.sort(Buffer.compare);

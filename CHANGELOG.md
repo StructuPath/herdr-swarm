@@ -8,6 +8,10 @@ Notable changes to the Swarm plugin. Format follows
 ## [Unreleased]
 
 ### Fixed
+- On Herdr 0.7.5+, a slot whose agent finished stayed `working` until a
+  harvest preview. The plugin's own report holds Herdr's lifecycle authority,
+  which suppresses screen detection (live-verified on 0.8.2). Finish
+  detection now corrects it while the status pane is open.
 - The shared test environment now supplies its fixture Git identity to stub
   subprocesses too, avoiding hostname-based identity detection during commits
   and reflog writes when user/system Git configuration is disabled (#11).
@@ -19,6 +23,15 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- Finish detection: the status pane runs a new `settle` verb every 10s. It
+  records a slot as finished when its agent creates `.swarm-done` (now asked
+  for in the task file's standing instructions, and excluded from `git status`
+  and from ignored-file cleanup approval like `.swarm-task.md`). It also does
+  so when the slot pane is back at a bare shell (via Herdr `pane process-info`).
+  Finished slots show `finished`, flip their plugin-reported state to `idle`,
+  and get one Herdr notification per run when all are done. Opt-in
+  auto-validate (`HERDR_SWARM_AUTO_VALIDATE=1` or a config-dir
+  `auto-validate` file) runs `validate` on each settled slot.
 - `validate <slot>` harvest verb (`v`, then slot in the pane) runs the
   operator's `validate.sh` hook against a slot's clean HEAD and records a
   SHA-bound checks file. The strict candidate handoff now produces its own

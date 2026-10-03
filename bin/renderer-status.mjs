@@ -109,6 +109,16 @@ export class Renderer {
 			Math.max(500, Number(env.HERDR_SWARM_INTERVAL_MS) || 2000),
 		);
 		this.idleTicks = 0;
+		// Finish detection runs OUT of process: status-pane.sh names the
+		// harvest-step script, whose `settle` verb does every write. Unset (as
+		// in direct/test invocation) means this pane never triggers one.
+		this.settleScript = env.HERDR_SWARM_SETTLE_SCRIPT || null;
+		this.settleEveryMs = Math.max(
+			1000,
+			Number(env.HERDR_SWARM_SETTLE_INTERVAL_MS) || 10_000,
+		);
+		this.lastSettle = 0;
+		this.settling = null;
 		this.rows = [];
 		this.runInfo = null; // {run_id, base_ref, fork_sha, repo_root}
 		this.banner = "";
@@ -168,11 +178,39 @@ export class Renderer {
 		return facts;
 	}
 
+	// Start `harvest-step.sh settle` at most every settleEveryMs, and never
+	// two at once. NOT awaited by tick(): the verb waits on the repo lock, so
+	// during a long merge an awaited settle would freeze the paint (and hide
+	// a slot going "blocked") for its whole timeout. Bounded and best-effort:
+	// a slow or failed settle only delays finish detection. Returns the
+	// in-flight promise so tests can wait on it.
+	maybeSettle(now = Date.now()) {
+		if (!this.settleScript || this.settling || now - this.lastSettle < this.settleEveryMs) {
+			return this.settling ?? Promise.resolve();
+		}
+		this.lastSettle = now;
+		this.settling = pExecFile("bash", [this.settleScript, "settle"], {
+			env: this.env,
+			timeout: 15_000,
+			killSignal: "SIGTERM",
+			maxBuffer: 1024 * 1024,
+		})
+			.catch(() => {
+				/* next interval retries */
+			})
+			.finally(() => {
+				this.settling = null;
+			});
+		return this.settling;
+	}
+
 	// One full poll cycle. Reads the manifest via fs (READ-ONLY — the single
 	// write path lives in lib.sh's manifest_write, held by launchers and
-	// harvest verbs only), queries live agents, gathers git facts, reconciles
-	// in memory, paints.
+	// harvest verbs only; finish detection writes through maybeSettle's
+	// child), queries live agents, gathers git facts, reconciles in memory,
+	// paints.
 	async tick() {
+		this.maybeSettle();
 		let text = null;
 		try {
 			text = fs.readFileSync(this.manifestFile, "utf8");

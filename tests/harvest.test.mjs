@@ -745,6 +745,23 @@ test("archive: inventory prompt on an agent-created ignored file, none on the ta
 	r = step(run2, "archive", [1]);
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 	assert.equal(run2.slotRow(1).status, "archived");
+	// Nor does the finish marker beside it: both are plugin-owned.
+	const run3 = mkRun({ status: "skipped" });
+	fs.writeFileSync(path.join(run3.wt(1), ".swarm-done"), "");
+	r = step(run3, "archive", [1]);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.equal(run3.slotRow(1).status, "archived");
+	// …but only while it is the empty file we asked for: content is user data.
+	const run5 = mkRun({ status: "skipped" });
+	fs.writeFileSync(path.join(run5.wt(1), ".swarm-done"), "agent notes\n");
+	r = step(run5, "archive", [1]);
+	assert.equal(r.status, EC.IGNORED, `${r.stdout}\n${r.stderr}`);
+	// …and only at the slot root, byte-exact: a nested one is user data.
+	const run4 = mkRun({ status: "skipped" });
+	fs.mkdirSync(path.join(run4.wt(1), "sub"));
+	fs.writeFileSync(path.join(run4.wt(1), "sub", ".swarm-done"), "");
+	r = step(run4, "archive", [1]);
+	assert.equal(r.status, EC.IGNORED, `${r.stdout}\n${r.stderr}`);
 });
 
 test("archive refuses a working agent (herdr remove would kill it) and dirty worktrees route to the uncommitted flow", () => {

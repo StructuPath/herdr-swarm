@@ -288,8 +288,10 @@ test("ensure_exclude_pattern appends exactly once across two calls and records i
 	);
 	assert.equal(r.status, 0, r.stderr);
 	const ex = fs.readFileSync(path.join(repo, ".git/info/exclude"), "utf8");
-	const ours = ex.split("\n").filter((l) => l === ".swarm-task.md");
-	assert.equal(ours.length, 1, `exclude file:\n${ex}`);
+	for (const pattern of [".swarm-task.md", ".swarm-done"]) {
+		const ours = ex.split("\n").filter((l) => l === pattern);
+		assert.equal(ours.length, 1, `${pattern} in exclude file:\n${ex}`);
+	}
 	const doc = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
 	assert.equal(doc.exclude_pattern_added, true);
 	fs.rmSync(manifestFile, { force: true });
@@ -304,7 +306,7 @@ test("ensure_exclude_pattern normalizes a final line missing its newline", () =>
 	fs.writeFileSync(exPath, "junk");
 	const r = runPf("ensure_exclude_pattern", freshEnv(), repo);
 	assert.equal(r.status, 0, r.stderr);
-	assert.equal(fs.readFileSync(exPath, "utf8"), "junk\n.swarm-task.md\n");
+	assert.equal(fs.readFileSync(exPath, "utf8"), "junk\n.swarm-task.md\n.swarm-done\n");
 	fs.rmSync(manifestFile, { force: true });
 });
 
@@ -319,13 +321,13 @@ test("remove_exclude_pattern removes only our namespaced line", () => {
 	// — only the exact line may go.
 	fs.writeFileSync(
 		exPath,
-		"node_modules/\n.swarm-task.md\n.swarm-task.md.orig\n*.log\n",
+		"node_modules/\n.swarm-task.md\n.swarm-done\n.swarm-task.md.orig\n.swarm-done.bak\n*.log\n",
 	);
 	const r = runPf("remove_exclude_pattern", freshEnv(), repo);
 	assert.equal(r.status, 0, r.stderr);
 	assert.equal(
 		fs.readFileSync(exPath, "utf8"),
-		"node_modules/\n.swarm-task.md.orig\n*.log\n",
+		"node_modules/\n.swarm-task.md.orig\n.swarm-done.bak\n*.log\n",
 	);
 	const doc = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
 	assert.equal(doc.exclude_pattern_added, false);
