@@ -23,6 +23,14 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- Compare view (`w` in the harvest pane; scriptable as the read-only
+  `compare` verb). It ranks running slots by validation of their current
+  tip, then commits, then finished, never by diff size, and shows commits,
+  files, +/-, dirty count, and the files each pair of slots both changed.
+  `d` shows the full diff between two slots' tips in git's pager. `m` merges
+  a chosen winner through the normal merge, and only if it lands, skips and
+  archives the other running slots (branches kept; anything that won't
+  archive cleanly is left and named).
 - Finish detection: the status pane runs a new `settle` verb every 10s. It
   records a slot as finished when its agent creates `.swarm-done` (now asked
   for in the task file's standing instructions, and excluded from `git status`
