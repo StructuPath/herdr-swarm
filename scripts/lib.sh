@@ -494,10 +494,23 @@ print_cleanup_inventory() {
 	'
 }
 
+# The inventory goes to node as a FILE, never argv: it lists every ignored
+# path twice, so a worktree with a real node_modules makes it megabytes —
+# past ARG_MAX (1 MiB on macOS, 128 KiB per argument on Linux). As argv,
+# exec failed with E2BIG and no approval could ever apply: abort and archive
+# would keep such a worktree forever.
 cleanup_approval_validate() {
-	local inventory="$1" approval="${HERDR_SWARM_CLEANUP_APPROVAL:-}"
+	local inventory="$1" approval="${HERDR_SWARM_CLEANUP_APPROVAL:-}" file rc
 	[ -n "$approval" ] || return 2
-	printf '%s' "$approval" | safety_state approval "$inventory" "$(state_dir)"
+	file="$(mktemp "$(state_dir)/cleanup-inventory.XXXXXX")" || return 1
+	printf '%s' "$inventory" >"$file" || {
+		rm -f "$file"
+		return 1
+	}
+	printf '%s' "$approval" | safety_state approval "$file" "$(state_dir)"
+	rc=$?
+	rm -f "$file"
+	return "$rc"
 }
 
 cleanup_approval_consume() {
@@ -709,7 +722,10 @@ _agent_start_native() {
 	fi
 	while [ $# -gt 0 ]; do
 		case "$1" in
-		--split-from)
+		# --env: `agent start` has no env field (AgentStartParams, protocol
+		# 20), so the 0.7.4 path cannot give the agent process slot variables;
+		# the task file and setup.sh still carry them (fan-out documents this).
+		--split-from | --env)
 			shift 2
 			;;
 		*)
@@ -727,12 +743,24 @@ _agent_start_native() {
 # not at the call site, is the whole point of the seam.
 _agent_start_via_pane() {
 	local name="${1-}" ws="" cwd="" from="" out pane term pws
-	local -a argv=()
+	local -a argv=() envs=()
 	shift || true
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--workspace)
 			ws="${2-}"
+			shift 2
+			;;
+		# --env K=V → `pane split --env K=V` (live-verified on 0.8.2: repeated
+		# flags all reach the pane's shell, and so the argv `pane run` types).
+		--env)
+			case "${2-}" in
+			[A-Za-z_]*=*) envs+=(--env "$2") ;;
+			*)
+				echo "herdr-swarm: internal error: --env needs NAME=VALUE (got '${2-}')" >&2
+				return 1
+				;;
+			esac
 			shift 2
 			;;
 		--cwd)
@@ -789,7 +817,8 @@ _agent_start_via_pane() {
 		return 1
 	fi
 
-	out="$(herdr_pane_split "$from" --direction down --cwd "$cwd" --no-focus)" || {
+	# ${envs[@]+…}: bash 3.2 under set -u treats an empty array as unbound.
+	out="$(herdr_pane_split "$from" --direction down --cwd "$cwd" --no-focus ${envs[@]+"${envs[@]}"})" || {
 		echo "herdr-swarm: pane split failed for $name" >&2
 		return 1
 	}
@@ -904,6 +933,42 @@ herdr_report_agent() {
 	local pane="${1-}"
 	shift || true
 	with_timeout 5 "$HERDR" pane report-agent "$pane" --source "$PLUGIN_ID" "$@"
+}
+
+# `pane process-info --pane ID` (live-captured on 0.8.2, protocol 20):
+# result.process_info = {pane_id, shell_pid, foreground_process_group_id,
+# foreground_processes:[{pid,name,argv0,argv,cmdline,cwd}]}. Read-only.
+herdr_pane_process_info() {
+	with_timeout 5 "$HERDR" pane process-info --pane "$@"
+}
+
+# `notification show <title> [--body T] [--sound none|done|request]`
+# (live-captured on 0.8.2): result = {type:"notification_show", shown, reason}.
+herdr_notification_show() {
+	with_timeout 5 "$HERDR" notification show "$@"
+}
+
+# pane_foreground <pane_id>: print `shell` when the pane's foreground process
+# group IS its shell (the command it was given has exited — live-verified on
+# 0.8.2: after `sleep` exits, foreground_process_group_id == shell_pid), `busy`
+# while anything else holds the foreground, `unknown` when herdr cannot say
+# (older herdr without process-info, a closed pane, a malformed response).
+# Unknown is never evidence of anything.
+pane_foreground() {
+	local out
+	out="$(herdr_pane_process_info "${1-}" 2>/dev/null)" || {
+		printf 'unknown\n'
+		return 0
+	}
+	printf '%s' "$out" | node -e '
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			let p;
+			try { p = JSON.parse(d).result.process_info; } catch {}
+			const ok = p && Number.isSafeInteger(p.shell_pid) && Number.isSafeInteger(p.foreground_process_group_id);
+			console.log(!ok ? "unknown" : p.foreground_process_group_id === p.shell_pid ? "shell" : "busy");
+		});
+	' 2>/dev/null || printf 'unknown\n'
 }
 
 # report_slot_agent_state <pane_id> <agent label> <idle|working|blocked|unknown>
@@ -1188,6 +1253,32 @@ verify_slot_ownership() {
 	printf "path '%s' is not a worktree of %s checked out on '%s'\n" \
 		"$wtpath" "${SWARM_REPO:-?}" "$branch"
 	return 1
+}
+
+# manifest_update_run <json-patch>: shallow merge into the run document's top
+# level. Same lock contract as manifest_update_slot below. `slots` is refused:
+# rows change only through manifest_update_slot, which checks they exist.
+manifest_update_run() {
+	local patch="${1-}" doc updated
+	doc="$(manifest_read)" || return $?
+	updated="$(printf '%s' "$doc" | node -e '
+		let p;
+		try { p = JSON.parse(process.argv[1]); } catch {
+			console.error("herdr-swarm: run patch is not valid JSON: " + process.argv[1]);
+			process.exit(1);
+		}
+		if (!p || typeof p !== "object" || Array.isArray(p) || "slots" in p) {
+			console.error("herdr-swarm: run patch must be an object without slots");
+			process.exit(1);
+		}
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			const doc = JSON.parse(d);
+			Object.assign(doc, p);
+			process.stdout.write(JSON.stringify(doc, null, 2));
+		});
+	' "$patch")" || return 1
+	printf '%s' "$updated" | manifest_write
 }
 
 # manifest_update_slot <slot> <json-patch>: read-modify-write of one slot

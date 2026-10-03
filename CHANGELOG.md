@@ -8,6 +8,15 @@ Notable changes to the Swarm plugin. Format follows
 ## [Unreleased]
 
 ### Fixed
+- Approving ignored-file cleanup failed with "Argument list too long" for any
+  worktree holding a real dependency tree, so abort and archive kept it
+  forever. The inventory went to Node as one argv string, past ARG_MAX. It now
+  goes through a file in the state dir. The harvest prompt summarizes large
+  ignored sets by top-level directory.
+- On Herdr 0.7.5+, a slot whose agent finished stayed `working` until a
+  harvest preview. The plugin's own report holds Herdr's lifecycle authority,
+  which suppresses screen detection (live-verified on 0.8.2). Finish
+  detection now corrects it while the status pane is open.
 - The shared test environment now supplies its fixture Git identity to stub
   subprocesses too, avoiding hostname-based identity detection during commits
   and reflog writes when user/system Git configuration is disabled (#11).
@@ -19,6 +28,30 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- Slot environment: fan-out clones the repo's ignored `node_modules` (or a
+  `clone-paths` list) into each worktree copy-on-write (`cp -c` / `--reflink`;
+  skipped, not fully copied, where unsupported), before `setup.sh`. Each slot
+  gets `HERDR_SWARM_RUN_ID`, `_SLOT`, `_PORT_BASE`, `_PORT_SPAN`: in
+  `setup.sh` always, in the agent via `pane split --env` on Herdr 0.7.5+, and
+  as a port-range line in the task file. Ports default to 10 per slot from
+  4100 and are recorded on the manifest row.
+- Compare view (`w` in the harvest pane; scriptable as the read-only
+  `compare` verb). It ranks running slots by validation of their current
+  tip, then commits, then finished, never by diff size, and shows commits,
+  files, +/-, dirty count, and the files each pair of slots both changed.
+  `d` shows the full diff between two slots' tips in git's pager. `m` merges
+  a chosen winner through the normal merge, and only if it lands, skips and
+  archives the other running slots (branches kept; anything that won't
+  archive cleanly is left and named).
+- Finish detection: the status pane runs a new `settle` verb every 10s. It
+  records a slot as finished when its agent creates `.swarm-done` (now asked
+  for in the task file's standing instructions, and excluded from `git status`
+  and from ignored-file cleanup approval like `.swarm-task.md`). It also does
+  so when the slot pane is back at a bare shell (via Herdr `pane process-info`).
+  Finished slots show `finished`, flip their plugin-reported state to `idle`,
+  and get one Herdr notification per run when all are done. Opt-in
+  auto-validate (`HERDR_SWARM_AUTO_VALIDATE=1` or a config-dir
+  `auto-validate` file) runs `validate` on each settled slot.
 - `validate <slot>` harvest verb (`v`, then slot in the pane) runs the
   operator's `validate.sh` hook against a slot's clean HEAD and records a
   SHA-bound checks file. The strict candidate handoff now produces its own

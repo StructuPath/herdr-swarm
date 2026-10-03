@@ -39,6 +39,19 @@ The broad compatibility baseline remains Herdr 0.7.4/0.7.5, and the existing
 newer-than-tested warning is retained. No paid model agent, credentials, external
 push, default user session, or production repository was used by the smoke run.
 
+## Live probe — 2026-10-03
+
+A throwaway named Herdr 0.8.2 session (protocol 20), with every inherited
+`HERDR_*` routing variable stripped, replayed the 0.7.5+ slot start: `pane
+split`, `pane run sleep 40`, `report-agent --state working`. It captured
+`process-info` while the argv was running and after it exited, `agent list`
+before and after `release-agent`, and `notification show`. It confirmed
+plugin-held state stays `working` after exit, and that foreground group ==
+shell pid marks exit. Those shapes back finish detection's stubs. See
+`docs/solutions/documentation-gaps/herdr-082-plugin-agent-authority-and-finish-detection.md`.
+The session was stopped afterwards. No paid agent was run, so Herdr-native
+detection after `release-agent` remains unverified.
+
 ## Recommended next work
 
 1. Add opt-in named-session integration coverage for released Herdr versions,

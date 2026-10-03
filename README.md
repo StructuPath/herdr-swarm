@@ -24,12 +24,13 @@ Conductor).
   - On **0.7.5+**, the plugin builds each slot itself — `pane split` into the
     worktree, `pane run` for the slot's argv, `pane report-agent` to register
     it — so slots run *any* command, but their state is **plugin-reported**:
-    `working` when the slot starts, `idle` once a harvest preview finds the
-    slot finished. Nothing polls in between, so a 0.7.5 slot that finishes on
-    its own still reads `working` until you open harvest. This is cosmetic:
-    committed work is mergeable regardless. Archive separately requires a
-    settled agent (`idle`, `done`, or absent) before removing its worktree;
-    harvest refreshes the completed slot's reported state before auto-archive.
+    `working` when the slot starts. Because the plugin holds that state,
+    Herdr stops reading the screen, so nothing else ever flips it. Finish
+    detection (below) does that while the status pane is open, and so does a
+    harvest preview. Committed work is mergeable regardless. Archive
+    separately requires a settled agent (`idle`, `done`, or absent) before
+    removing its worktree; harvest refreshes the completed slot's reported
+    state before auto-archive.
   - On **0.7.5+**, `pane run` hands the slot's argv to the pane's **shell**,
     not to `exec` — a preset containing shell metacharacters is interpreted
     there, unlike on 0.7.4. Presets are your own config, but keep them to a
@@ -207,7 +208,7 @@ forwards no environment):
 | Capability | Scriptable path |
 | --- | --- |
 | Fan out | `scripts/fanout-pane.sh` with the variables above (zero-TTY) |
-| Harvest | `scripts/harvest-step.sh <verb>` — a verb CLI with typed exit codes and `key<TAB>value` stdout |
+| Harvest | `scripts/harvest-step.sh <verb>` — a verb CLI with typed exit codes and `key<TAB>value` stdout (includes `compare`, `validate`, `settle`) |
 | Abort | `scripts/abort.sh` — a zero-TTY action, env-gated |
 | Prune | `scripts/prune.sh` — a zero-TTY action, dry run by default, env-gated per resource class |
 
@@ -350,9 +351,66 @@ codex-fast|argv|codex --profile fast
 
 Every slot starts in a **fresh** worktree: gitignored files — `.env`,
 `node_modules`, build caches, installed deps — are absent. This is the most
-likely cause of "all my agents failed instantly": either have the task prompt
-tell agents to install deps first, or prep each worktree yourself before the
-agents get going. The same applies to repo hooks during harvest: a hook that
+likely cause of "all my agents failed instantly". Swarm handles the common
+case itself (below); for anything else, have the task prompt tell agents to
+install deps first, or use `setup.sh`.
+
+### Dependency clones
+
+Fan-out clones `node_modules` from your repo root into each new worktree.
+It uses copy-on-write: `/bin/cp -c` (APFS clonefile) on macOS, and
+`cp --reflink=always` on Linux. A clone is near-instant and takes no extra
+disk until a file changes. To clone other paths, list them in `clone-paths`
+in the plugin config dir, one repo-relative path per line (`#` comments). That
+list replaces the default, and an empty file turns cloning off.
+
+A path is cloned only if it exists in the repo, is **ignored** by git there,
+is absent in the worktree, and doesn't resolve outside the repo or worktree
+through a symlinked parent. Tracked content always comes from the checkout and
+is never overwritten.
+
+Where copy-on-write isn't available, behaviour depends on the platform:
+
+- **Linux** (for example ext4): the path is skipped with a warning.
+  `HERDR_SWARM_CLONE_MODE=copy` accepts a real copy instead.
+- **macOS:** `cp -c` silently falls back to a full copy when it can't clone,
+  for example on a non-APFS volume or with worktrees on another volume.
+
+`HERDR_SWARM_CLONE_TIMEOUT` (default 120 s) bounds each clone. A timeout stops
+`cp` and everything it started, and removes the partial copy. A clone failure
+never fails the slot. Cloning happens before `setup.sh`, so the hook can build
+on it.
+
+Each clone is a snapshot of your repo's *current* `node_modules`, not one
+installed from the fork commit's lockfile. If those can differ, have
+`setup.sh` run your installer anyway (`npm ci` on top of a clone is fast).
+Only list relocatable paths. A Python `.venv` has absolute paths baked into
+its scripts, so a cloned one installs into your main checkout's venv. Build
+those in `setup.sh` instead.
+
+`.env` and other secrets are **not** in the default list on purpose. Copying
+credentials into agent worktrees is your call: add them to `clone-paths` if
+you want them. Like any ignored content, cloned paths count as ignored files
+when the worktree is archived, so removing them needs the usual approval. The
+harvest prompt summarizes large sets by top-level directory (for example
+`node_modules/  10000 files`); the approval still covers every exact file.
+
+### Slot variables and ports
+
+Each slot gets `HERDR_SWARM_RUN_ID`, `HERDR_SWARM_SLOT`,
+`HERDR_SWARM_PORT_BASE` and `HERDR_SWARM_PORT_SPAN`:
+
+- **`setup.sh`** always sees them.
+- **The agent process** sees them on Herdr 0.7.5+, set through `pane split
+  --env` (live-verified on 0.8.2). On 0.7.4, `agent start` has no environment
+  field, so there the agent learns its ports from the task file.
+- **The task file's standing instructions** tell every agent to use only its
+  own port range when it starts a server.
+
+Ports start at `HERDR_SWARM_PORT_START` (default 4100), with
+`HERDR_SWARM_PORT_SPAN` (default 10) per slot: slot 1 gets 4100–4109, slot 2
+gets 4110–4119. This is a convention the agents are told, not an OS
+reservation. A range that doesn't fit in 1024–65535 refuses the fan-out. The same applies to repo hooks during harvest: a hook that
 shells into `node_modules/.bin` fails in the plugin-owned merge worktree —
 `HERDR_SWARM_HARVEST_WT_NO_HOOKS=1` disables hooks in that worktree *only*
 (never in your tree). To automate worktree prep, drop a `setup.sh` in the
@@ -363,6 +421,88 @@ starts the agent anyway; output lands in the plugin state dir. The hook's
 stdout and stderr are logged there **verbatim and indefinitely** — the state
 dir is `0700`, but don't `echo`/`set -x` secrets in `setup.sh`: a token
 printed during dependency install stays on disk until you delete the log.
+
+## Comparing slots and picking a winner
+
+In the harvest pane, `w` opens the compare view, which replaces the slot list
+with one ranked row per slot. The same data is scriptable as
+`bash scripts/harvest-step.sh compare`, which emits one
+`compare_slot<TAB>{json}` per slot and one
+`compare_overlap<TAB>a<TAB>b<TAB>n<TAB>[files]` per candidate pair. It is
+read-only.
+
+| Column | Source |
+| --- | --- |
+| checks | The slot's `validate` result **for its current tip**: `passed`, `failed:<checks>`, `stale` (validated an older commit), or `not run`. Only Swarm's own record for this run and slot counts. |
+| commits / files / +/- | Against the run's recorded fork SHA. |
+| dirty | Uncommitted entries in the slot worktree. Those changes are not part of the merge. |
+| finished | `marker` / `exited` from finish detection, or `no`. |
+| overlap | For each pair of running slots, the files both changed: the merges likely to conflict. |
+
+**Ranking** is an order, not a score: checks (passed > not run > stale >
+failed), then having commits, then finished, then slot number. Diff size is
+shown but never ranked, because a smaller change isn't a better one. Settled
+slots (merged, skipped) are listed without a rank.
+
+In the compare view:
+
+- `d`, then two slot digits: the full diff between the two slots' tips, in
+  git's pager. The pane's terminal is handed over and restored, like the
+  merge-tree shell.
+- `m`, then a slot digit, then `y`: **merge the winner and skip the rest**.
+  The winner is merged **at the exact tip the table showed**: if its agent
+  committed since, the merge refuses and you re-open compare. Otherwise it
+  goes through the normal merge: re-previewed and drift-checked. If the merge
+  would now land in your checked-out branch and the confirm didn't say so,
+  you are asked again. **Only if that merge lands** are the other running
+  slots whose agent has *finished* marked skipped and archived. Slots still
+  working are left running and named. Branches are always kept. A worktree
+  that won't archive cleanly (dirty, ignored files, a working agent) is left
+  in place and named in the banner. If that's the winner's, its approval
+  prompt stays open. A winner that isn't clean, or a merge that conflicts,
+  skips nothing.
+
+Scripted, the same pin is `harvest-step.sh merge <slot> <base-sha>
+<slot-tip>`: it refuses unless the slot is still at `<slot-tip>`, then merges
+that SHA rather than the branch name.
+- `r` refreshes; `b`/Esc goes back.
+
+## Finish detection
+
+While the status pane is open, it runs `harvest-step.sh settle` every 10
+seconds (`HERDR_SWARM_SETTLE_INTERVAL_MS`). The renderer itself stays
+read-only. A running slot is recorded as **finished**, once, on either piece
+of evidence:
+
+| Evidence | Meaning |
+| --- | --- |
+| `marker` | The agent created `.swarm-done` in its worktree root. The task file's standing instructions ask for this, and fan-out excludes it from `git status` alongside `.swarm-task.md`. |
+| `exited` | The slot pane's foreground is its bare shell again (Herdr `pane process-info`: foreground group == shell). This only counts after the pane was once seen busy, and then on two consecutive settles. |
+
+A finished slot shows `finished` in the status pane (`blocked` still
+outranks it), and its plugin-reported agent state flips to `idle`. Its
+manifest row gains `finished: {at, reason}`, while its status stays `running`,
+so harvest behaves exactly as before. `exited` is reversible: if the pane is
+busy again (for example after Ctrl-Z then `fg`, or an agent you restarted),
+the slot goes back to `working`. `marker` is final. When every running slot
+has finished, Herdr shows **one** notification for the run. It isn't repeated
+if a slot later resumes and finishes again.
+
+Interactive agents that sit at a prompt when done (`claude`, `codex`) are only
+detected through the marker. Agents that don't follow the instruction stay
+`working` until you harvest. An argv that exits before it is ever seen busy
+(under one settle interval) is also only caught by the marker. Finish
+detection only runs while a status pane is open, or when you run `settle`
+yourself. A marker with content in it is treated as agent data, so archive
+needs the usual ignored-file approval to remove it.
+
+**Auto-validate (opt-in).** With `HERDR_SWARM_AUTO_VALIDATE=1`, or an empty
+`auto-validate` file in the plugin config dir, a slot that settles also starts
+a detached `validate` for that slot, if `validate.sh` exists (log:
+`auto-validate-<run>-s<slot>.log` in the state dir). Use the file when the
+status pane is opened through the plugin action, because action-launched panes
+never inherit your shell's environment. Validate's own rules still apply: a
+dirty slot is refused, not validated.
 
 ## Validating slots
 

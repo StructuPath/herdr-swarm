@@ -656,9 +656,12 @@ test("per-slot override lands in .swarm-task.md with the standing footer, exclud
 	// never push.
 	assert.match(tf, /Commit completed work locally/);
 	assert.match(tf, /Never push/);
-	// info/exclude (shared repo-wide) keeps the task file out of git status
-	// in the linked worktree — real git, real worktree.
-	assert.doesNotMatch(git(wt, "status", "--porcelain").stdout, /swarm-task/);
+	// Finish detection: the agent is asked for the marker settle reads.
+	assert.match(tf, /create an empty file named \.swarm-done in the worktree root \(do not commit it\)/);
+	// info/exclude (shared repo-wide) keeps the task file AND the finish
+	// marker out of git status in the linked worktree — real git, real worktree.
+	fs.writeFileSync(path.join(wt, ".swarm-done"), "");
+	assert.doesNotMatch(git(wt, "status", "--porcelain").stdout, /swarm-task|swarm-done/);
 	assert.equal(m.exclude_pattern_added, true);
 });
 
@@ -1217,4 +1220,90 @@ test("no env vars set: the interactive stdin protocol is untouched", () => {
 		"the preset menu is still printed",
 	);
 	assert.equal(readManifest().slots.length, 1);
+});
+
+// --- slot environment: env, ports, dependency clones (roadmap item 4) ---
+
+// A repo with an ignored node_modules (committed .gitignore), like a real
+// JS project: the dependency dir fresh worktrees lack.
+function setupWithDeps(extraEnv = {}) {
+	const ctx = setup(extraEnv);
+	fs.writeFileSync(path.join(ctx.repo, ".gitignore"), "node_modules/\n");
+	git(ctx.repo, "add", ".gitignore");
+	git(ctx.repo, "commit", "-q", "-m", "ignore deps");
+	fs.mkdirSync(path.join(ctx.repo, "node_modules", "pkg"), { recursive: true });
+	fs.writeFileSync(path.join(ctx.repo, "node_modules", "pkg", "index.js"), "module.exports = 1;\n");
+	return ctx;
+}
+
+test("each slot gets its env, a port range, and the ignored node_modules cloned in", () => {
+	const cfg = mkdtemp("hs-cfg-");
+	const seen = mkdtemp("hs-seen-");
+	// setup.sh records what it was told — outside the worktree, so the slot
+	// stays clean.
+	fs.writeFileSync(path.join(cfg, "setup.sh"),
+		`env | grep -E '^HERDR_SWARM_(RUN_ID|SLOT|PORT_BASE|PORT_SPAN)=' | sort > "${seen}/slot-$HERDR_SWARM_SLOT"\n` +
+		`[ -f node_modules/pkg/index.js ] && echo cloned-before-setup >> "${seen}/slot-$HERDR_SWARM_SLOT"\n`);
+	// Linux CI disks don't reflink: exercise the clone through copy mode there.
+	const { repo, env } = setupWithDeps({ HERDR_PLUGIN_CONFIG_DIR: cfg, STUB_HERDR_VERSION: "0.7.5",
+		...(process.platform === "darwin" ? {} : { HERDR_SWARM_CLONE_MODE: "copy" }) });
+	const r = runPane(lines(["2", "", "", "Task", ".", "", ""]), env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /slot 1: cloned node_modules/);
+	const m = readManifest();
+	for (const s of m.slots) {
+		const base = 4100 + (s.slot - 1) * 10;
+		assert.equal(s.port_base, base);
+		assert.equal(s.port_span, 10);
+		assert.equal(fs.readFileSync(path.join(s.path, "node_modules", "pkg", "index.js"), "utf8"), "module.exports = 1;\n");
+		assert.equal(git(s.path, "status", "--porcelain").stdout, "", "the clone is ignored, the slot stays clean");
+		assert.deepEqual(fs.readFileSync(path.join(seen, `slot-${s.slot}`), "utf8").trim().split("\n"), [
+			`HERDR_SWARM_PORT_BASE=${base}`, "HERDR_SWARM_PORT_SPAN=10", `HERDR_SWARM_RUN_ID=${m.run_id}`, `HERDR_SWARM_SLOT=${s.slot}`,
+			"cloned-before-setup",
+		]);
+		assert.match(fs.readFileSync(path.join(s.path, ".swarm-task.md"), "utf8"), new RegExp(`use only ports ${base}-${base + 9}\\.`));
+		// 0.7.5+: the agent's own pane is split with the same variables.
+		const split = log().split("\n").find((l) => l.includes("pane split") && l.includes(`--cwd ${s.path} `));
+		for (const kv of [`HERDR_SWARM_SLOT=${s.slot}`, `HERDR_SWARM_PORT_BASE=${base}`, `HERDR_SWARM_RUN_ID=${m.run_id}`])
+			assert.ok(split.includes(`--env ${kv}`), `${kv} in: ${split}`);
+	}
+});
+
+test("0.7.4: agent start never receives --env (it has no env field); setup.sh and the task file still do", () => {
+	const { repo, env } = setupWithDeps();
+	const r = runPane(lines(["1", "", "Task", ".", ""]), env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	const start = log().split("\n").find((l) => /agent start/.test(l));
+	assert.doesNotMatch(start, /--env/);
+	assert.match(fs.readFileSync(path.join(readManifest().slots[0].path, ".swarm-task.md"), "utf8"), /use only ports 4100-4109\./);
+});
+
+test("port range is configurable and refused when it does not fit", () => {
+	{
+		const { repo, env } = setup({ HERDR_SWARM_PORT_START: "5000", HERDR_SWARM_PORT_SPAN: "3" });
+		const r = runPane(lines(["2", "", "", "Task", ".", "", ""]), env, repo);
+		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+		assert.deepEqual(readManifest().slots.map((s) => s.port_base), [5000, 5003]);
+	}
+	for (const bad of [{ HERDR_SWARM_PORT_START: "80" }, { HERDR_SWARM_PORT_START: "65530" }, { HERDR_SWARM_PORT_SPAN: "x" }]) {
+		const { repo, env } = setup(bad);
+		const r = runPane(lines(["1", "", "Task", ".", ""]), env, repo);
+		assert.notEqual(r.status, 0, JSON.stringify(bad));
+		assert.match(r.stderr + r.stdout, /no valid port range/);
+	}
+	// Leading zeros are decimal, not octal, and land in the manifest as numbers.
+	{
+		const { repo, env } = setup({ HERDR_SWARM_PORT_START: "05000", HERDR_SWARM_PORT_SPAN: "010" });
+		const r = runPane(lines(["2", "", "", "Task", ".", "", ""]), env, repo);
+		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+		assert.deepEqual(readManifest().slots.map((s) => [s.port_base, s.port_span]), [[5000, 10], [5010, 10]]);
+	}
+});
+
+test("a port range that only overflows for a later slot refuses before any worktree is created", () => {
+	const { repo, env } = setup({ HERDR_SWARM_PORT_START: "65500", HERDR_SWARM_PORT_SPAN: "10" });
+	const r = runPane(lines(["4", "", "", "", "", "Task", ".", "", "", "", ""]), env, repo);
+	assert.notEqual(r.status, 0);
+	assert.match(r.stderr + r.stdout, /give 4 slots no valid port range/);
+	assert.doesNotMatch(log(), /worktree create/, "nothing was created");
 });

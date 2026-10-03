@@ -91,6 +91,10 @@ export function reconcileSlots(manifestSlots, agents, gitFacts) {
 					: row.pane_id && a.pane_id === row.pane_id,
 			);
 			state = live ? String(live.agent_status || "unknown") : "unknown";
+			// `settle` recorded the agent as finished (marker or exit). That is
+			// stronger than a plugin-reported "working" that nothing refreshed,
+			// but never hides "blocked": an agent waiting on input stays loud.
+			if (row.finished && state !== "blocked") state = "finished";
 		} else {
 			state = row.status;
 		}
@@ -103,6 +107,7 @@ export function reconcileSlots(manifestSlots, agents, gitFacts) {
 			pane_id: row.pane_id,
 			agent_name: row.agent_name,
 			state,
+			finished: row.finished ?? null,
 			committed: facts.committed ?? null,
 			uncommitted: facts.uncommitted ?? null,
 		};
