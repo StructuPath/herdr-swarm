@@ -101,7 +101,10 @@ creation, it reads and revalidates three separate files:
 
 1. `HERDR_SWARM_CANDIDATE_VALIDATION_FILE` uses the explicit `schema_version: 1`
    checks format above. Its `head_sha` must equal the selected HEAD, and every
-   check must be `passed`.
+   check must be `passed`. When the variable is unset, the slot's result from
+   `harvest-step.sh validate <slot>` is used if one exists (see the README's
+   "Validating slots"). It goes through the same reader and gates, and it is
+   still a local observation, not an attestation.
 2. `HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE` is a Browser QA `result.json` in the
    strict format above. Its commit must equal the same HEAD and its derived
    `browser-qa` check must be `passed`. The checks file cannot substitute for

@@ -364,6 +364,51 @@ stdout and stderr are logged there **verbatim and indefinitely** — the state
 dir is `0700`, but don't `echo`/`set -x` secrets in `setup.sh`: a token
 printed during dependency install stays on disk until you delete the log.
 
+## Validating slots
+
+Drop a `validate.sh` next to `setup.sh` in the plugin config dir, then run it
+against a slot with `v` then a slot digit in the harvest pane, or
+`bash scripts/harvest-step.sh validate <slot>`. It runs in the slot's worktree
+against the slot's **clean** HEAD, and records the result in that HEAD's
+checks format in the plugin state dir (`validation-<run>-s<slot>.json`, log
+alongside).
+
+```sh
+# $(herdr plugin config-dir structupath.swarm)/validate.sh
+npm test >/dev/null 2>&1 && echo "unit-tests passed" >>"$HERDR_SWARM_CHECKS_FILE" \
+  || { echo "unit-tests failed" >>"$HERDR_SWARM_CHECKS_FILE"; exit 1; }
+```
+
+- The hook sees `HERDR_SWARM_RUN_ID`, `HERDR_SWARM_SLOT`,
+  `HERDR_SWARM_HEAD_SHA`, and `HERDR_SWARM_CHECKS_FILE`. Writing
+  `<name> passed|failed|not_run` lines there is optional; Swarm always appends a
+  `validate` check for the hook's own exit status. A malformed, duplicate, or
+  reserved line records the whole result as failed rather than trusting part
+  of it.
+- A dirty slot refuses before the hook runs. If the slot is dirty or its HEAD
+  moved when the hook finishes, nothing is recorded (exit 36 or 30). A hook
+  that leaves build output behind needs that output gitignored.
+- Passing and failing hooks both exit 0 with a
+  `validated<TAB>slot<TAB>sha<TAB>passed|failed<TAB>path` record.
+- The repo lock is **released** while the hook runs, so a long suite never
+  blocks abort or harvest. The run, slot ownership, HEAD, and cleanliness are
+  re-verified under a fresh lock before the result is written.
+- `HERDR_SWARM_VALIDATE_TIMEOUT` (seconds, real time, default 900) bounds the
+  hook. When the hook exits, times out, or validate itself receives TERM, INT
+  or HUP (for example when the pane closes), the hook's whole process group is
+  sent TERM and then KILL. A dev server or test worker it started therefore
+  can't outlive it. A timeout is recorded as failed. A process that calls
+  `setsid` to leave its group is beyond reach.
+- Only one validate runs per slot at a time; a second is refused (exit 36).
+- `candidate-status` and `publish-candidate-pr` use this result when
+  `HERDR_SWARM_CANDIDATE_VALIDATION_FILE` is unset. In that case the file must
+  also be Swarm's record for the same run and slot. An explicit file always
+  wins. A result for an older commit reads as `stale`. Like supplied evidence,
+  the result is a local observation, not an attestation.
+- Validate does not wait for the slot's agent to go idle. Validate after the
+  agent has finished, or the suite may run against files that change mid-run.
+- The hook's output is logged verbatim, like `setup.sh`'s. Don't print secrets.
+
 ## Safety model
 
 - Agents commit locally and never push (standing instructions in every task

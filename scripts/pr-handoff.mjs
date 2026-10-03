@@ -108,7 +108,8 @@ function candidateRefuse(issue, message) {
 	throw new CandidateEvidenceError(issue, message);
 }
 
-function candidateValidation(filename, sha) {
+function candidateValidation(filename, plan) {
+	const sha = plan.sha;
 	if (!filename) candidateRefuse("validation_missing", "Candidate handoff requires a validation evidence file.");
 	let value;
 	try { value = JSON.parse(readEvidenceFile(filename, "Candidate validation evidence")); }
@@ -117,6 +118,14 @@ function candidateValidation(filename, sha) {
 		candidateRefuse("validation_invalid", `Candidate validation evidence is invalid: ${error.message}`);
 	}
 	if (value?.schema_version !== 1 || !Array.isArray(value.checks)) candidateRefuse("validation_invalid", "Candidate validation evidence must use the typed checks schema.");
+	// A file nobody named (the slot's default validate result) sits at a
+	// predictable path, so it must also prove it is Swarm's own record for
+	// exactly this run and slot, with the hook's own check present.
+	if (process.env.HERDR_SWARM_CANDIDATE_VALIDATION_PRODUCED === "1" &&
+		(value.kind !== "herdr-swarm-validation" || value.run_id !== plan.run || value.slot !== plan.slot ||
+			!value.checks.some(check => check?.name === "validate"))) {
+		candidateRefuse("validation_invalid", "The slot's validate result is not a Swarm validation record for this run and slot.");
+	}
 	if (value.head_sha !== sha) candidateRefuse("validation_stale", "Candidate validation evidence does not match the selected slot HEAD.");
 	let evidence;
 	try { evidence = parseValidationEvidence(value, sha); }
@@ -166,7 +175,7 @@ function candidateEvidence(plan) {
 		run_id: plan.run,
 		slot: plan.slot,
 		head_sha: plan.sha,
-		validation: candidateValidation(process.env.HERDR_SWARM_CANDIDATE_VALIDATION_FILE, plan.sha),
+		validation: candidateValidation(process.env.HERDR_SWARM_CANDIDATE_VALIDATION_FILE, plan),
 		browser_qa: candidateBrowserQa(process.env.HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE, plan.sha),
 		operator_review: candidateReview(process.env.HERDR_SWARM_CANDIDATE_REVIEW_FILE, plan),
 	};
@@ -194,7 +203,7 @@ function candidateStatus(plan, slotPath) {
 			return error.issue.slice(prefix.length + 1);
 		}
 	};
-	const validationStatus = inspect(() => candidateValidation(process.env.HERDR_SWARM_CANDIDATE_VALIDATION_FILE, plan.sha), "validation");
+	const validationStatus = inspect(() => candidateValidation(process.env.HERDR_SWARM_CANDIDATE_VALIDATION_FILE, plan), "validation");
 	const browserQaStatus = inspect(() => candidateBrowserQa(process.env.HERDR_SWARM_CANDIDATE_BROWSER_QA_FILE, plan.sha), "browser_qa");
 	let reviewDecision;
 	try {
