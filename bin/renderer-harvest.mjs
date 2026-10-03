@@ -62,6 +62,25 @@ export function previewFromStep(res) {
 // on views (conflict list, drift banner, prompts) without a PTY.
 // model: { runInfo, banner, phase, rows }  where rows carry {slot, label,
 // branch, status, preview} and phase is the state machine node.
+// The ignored-files prompt: every path when there are few, otherwise counts
+// per top-level entry — a cloned node_modules is ten thousand lines nobody
+// reads. Display only: the approval still binds the exact digest of every
+// file, and the verb's stdout (ignored_json) still lists each one.
+export function summarizeIgnored(files, limit = 20) {
+	const names = files.map((f) => sanitizeText(String(f)));
+	if (names.length <= limit) return names;
+	const groups = new Map();
+	for (const n of names) {
+		const slash = n.indexOf("/");
+		const key = slash === -1 ? n : `${n.slice(0, slash)}/`;
+		groups.set(key, (groups.get(key) ?? 0) + 1);
+	}
+	const sorted = [...groups].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+	const shown = sorted.slice(0, limit).map(([k, c]) => `${k}  ${c} file${c === 1 ? "" : "s"}`);
+	if (sorted.length > limit) shown.push(`… and ${sorted.length - limit} more entries`);
+	return [`${names.length} files:`, ...shown];
+}
+
 // The pane's env minus every variable that reroutes or reconfigures git —
 // the same list scripts/lib.sh clear_git_routing_env removes.
 const GIT_ROUTING = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -243,7 +262,7 @@ export function renderHarvest(model, cols = 80) {
 			lines.push(
 				` ARCHIVE slot ${ph.slot}: removal would silently delete these ignored files:`,
 			);
-			for (const f of ph.files ?? []) lines.push(`   ${sanitizeText(f)}`);
+			lines.push(...summarizeIgnored(ph.files ?? []).map((l) => `   ${l}`.slice(0, cols)));
 			lines.push(`${ESC}[2m [y]archive anyway  [n]keep the worktree${ESC}[0m`);
 			break;
 		case "publish-pick":

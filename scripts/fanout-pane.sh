@@ -541,6 +541,11 @@ done
 # after worktree create would strand a half-built run (R3/R4).
 preflight_check_argv "${slot_argvs[@]}" || fatal $?
 
+# Same rule for ports: the HIGHEST slot's range is checked here, so a range
+# that only overflows for slot N never strands slots 1..N-1 half-built.
+slot_port_base "$n" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_PORT_START/_SPAN give $n slots no valid port range (need 1024-65535, decimal)."
+port_span="$(slot_port_span)"
+
 # --- Run identity and manifest ----------------------------------------------
 
 # Timestamp + urandom nonce, then sanitized: run-unique branch names are the
@@ -623,6 +628,12 @@ for ((i = 1; i <= n; i++)); do
 	patch="$(created_patch_json "$wt_path" "$slot_ws" "$root_pane_id" "$root_term_id")" || fatal 1 "herdr-swarm: internal error building the slot patch."
 	manifest_update_slot "$i" "$patch" || fatal 1 "herdr-swarm: manifest write failed recording slot $i — stopping."
 
+	# Validated for slot n before the loop, so this cannot fail mid-run; both
+	# values are normalized decimal integers, safe to splice into JSON.
+	port_base="$(slot_port_base "$i")" || fatal 1 "herdr-swarm: internal error: slot $i port range."
+	manifest_update_slot "$i" "{\"port_base\":$port_base,\"port_span\":$port_span}" ||
+		fatal 1 "herdr-swarm: manifest write failed recording slot $i ports — stopping."
+
 	# The task file is the prompt channel (input-channel KTD): presets
 	# reference .swarm-task.md by convention, no placeholder substitution.
 	if ! {
@@ -632,10 +643,28 @@ for ((i = 1; i <= n; i++)); do
 		printf -- '- Commit completed work locally as you go.\n'
 		printf -- '- Never push. Never switch branches.\n'
 		printf -- '- When the task is finished and committed, create an empty file named %s in the worktree root (do not commit it), then stop.\n' "$SWARM_DONE_FILE"
+		printf -- '- Other agents work on this repo in parallel. If you start a server, use only ports %s-%s.\n' "$port_base" "$((port_base + port_span - 1))"
 	} >"$wt_path/$SWARM_TASK_FILE"; then
 		mark_failed "$i" "could not write $SWARM_TASK_FILE in $wt_path"
 		continue
 	fi
+
+	# Clone ignored dependency dirs (default: node_modules) copy-on-write, so
+	# the agent does not start in a worktree missing its deps. Before setup.sh,
+	# which can then build on them. Never fails the slot.
+	while IFS=$'\t' read -r kind rel why; do
+		case "$kind" in
+		cloned) echo "herdr-swarm: slot $i: cloned $rel" ;;
+		# Absent in the repo is the normal case for the default list: quiet.
+		clone_skipped) [ "$why" = "not present in the repo" ] || echo "herdr-swarm: WARNING slot $i: did not clone $rel — $why" >&2 ;;
+		esac
+	done < <(provision_slot_paths "$repo_root" "$wt_path")
+
+	# What every slot process is told about itself: setup.sh here, and the
+	# agent through `pane split --env` on 0.7.5+ (0.7.4's `agent start` has no
+	# env field — there the task file above is the channel).
+	slot_env=(HERDR_SWARM_RUN_ID="$run_id" HERDR_SWARM_SLOT="$i"
+		HERDR_SWARM_PORT_BASE="$port_base" HERDR_SWARM_PORT_SPAN="$port_span")
 
 	# Optional per-repo setup hook: fresh worktrees lack gitignored deps
 	# (.env, node_modules), the most likely "all my agents failed" cause.
@@ -644,7 +673,7 @@ for ((i = 1; i <= n; i++)); do
 	setup_hook="${HERDR_PLUGIN_CONFIG_DIR:-}/setup.sh"
 	if [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "$setup_hook" ]; then
 		setup_log="$(state_dir)/setup-$run_id-s$i.log"
-		if ! (cd "$wt_path" && with_timeout "${HERDR_SWARM_SETUP_TIMEOUT:-300}" bash "$setup_hook") >"$setup_log" 2>&1; then
+		if ! (cd "$wt_path" && export "${slot_env[@]}" && with_timeout "${HERDR_SWARM_SETUP_TIMEOUT:-300}" bash "$setup_hook") >"$setup_log" 2>&1; then
 			echo "herdr-swarm: WARNING slot $i setup.sh failed (see $setup_log) — starting agent anyway" >&2
 			setup_failures=$((setup_failures + 1))
 		fi
@@ -663,6 +692,7 @@ for ((i = 1; i <= n; i++)); do
 	# --cwd is EXPLICIT and mandatory on both paths: --workspace alone does
 	# NOT put the agent in the worktree — it inherits the server's cwd
 	# (spike (k)).
+	for kv in "${slot_env[@]}"; do start_args+=(--env "$kv"); done
 	start_args+=(--cwd "$wt_path" --no-focus -- "${argv_arr[@]}")
 	if ! sout="$(herdr_agent_start "${start_args[@]}")"; then
 		mark_failed "$i" "agent start failed"

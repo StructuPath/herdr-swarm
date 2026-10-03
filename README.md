@@ -351,9 +351,66 @@ codex-fast|argv|codex --profile fast
 
 Every slot starts in a **fresh** worktree: gitignored files — `.env`,
 `node_modules`, build caches, installed deps — are absent. This is the most
-likely cause of "all my agents failed instantly": either have the task prompt
-tell agents to install deps first, or prep each worktree yourself before the
-agents get going. The same applies to repo hooks during harvest: a hook that
+likely cause of "all my agents failed instantly". Swarm handles the common
+case itself (below); for anything else, have the task prompt tell agents to
+install deps first, or use `setup.sh`.
+
+### Dependency clones
+
+Fan-out clones `node_modules` from your repo root into each new worktree.
+It uses copy-on-write: `/bin/cp -c` (APFS clonefile) on macOS, and
+`cp --reflink=always` on Linux. A clone is near-instant and takes no extra
+disk until a file changes. To clone other paths, list them in `clone-paths`
+in the plugin config dir, one repo-relative path per line (`#` comments). That
+list replaces the default, and an empty file turns cloning off.
+
+A path is cloned only if it exists in the repo, is **ignored** by git there,
+is absent in the worktree, and doesn't resolve outside the repo or worktree
+through a symlinked parent. Tracked content always comes from the checkout and
+is never overwritten.
+
+Where copy-on-write isn't available, behaviour depends on the platform:
+
+- **Linux** (for example ext4): the path is skipped with a warning.
+  `HERDR_SWARM_CLONE_MODE=copy` accepts a real copy instead.
+- **macOS:** `cp -c` silently falls back to a full copy when it can't clone,
+  for example on a non-APFS volume or with worktrees on another volume.
+
+`HERDR_SWARM_CLONE_TIMEOUT` (default 120 s) bounds each clone. A timeout stops
+`cp` and everything it started, and removes the partial copy. A clone failure
+never fails the slot. Cloning happens before `setup.sh`, so the hook can build
+on it.
+
+Each clone is a snapshot of your repo's *current* `node_modules`, not one
+installed from the fork commit's lockfile. If those can differ, have
+`setup.sh` run your installer anyway (`npm ci` on top of a clone is fast).
+Only list relocatable paths. A Python `.venv` has absolute paths baked into
+its scripts, so a cloned one installs into your main checkout's venv. Build
+those in `setup.sh` instead.
+
+`.env` and other secrets are **not** in the default list on purpose. Copying
+credentials into agent worktrees is your call: add them to `clone-paths` if
+you want them. Like any ignored content, cloned paths count as ignored files
+when the worktree is archived, so removing them needs the usual approval. The
+harvest prompt summarizes large sets by top-level directory (for example
+`node_modules/  10000 files`); the approval still covers every exact file.
+
+### Slot variables and ports
+
+Each slot gets `HERDR_SWARM_RUN_ID`, `HERDR_SWARM_SLOT`,
+`HERDR_SWARM_PORT_BASE` and `HERDR_SWARM_PORT_SPAN`:
+
+- **`setup.sh`** always sees them.
+- **The agent process** sees them on Herdr 0.7.5+, set through `pane split
+  --env` (live-verified on 0.8.2). On 0.7.4, `agent start` has no environment
+  field, so there the agent learns its ports from the task file.
+- **The task file's standing instructions** tell every agent to use only its
+  own port range when it starts a server.
+
+Ports start at `HERDR_SWARM_PORT_START` (default 4100), with
+`HERDR_SWARM_PORT_SPAN` (default 10) per slot: slot 1 gets 4100–4109, slot 2
+gets 4110–4119. This is a convention the agents are told, not an OS
+reservation. A range that doesn't fit in 1024–65535 refuses the fan-out. The same applies to repo hooks during harvest: a hook that
 shells into `node_modules/.bin` fails in the plugin-owned merge worktree —
 `HERDR_SWARM_HARVEST_WT_NO_HOOKS=1` disables hooks in that worktree *only*
 (never in your tree). To automate worktree prep, drop a `setup.sh` in the
