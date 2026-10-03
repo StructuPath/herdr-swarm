@@ -756,6 +756,24 @@ test("archive: inventory prompt on an agent-created ignored file, none on the ta
 	fs.writeFileSync(path.join(run5.wt(1), ".swarm-done"), "agent notes\n");
 	r = step(run5, "archive", [1]);
 	assert.equal(r.status, EC.IGNORED, `${r.stdout}\n${r.stderr}`);
+	// A real dependency tree (thousands of ignored files) must still be
+	// approvable: the inventory used to travel as ONE argv string, which
+	// failed exec with E2BIG past ARG_MAX and kept the worktree forever.
+	const big = mkRun({ status: "skipped" });
+	fs.appendFileSync(path.join(big.repo, ".git/info/exclude"), "node_modules/\n");
+	for (let p = 0; p < 100; p++) {
+		const dir = path.join(big.wt(1), "node_modules", `pkg-with-a-realistic-name-${p}`, "lib", "nested");
+		fs.mkdirSync(dir, { recursive: true });
+		for (let f = 0; f < 100; f++) fs.writeFileSync(path.join(dir, `module-file-${f}.js`), "");
+	}
+	r = step(big, "archive", [1]);
+	assert.equal(r.status, EC.IGNORED, `${r.stdout.slice(0, 500)}\n${r.stderr}`);
+	// 10k paths: the inventory JSON (each path base64 + display) is ~2 MiB.
+	assert.equal(r.stdout.split("\n").filter((l) => l.startsWith("ignored_json\t")).length, 10_000);
+	r = step(big, "archive", [1], { HERDR_SWARM_CLEANUP_APPROVAL: cleanupApproval(r.stdout) });
+	assert.equal(r.status, 0, r.stderr);
+	assert.equal(big.slotRow(1).status, "archived");
+	assert.equal(fs.existsSync(big.wt(1)), false);
 	// …and only at the slot root, byte-exact: a nested one is user data.
 	const run4 = mkRun({ status: "skipped" });
 	fs.mkdirSync(path.join(run4.wt(1), "sub"));
