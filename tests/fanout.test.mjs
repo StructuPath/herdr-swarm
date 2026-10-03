@@ -1244,7 +1244,9 @@ test("each slot gets its env, a port range, and the ignored node_modules cloned 
 	fs.writeFileSync(path.join(cfg, "setup.sh"),
 		`env | grep -E '^HERDR_SWARM_(RUN_ID|SLOT|PORT_BASE|PORT_SPAN)=' | sort > "${seen}/slot-$HERDR_SWARM_SLOT"\n` +
 		`[ -f node_modules/pkg/index.js ] && echo cloned-before-setup >> "${seen}/slot-$HERDR_SWARM_SLOT"\n`);
-	const { repo, env } = setupWithDeps({ HERDR_PLUGIN_CONFIG_DIR: cfg, STUB_HERDR_VERSION: "0.7.5" });
+	// Linux CI disks don't reflink: exercise the clone through copy mode there.
+	const { repo, env } = setupWithDeps({ HERDR_PLUGIN_CONFIG_DIR: cfg, STUB_HERDR_VERSION: "0.7.5",
+		...(process.platform === "darwin" ? {} : { HERDR_SWARM_CLONE_MODE: "copy" }) });
 	const r = runPane(lines(["2", "", "", "Task", ".", "", ""]), env, repo);
 	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 	assert.match(r.stdout, /slot 1: cloned node_modules/);

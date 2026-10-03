@@ -353,16 +353,31 @@ function provisionFixture(list) {
 	return { repo, wt, cfg, run, records };
 }
 
-test("provision clones the default node_modules copy-on-write, symlinks intact", () => {
+// macOS test disks are APFS, so the default clonefile path really runs.
+// Linux CI is ext4 (no reflinks): there the default mode must SKIP, and the
+// clone mechanics are exercised through copy mode instead.
+const cloneEnv = process.platform === "darwin" ? {} : { HERDR_SWARM_CLONE_MODE: "copy" };
+
+test("provision clones the default node_modules, symlinks intact", () => {
 	const f = provisionFixture(null);
-	const r = f.run();
+	const r = f.run(cloneEnv);
 	assert.equal(r.status, 0, r.stderr);
 	assert.deepEqual(f.records(r), [["cloned", "node_modules"]]);
 	assert.equal(fs.readFileSync(path.join(f.wt, "node_modules", "pkg", "a.js"), "utf8"), "a\n");
 	assert.equal(fs.readlinkSync(path.join(f.wt, "node_modules", "linked")), "pkg");
 	assert.deepEqual(fs.readdirSync(f.wt).filter((n) => n.startsWith(".swarm-clone")), [], "no temp left behind");
 	// Second run: already present, never overwritten.
-	assert.deepEqual(f.records(f.run()), [["clone_skipped", "node_modules", "already present in the worktree"]]);
+	assert.deepEqual(f.records(f.run(cloneEnv)), [["clone_skipped", "node_modules", "already present in the worktree"]]);
+});
+
+test("without copy-on-write, the default mode skips instead of silently copying (Linux)", { skip: process.platform === "darwin" && "macOS cp -c falls back to a copy by design" }, () => {
+	const f = provisionFixture(null);
+	const recs = f.records(f.run());
+	// A runner whose filesystem DOES reflink (btrfs/xfs) legitimately clones.
+	if (recs[0]?.[0] === "cloned") return;
+	assert.deepEqual(recs.map((r) => r.slice(0, 2)), [["clone_skipped", "node_modules"]]);
+	assert.match(recs[0][2], /clone failed or timed out/);
+	assert.deepEqual(fs.readdirSync(f.wt).filter((n) => n.startsWith(".swarm-clone") || n === "node_modules"), []);
 });
 
 test("provision refuses anything that is not an ignored, in-repo, absent path", () => {
