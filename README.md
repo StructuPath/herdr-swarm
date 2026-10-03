@@ -24,12 +24,13 @@ Conductor).
   - On **0.7.5+**, the plugin builds each slot itself — `pane split` into the
     worktree, `pane run` for the slot's argv, `pane report-agent` to register
     it — so slots run *any* command, but their state is **plugin-reported**:
-    `working` when the slot starts, `idle` once a harvest preview finds the
-    slot finished. Nothing polls in between, so a 0.7.5 slot that finishes on
-    its own still reads `working` until you open harvest. This is cosmetic:
-    committed work is mergeable regardless. Archive separately requires a
-    settled agent (`idle`, `done`, or absent) before removing its worktree;
-    harvest refreshes the completed slot's reported state before auto-archive.
+    `working` when the slot starts. Because the plugin holds that state,
+    Herdr stops reading the screen, so nothing else ever flips it. Finish
+    detection (below) does that while the status pane is open, and so does a
+    harvest preview. Committed work is mergeable regardless. Archive
+    separately requires a settled agent (`idle`, `done`, or absent) before
+    removing its worktree; harvest refreshes the completed slot's reported
+    state before auto-archive.
   - On **0.7.5+**, `pane run` hands the slot's argv to the pane's **shell**,
     not to `exec` — a preset containing shell metacharacters is interpreted
     there, unlike on 0.7.4. Presets are your own config, but keep them to a
@@ -363,6 +364,43 @@ starts the agent anyway; output lands in the plugin state dir. The hook's
 stdout and stderr are logged there **verbatim and indefinitely** — the state
 dir is `0700`, but don't `echo`/`set -x` secrets in `setup.sh`: a token
 printed during dependency install stays on disk until you delete the log.
+
+## Finish detection
+
+While the status pane is open, it runs `harvest-step.sh settle` every 10
+seconds (`HERDR_SWARM_SETTLE_INTERVAL_MS`). The renderer itself stays
+read-only. A running slot is recorded as **finished**, once, on either piece
+of evidence:
+
+| Evidence | Meaning |
+| --- | --- |
+| `marker` | The agent created `.swarm-done` in its worktree root. The task file's standing instructions ask for this, and fan-out excludes it from `git status` alongside `.swarm-task.md`. |
+| `exited` | The slot pane's foreground is its bare shell again (Herdr `pane process-info`: foreground group == shell). This only counts after the pane was once seen busy, and then on two consecutive settles. |
+
+A finished slot shows `finished` in the status pane (`blocked` still
+outranks it), and its plugin-reported agent state flips to `idle`. Its
+manifest row gains `finished: {at, reason}`, while its status stays `running`,
+so harvest behaves exactly as before. `exited` is reversible: if the pane is
+busy again (for example after Ctrl-Z then `fg`, or an agent you restarted),
+the slot goes back to `working`. `marker` is final. When every running slot
+has finished, Herdr shows **one** notification for the run. It isn't repeated
+if a slot later resumes and finishes again.
+
+Interactive agents that sit at a prompt when done (`claude`, `codex`) are only
+detected through the marker. Agents that don't follow the instruction stay
+`working` until you harvest. An argv that exits before it is ever seen busy
+(under one settle interval) is also only caught by the marker. Finish
+detection only runs while a status pane is open, or when you run `settle`
+yourself. A marker with content in it is treated as agent data, so archive
+needs the usual ignored-file approval to remove it.
+
+**Auto-validate (opt-in).** With `HERDR_SWARM_AUTO_VALIDATE=1`, or an empty
+`auto-validate` file in the plugin config dir, a slot that settles also starts
+a detached `validate` for that slot, if `validate.sh` exists (log:
+`auto-validate-<run>-s<slot>.log` in the state dir). Use the file when the
+status pane is opened through the plugin action, because action-launched panes
+never inherit your shell's environment. Validate's own rules still apply: a
+dirty slot is refused, not validated.
 
 ## Validating slots
 

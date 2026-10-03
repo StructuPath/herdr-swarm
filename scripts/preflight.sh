@@ -49,6 +49,10 @@ PF_EC_SPARSE=20
 # gitignore syntax treats a trailing " # comment" as part of the pattern —
 # there is no way to tag the line itself.
 SWARM_TASK_FILE=".swarm-task.md"
+# The finish marker the task file asks agents to create (`settle` reads it).
+# Same namespace rule, excluded alongside the task file, and skipped by the
+# ignored-file inventory exactly like it (safety-state.mjs).
+SWARM_DONE_FILE=".swarm-done"
 
 # Also the validation that SWARM_REPO itself is usable: it is resolved before
 # this runs (see above), and an empty value means resolution already failed.
@@ -266,15 +270,17 @@ ensure_exclude_pattern() {
 	_manifest_set_exclude_flag true || return $?
 	mkdir -p "$(dirname "$ex")" || return 1
 	[ -f "$ex" ] || : >"$ex"
-	if ! grep -qFx "$SWARM_TASK_FILE" "$ex"; then
+	local pattern
+	for pattern in "$SWARM_TASK_FILE" "$SWARM_DONE_FILE"; do
+		grep -qFx "$pattern" "$ex" && continue
 		# A final line without \n would glue our pattern onto it, corrupting
 		# both patterns — normalize first. $(tail -c1) is empty iff the last
 		# byte is a newline (command substitution strips it).
 		if [ -s "$ex" ] && [ -n "$(tail -c1 "$ex")" ]; then
 			echo >>"$ex"
 		fi
-		printf '%s\n' "$SWARM_TASK_FILE" >>"$ex"
-	fi
+		printf '%s\n' "$pattern" >>"$ex"
+	done
 	return 0
 }
 
@@ -289,7 +295,7 @@ remove_exclude_pattern() {
 	ex="$(repo_git_path info/exclude)" || return 1
 	if [ -f "$ex" ]; then
 		tmp="$ex.tmp.$$"
-		if ! awk -v p="$SWARM_TASK_FILE" '$0 != p' "$ex" >"$tmp"; then
+		if ! awk -v p="$SWARM_TASK_FILE" -v q="$SWARM_DONE_FILE" '$0 != p && $0 != q' "$ex" >"$tmp"; then
 			rm -f "$tmp"
 			return 1
 		fi

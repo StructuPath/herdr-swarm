@@ -55,5 +55,9 @@ pane_export_context status "$mf"
 if [ -n "$repo_root" ]; then
 	export HERDR_SWARM_REPO_ROOT="$repo_root"
 fi
+# Finish detection: the renderer stays read-only and periodically runs the
+# `settle` verb, which owns every write (see do_settle in harvest-step.sh).
+HERDR_SWARM_SETTLE_SCRIPT="$PWD/scripts/harvest-step.sh"
+export HERDR_SWARM_SETTLE_SCRIPT
 
 exec node bin/renderer.mjs

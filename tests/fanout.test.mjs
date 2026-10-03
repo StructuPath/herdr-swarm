@@ -656,9 +656,12 @@ test("per-slot override lands in .swarm-task.md with the standing footer, exclud
 	// never push.
 	assert.match(tf, /Commit completed work locally/);
 	assert.match(tf, /Never push/);
-	// info/exclude (shared repo-wide) keeps the task file out of git status
-	// in the linked worktree — real git, real worktree.
-	assert.doesNotMatch(git(wt, "status", "--porcelain").stdout, /swarm-task/);
+	// Finish detection: the agent is asked for the marker settle reads.
+	assert.match(tf, /create an empty file named \.swarm-done in the worktree root \(do not commit it\)/);
+	// info/exclude (shared repo-wide) keeps the task file AND the finish
+	// marker out of git status in the linked worktree — real git, real worktree.
+	fs.writeFileSync(path.join(wt, ".swarm-done"), "");
+	assert.doesNotMatch(git(wt, "status", "--porcelain").stdout, /swarm-task|swarm-done/);
 	assert.equal(m.exclude_pattern_added, true);
 });
 

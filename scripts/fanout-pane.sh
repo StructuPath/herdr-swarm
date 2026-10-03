@@ -631,6 +631,7 @@ for ((i = 1; i <= n; i++)); do
 		printf -- '- Work only in this worktree, on branch %s.\n' "$branch"
 		printf -- '- Commit completed work locally as you go.\n'
 		printf -- '- Never push. Never switch branches.\n'
+		printf -- '- When the task is finished and committed, create an empty file named %s in the worktree root (do not commit it), then stop.\n' "$SWARM_DONE_FILE"
 	} >"$wt_path/$SWARM_TASK_FILE"; then
 		mark_failed "$i" "could not write $SWARM_TASK_FILE in $wt_path"
 		continue

@@ -107,7 +107,7 @@ export function makeFannedOutRun(h, opts = {}) {
 	const runId = `${opts.prefix ?? "r"}${++runSeq}`;
 	const fork = git(repo, "rev-parse", "HEAD").stdout.trim();
 	const sdir = mkdtemp("hs-run-");
-	fs.appendFileSync(path.join(repo, ".git/info/exclude"), ".swarm-task.md\n");
+	fs.appendFileSync(path.join(repo, ".git/info/exclude"), ".swarm-task.md\n.swarm-done\n");
 	const slots = [];
 	for (let i = 1; i <= nslots; i++) {
 		const branch = `swarm/${runId}/s${i}`;
@@ -359,6 +359,22 @@ if [ "$1" = "pane" ] && [ "$2" = "report-agent" ]; then
   exit 0
 fi
 if [ "$1" = "pane" ] && [ "$2" = "read" ]; then exit "\${STUB_PANE_ALIVE:-1}"; fi
+if [ "$1" = "pane" ] && [ "$2" = "process-info" ]; then
+  # Live-captured on 0.8.2 (protocol 20), paths sanitized. STUB_PANE_FG picks
+  # the pane's foreground: "busy" (argv running), "shell" (argv exited — the
+  # foreground group IS the shell), unset = herdr refuses (older herdr).
+  case "\${STUB_PANE_FG:-}" in
+  busy) echo '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":53782,"foreground_processes":[{"argv":["sleep","40"],"argv0":"sleep","cmdline":"sleep 40","cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","name":"sleep","pid":53782}],"pane_id":"w9:p7","shell_pid":53593},"type":"pane_process_info"}}' ;;
+  shell) echo '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":53593,"foreground_processes":[{"argv":["-zsh"],"argv0":"zsh","cmdline":"-zsh","cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","name":"zsh","pid":53593}],"pane_id":"w9:p7","shell_pid":53593},"type":"pane_process_info"}}' ;;
+  *) exit 1 ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "notification" ] && [ "$2" = "show" ]; then
+  # Live-captured on 0.8.2.
+  echo '{"id":"cli:notification:show","result":{"reason":"shown","shown":true,"type":"notification_show"}}'
+  exit 0
+fi
 exit 0`,
 		);
 	}
