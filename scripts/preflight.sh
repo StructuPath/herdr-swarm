@@ -53,6 +53,9 @@ SWARM_TASK_FILE=".swarm-task.md"
 # Same namespace rule, excluded alongside the task file, and skipped by the
 # ignored-file inventory exactly like it (safety-state.mjs).
 SWARM_DONE_FILE=".swarm-done"
+# Temp name provision_slot_paths clones into before renaming into place;
+# excluded so a temp left by a killed fan-out can never be committed.
+SWARM_CLONE_TEMP_PATTERN=".swarm-clone.*"
 
 # Also the validation that SWARM_REPO itself is usable: it is resolved before
 # this runs (see above), and an empty value means resolution already failed.
@@ -271,7 +274,7 @@ ensure_exclude_pattern() {
 	mkdir -p "$(dirname "$ex")" || return 1
 	[ -f "$ex" ] || : >"$ex"
 	local pattern
-	for pattern in "$SWARM_TASK_FILE" "$SWARM_DONE_FILE"; do
+	for pattern in "$SWARM_TASK_FILE" "$SWARM_DONE_FILE" "$SWARM_CLONE_TEMP_PATTERN"; do
 		grep -qFx "$pattern" "$ex" && continue
 		# A final line without \n would glue our pattern onto it, corrupting
 		# both patterns — normalize first. $(tail -c1) is empty iff the last
@@ -295,7 +298,7 @@ remove_exclude_pattern() {
 	ex="$(repo_git_path info/exclude)" || return 1
 	if [ -f "$ex" ]; then
 		tmp="$ex.tmp.$$"
-		if ! awk -v p="$SWARM_TASK_FILE" -v q="$SWARM_DONE_FILE" '$0 != p && $0 != q' "$ex" >"$tmp"; then
+		if ! awk -v p="$SWARM_TASK_FILE" -v q="$SWARM_DONE_FILE" -v c="$SWARM_CLONE_TEMP_PATTERN" '$0 != p && $0 != q && $0 != c' "$ex" >"$tmp"; then
 			rm -f "$tmp"
 			return 1
 		fi
@@ -306,6 +309,136 @@ remove_exclude_pattern() {
 	fi
 	_manifest_set_exclude_flag false 2>/dev/null || true
 	return 0
+}
+
+# --- Slot environment --------------------------------------------------------
+
+# clone_path_list: the repo-relative paths fan-out clones into each new
+# worktree. `clone-paths` in the plugin config dir (one per line, # comments)
+# replaces the default; an empty file means none. Default: node_modules — the
+# dependency dir whose absence is the classic "every agent failed instantly".
+clone_path_list() {
+	local f="${HERDR_PLUGIN_CONFIG_DIR:-}/clone-paths"
+	if [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "$f" ]; then
+		sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$f" | grep -v '^$' || true
+	else
+		printf 'node_modules\n'
+	fi
+}
+
+# clone_one <src> <dst>: copy-on-write, unless HERDR_SWARM_CLONE_MODE=copy.
+# macOS: /bin/cp -c (clonefile(2)) — /bin explicitly, because a GNU cp
+# earlier on PATH reads -c differently. Where clonefile is unsupported (a
+# non-APFS volume, or worktrees on another volume) BSD cp silently falls back
+# to a regular copy; HERDR_SWARM_CLONE_TIMEOUT bounds that. Linux:
+# --reflink=always, which fails fast where reflinks are unsupported.
+clone_one() {
+	local src="$1" dst="$2"
+	if [ "${HERDR_SWARM_CLONE_MODE:-clone}" = copy ]; then
+		cp -R "$src" "$dst"
+	elif [ "$(uname -s)" = Darwin ]; then
+		/bin/cp -c -R "$src" "$dst"
+	else
+		cp -R --reflink=always "$src" "$dst"
+	fi
+}
+
+# _physically_within <dir> <root>: <dir>, symlinks resolved, is <root> or
+# below it.
+_physically_within() {
+	local d r
+	d="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+	r="$(cd "$2" 2>/dev/null && pwd -P)" || return 1
+	case "$d/" in "$r"/*) return 0 ;; esac
+	return 1
+}
+
+# provision_slot_paths <repo_root> <worktree>: clone each listed path from the
+# repo root into a fresh worktree, so agents start with dependencies present.
+# A path is cloned only if it is relative and stays inside the repo, exists
+# there, is IGNORED by git there (tracked content already came with the
+# checkout — never overwrite it), and is absent in the worktree. Each clone
+# lands in a unique temp sibling first and is renamed into place, so a failed
+# or timed-out clone leaves nothing half-copied under the real name; only that
+# temp, which this function just created, is ever removed. Best-effort: a
+# skipped or failed path warns and fan-out continues (setup.sh may provide
+# it). Prints `cloned<TAB>path` / `clone_skipped<TAB>path<TAB>why` lines.
+provision_slot_paths() {
+	local repo="$1" wt="$2" rel src dst tmp why
+	while IFS= read -r rel; do
+		[ -n "$rel" ] || continue
+		why=""
+		case "/$rel/" in
+		/./* | //* | */../* | */./*) why="must be a plain relative path inside the repo" ;;
+		esac
+		src="$repo/$rel"
+		dst="$wt/$rel"
+		if [ -z "$why" ]; then
+			if [ ! -e "$src" ]; then
+				why="not present in the repo"
+			elif [ -L "$src" ]; then
+				why="is a symlink in the repo"
+			elif [ -e "$dst" ] || [ -L "$dst" ]; then
+				why="already present in the worktree"
+			elif [ ! -d "$(dirname "$dst")" ]; then
+				why="parent directory missing in the worktree"
+			elif ! _physically_within "$(dirname "$src")" "$repo" || ! _physically_within "$(dirname "$dst")" "$wt"; then
+				# A symlinked parent (tracked `vendor -> ../..`) would read from or
+				# write to somewhere that is not this repo / this worktree.
+				why="a parent directory resolves outside the repo or worktree"
+			elif ! git -C "$repo" check-ignore -q -- "$rel" 2>/dev/null; then
+				why="not ignored by git (tracked content comes with the checkout)"
+			fi
+		fi
+		if [ -n "$why" ]; then
+			printf 'clone_skipped\t%s\t%s\n' "$rel" "$why"
+			continue
+		fi
+		tmp="$(dirname "$dst")/.swarm-clone.$$.$(basename "$dst")"
+		# with_GROUP_timeout: a timeout must stop cp itself, not just the
+		# subshell running clone_one — an orphaned cp would keep writing into
+		# the temp after the rm below, racing it and leaving a half-tree the
+		# agent could commit. (The temp name is also in info/exclude.)
+		if with_group_timeout "${HERDR_SWARM_CLONE_TIMEOUT:-120}" clone_one "$src" "$tmp" 2>/dev/null && mv "$tmp" "$dst"; then
+			printf 'cloned\t%s\n' "$rel"
+		else
+			rm -rf "$tmp" 2>/dev/null
+			if [ -e "$tmp" ] || [ -L "$tmp" ]; then
+				printf 'clone_skipped\t%s\t%s\n' "$rel" "clone failed and its temp $tmp could not be removed — delete it by hand"
+			else
+				printf 'clone_skipped\t%s\t%s\n' "$rel" "clone failed or timed out (HERDR_SWARM_CLONE_TIMEOUT; HERDR_SWARM_CLONE_MODE=copy forces a full copy where copy-on-write is unavailable)"
+			fi
+		fi
+	done < <(clone_path_list)
+}
+
+# slot_port_base <slot>: the first of HERDR_SWARM_PORT_SPAN (default 10)
+# ports reserved for this slot, from HERDR_SWARM_PORT_START (default 4100):
+# slot 1 → 4100–4109, slot 2 → 4110–4119. A convention the agents are told
+# about, not a reservation the OS enforces.
+slot_port_base() {
+	local start span base
+	start="$(_port_decimal "${HERDR_SWARM_PORT_START:-4100}")" || return 1
+	span="$(slot_port_span)" || return 1
+	[ "$span" -ge 1 ] || return 1
+	base=$((start + ($1 - 1) * span))
+	[ "$start" -ge 1024 ] && [ $((base + span - 1)) -le 65535 ] || return 1
+	printf '%s\n' "$base"
+}
+
+slot_port_span() {
+	_port_decimal "${HERDR_SWARM_PORT_SPAN:-10}"
+}
+
+# _port_decimal <value>: digits only, read as DECIMAL (10#) — bash would read
+# "010" as octal 8 and reject "09" outright — and capped in length so the
+# arithmetic cannot overflow. Prints the normalized integer.
+_port_decimal() {
+	case "${1-}" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "${#1}" -le 6 ] || return 1
+	printf '%s\n' "$((10#$1))"
 }
 
 exact_run_archive_exists() {

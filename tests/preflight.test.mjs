@@ -288,7 +288,7 @@ test("ensure_exclude_pattern appends exactly once across two calls and records i
 	);
 	assert.equal(r.status, 0, r.stderr);
 	const ex = fs.readFileSync(path.join(repo, ".git/info/exclude"), "utf8");
-	for (const pattern of [".swarm-task.md", ".swarm-done"]) {
+	for (const pattern of [".swarm-task.md", ".swarm-done", ".swarm-clone.*"]) {
 		const ours = ex.split("\n").filter((l) => l === pattern);
 		assert.equal(ours.length, 1, `${pattern} in exclude file:\n${ex}`);
 	}
@@ -306,7 +306,7 @@ test("ensure_exclude_pattern normalizes a final line missing its newline", () =>
 	fs.writeFileSync(exPath, "junk");
 	const r = runPf("ensure_exclude_pattern", freshEnv(), repo);
 	assert.equal(r.status, 0, r.stderr);
-	assert.equal(fs.readFileSync(exPath, "utf8"), "junk\n.swarm-task.md\n.swarm-done\n");
+	assert.equal(fs.readFileSync(exPath, "utf8"), "junk\n.swarm-task.md\n.swarm-done\n.swarm-clone.*\n");
 	fs.rmSync(manifestFile, { force: true });
 });
 
@@ -321,7 +321,7 @@ test("remove_exclude_pattern removes only our namespaced line", () => {
 	// — only the exact line may go.
 	fs.writeFileSync(
 		exPath,
-		"node_modules/\n.swarm-task.md\n.swarm-done\n.swarm-task.md.orig\n.swarm-done.bak\n*.log\n",
+		"node_modules/\n.swarm-task.md\n.swarm-done\n.swarm-clone.*\n.swarm-task.md.orig\n.swarm-done.bak\n*.log\n",
 	);
 	const r = runPf("remove_exclude_pattern", freshEnv(), repo);
 	assert.equal(r.status, 0, r.stderr);
@@ -332,4 +332,86 @@ test("remove_exclude_pattern removes only our namespaced line", () => {
 	const doc = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
 	assert.equal(doc.exclude_pattern_added, false);
 	fs.rmSync(manifestFile, { force: true });
+});
+
+// --- provision_slot_paths: copy-on-write dependency clones ---
+
+function provisionFixture(list) {
+	const repo = makeRepo();
+	fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules/\nbuild/\nlinked-parent\n");
+	git(repo, "add", ".gitignore");
+	git(repo, "commit", "-q", "-m", "ignore");
+	fs.mkdirSync(path.join(repo, "node_modules", "pkg"), { recursive: true });
+	fs.writeFileSync(path.join(repo, "node_modules", "pkg", "a.js"), "a\n");
+	fs.symlinkSync("pkg", path.join(repo, "node_modules", "linked"));
+	const wt = path.join(mkdtemp("hs-pwt-"), "wt");
+	git(repo, "worktree", "add", "-q", "--detach", wt);
+	const cfg = mkdtemp("hs-pcfg-");
+	if (list !== null) fs.writeFileSync(path.join(cfg, "clone-paths"), list);
+	const run = (extra = {}) => runPf(`provision_slot_paths "${repo}" "${wt}"`, freshEnv({ HERDR_PLUGIN_CONFIG_DIR: cfg, ...extra }), repo);
+	const records = (r) => r.stdout.split("\n").filter(Boolean).map((l) => l.split("\t"));
+	return { repo, wt, cfg, run, records };
+}
+
+test("provision clones the default node_modules copy-on-write, symlinks intact", () => {
+	const f = provisionFixture(null);
+	const r = f.run();
+	assert.equal(r.status, 0, r.stderr);
+	assert.deepEqual(f.records(r), [["cloned", "node_modules"]]);
+	assert.equal(fs.readFileSync(path.join(f.wt, "node_modules", "pkg", "a.js"), "utf8"), "a\n");
+	assert.equal(fs.readlinkSync(path.join(f.wt, "node_modules", "linked")), "pkg");
+	assert.deepEqual(fs.readdirSync(f.wt).filter((n) => n.startsWith(".swarm-clone")), [], "no temp left behind");
+	// Second run: already present, never overwritten.
+	assert.deepEqual(f.records(f.run()), [["clone_skipped", "node_modules", "already present in the worktree"]]);
+});
+
+test("provision refuses anything that is not an ignored, in-repo, absent path", () => {
+	const f = provisionFixture("# comment\n\nREADME.md\nnotes.txt\n../escape\n/abs\n./node_modules\nmissing/\nbuild\nlinked-parent/node_modules\n");
+	fs.writeFileSync(path.join(f.repo, "notes.txt"), "untracked, not ignored\n");
+	fs.mkdirSync(path.join(f.repo, "build"));
+	fs.writeFileSync(path.join(f.repo, "build", "x"), "x\n");
+	fs.mkdirSync(path.join(f.wt, "build"));
+	// A symlinked parent pointing outside the repo, mirrored in the worktree.
+	const outside = mkdtemp("hs-outside-");
+	fs.mkdirSync(path.join(outside, "node_modules"));
+	fs.symlinkSync(outside, path.join(f.repo, "linked-parent"));
+	fs.symlinkSync(mkdtemp("hs-outside2-"), path.join(f.wt, "linked-parent"));
+	const recs = Object.fromEntries(f.records(f.run()).map(([k, p, why]) => [p, `${k}:${why ?? ""}`]));
+	assert.match(recs["README.md"], /^clone_skipped:already present in the worktree/, "tracked content came with the checkout");
+	assert.match(recs["notes.txt"], /^clone_skipped:not ignored by git/);
+	assert.match(recs["../escape"], /^clone_skipped:must be a plain relative path/);
+	assert.match(recs["/abs"], /^clone_skipped:must be a plain relative path/);
+	assert.match(recs["./node_modules"], /^clone_skipped:must be a plain relative path/);
+	assert.match(recs["missing/"], /^clone_skipped:not present in the repo/);
+	assert.match(recs["build"], /^clone_skipped:already present in the worktree/);
+	assert.match(recs["linked-parent/node_modules"], /^clone_skipped:a parent directory resolves outside/);
+	assert.equal(Object.values(recs).some((v) => v.startsWith("cloned")), false);
+});
+
+test("a clone that times out is killed with its children: no writer survives, no temp left", async () => {
+	const f = provisionFixture("node_modules\n");
+	const marker = path.join(mkdtemp("hs-cpkid-"), "pid");
+	// A cp that hands the work to a child which keeps writing into the temp
+	// long after its parent shell would have been killed — recreating the
+	// tree as a real cp mid-copy would. Its stdio is detached so spawnSync
+	// returns at the timeout instead of waiting for the writer to finish.
+	const bin = mkdtemp("hs-slowcp-");
+	fs.writeFileSync(path.join(bin, "cp"),
+		`#!/bin/bash\nmkdir -p "$3"\n( sleep 3; mkdir -p "$3/pkg"; echo late > "$3/pkg/late.js" ) </dev/null >/dev/null 2>&1 &\necho $! > "${marker}"\nwait\n`, { mode: 0o755 });
+	const r = f.run({ HERDR_SWARM_CLONE_MODE: "copy", HERDR_SWARM_CLONE_TIMEOUT: "1", PATH: `${bin}:${process.env.PATH}` });
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /clone_skipped\tnode_modules\tclone failed or timed out/);
+	const pid = Number(fs.readFileSync(marker, "utf8"));
+	assert.throws(() => process.kill(pid, 0), /ESRCH/, "the writer outlived the timeout");
+	await new Promise((res) => setTimeout(res, 3500));
+	assert.deepEqual(fs.readdirSync(f.wt).filter((n) => n.startsWith(".swarm-clone") || n === "node_modules"), [], "no temp, no half clone");
+});
+
+test("an empty clone-paths clones nothing; copy mode forces a full copy", () => {
+	const none = provisionFixture("");
+	assert.deepEqual(none.records(none.run()), []);
+	const copy = provisionFixture("node_modules\n");
+	const r = copy.run({ HERDR_SWARM_CLONE_MODE: "copy" });
+	assert.deepEqual(copy.records(r), [["cloned", "node_modules"]]);
+	assert.ok(fs.existsSync(path.join(copy.wt, "node_modules", "pkg", "a.js")));
 });

@@ -445,8 +445,10 @@ try {
 		case "approval": {
 			let raw = "";
 			for await (const chunk of process.stdin) raw += chunk;
-			const [inventoryRaw, stateDir] = args;
-			const inventory = JSON.parse(inventoryRaw);
+			// A path, not the JSON: inventories outgrow ARG_MAX (lib.sh
+			// cleanup_approval_validate writes the file in the 0700 state dir).
+			const [inventoryFile, stateDir] = args;
+			const inventory = JSON.parse(fs.readFileSync(inventoryFile, "utf8"));
 			const approval = JSON.parse(raw);
 			for (const key of [
 				"resource_type",
