@@ -208,7 +208,7 @@ forwards no environment):
 | Capability | Scriptable path |
 | --- | --- |
 | Fan out | `scripts/fanout-pane.sh` with the variables above (zero-TTY) |
-| Harvest | `scripts/harvest-step.sh <verb>` — a verb CLI with typed exit codes and `key<TAB>value` stdout |
+| Harvest | `scripts/harvest-step.sh <verb>` — a verb CLI with typed exit codes and `key<TAB>value` stdout (includes `compare`, `validate`, `settle`) |
 | Abort | `scripts/abort.sh` — a zero-TTY action, env-gated |
 | Prune | `scripts/prune.sh` — a zero-TTY action, dry run by default, env-gated per resource class |
 
@@ -364,6 +364,51 @@ starts the agent anyway; output lands in the plugin state dir. The hook's
 stdout and stderr are logged there **verbatim and indefinitely** — the state
 dir is `0700`, but don't `echo`/`set -x` secrets in `setup.sh`: a token
 printed during dependency install stays on disk until you delete the log.
+
+## Comparing slots and picking a winner
+
+In the harvest pane, `w` opens the compare view, which replaces the slot list
+with one ranked row per slot. The same data is scriptable as
+`bash scripts/harvest-step.sh compare`, which emits one
+`compare_slot<TAB>{json}` per slot and one
+`compare_overlap<TAB>a<TAB>b<TAB>n<TAB>[files]` per candidate pair. It is
+read-only.
+
+| Column | Source |
+| --- | --- |
+| checks | The slot's `validate` result **for its current tip**: `passed`, `failed:<checks>`, `stale` (validated an older commit), or `not run`. Only Swarm's own record for this run and slot counts. |
+| commits / files / +/- | Against the run's recorded fork SHA. |
+| dirty | Uncommitted entries in the slot worktree. Those changes are not part of the merge. |
+| finished | `marker` / `exited` from finish detection, or `no`. |
+| overlap | For each pair of running slots, the files both changed: the merges likely to conflict. |
+
+**Ranking** is an order, not a score: checks (passed > not run > stale >
+failed), then having commits, then finished, then slot number. Diff size is
+shown but never ranked, because a smaller change isn't a better one. Settled
+slots (merged, skipped) are listed without a rank.
+
+In the compare view:
+
+- `d`, then two slot digits: the full diff between the two slots' tips, in
+  git's pager. The pane's terminal is handed over and restored, like the
+  merge-tree shell.
+- `m`, then a slot digit, then `y`: **merge the winner and skip the rest**.
+  The winner is merged **at the exact tip the table showed**: if its agent
+  committed since, the merge refuses and you re-open compare. Otherwise it
+  goes through the normal merge: re-previewed and drift-checked. If the merge
+  would now land in your checked-out branch and the confirm didn't say so,
+  you are asked again. **Only if that merge lands** are the other running
+  slots whose agent has *finished* marked skipped and archived. Slots still
+  working are left running and named. Branches are always kept. A worktree
+  that won't archive cleanly (dirty, ignored files, a working agent) is left
+  in place and named in the banner. If that's the winner's, its approval
+  prompt stays open. A winner that isn't clean, or a merge that conflicts,
+  skips nothing.
+
+Scripted, the same pin is `harvest-step.sh merge <slot> <base-sha>
+<slot-tip>`: it refuses unless the slot is still at `<slot-tip>`, then merges
+that SHA rather than the branch name.
+- `r` refreshes; `b`/Esc goes back.
 
 ## Finish detection
 

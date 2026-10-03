@@ -9,11 +9,12 @@
 #   bash scripts/harvest-step.sh <verb> [args…]
 #
 # Verbs: preview <slot> | commit-wip <slot> | snapshot <slot> |
-#        discard <slot> | skip <slot> | merge <slot> <expected-base-sha> |
+#        discard <slot> | skip <slot> |
+#        merge <slot> <expected-base-sha> [expected-slot-tip] |
 #        resume [complete <slot>] | archive <slot> | abort-merge <slot> |
 #        publish <slot> | publish-pr <slot> | publish-candidate-pr <slot> |
 #        candidate-status <slot> | pr-status <slot> | validate <slot> |
-#        settle
+#        settle | compare
 #
 # Output protocol: machine-readable "key<TAB>value…" lines on stdout, human
 # messages on stderr, typed exit codes (HS_EC_*) so the renderer branches on
@@ -76,7 +77,7 @@ VERB="${1-}"
 }
 shift
 
-case "$VERB" in publish-pr | publish-candidate-pr | candidate-status | pr-status | validate) clear_git_routing_env ;; esac
+case "$VERB" in publish-pr | publish-candidate-pr | candidate-status | pr-status | validate | compare) clear_git_routing_env ;; esac
 
 # --- Run + slot context ------------------------------------------------------
 
@@ -268,9 +269,9 @@ run_merge() {
 		local hooks_off
 		hooks_off="$(state_dir)/no-hooks"
 		mkdir -p "$hooks_off"
-		git -C "$d" -c "core.hooksPath=$hooks_off" merge --no-ff -m "$msg" "$SLOT_BRANCH"
+		git -C "$d" -c "core.hooksPath=$hooks_off" merge --no-ff -m "$msg" "${SLOT_MERGE_REF:-$SLOT_BRANCH}"
 	else
-		git -C "$d" merge --no-ff -m "$msg" "$SLOT_BRANCH"
+		git -C "$d" merge --no-ff -m "$msg" "${SLOT_MERGE_REF:-$SLOT_BRANCH}"
 	fi
 }
 
@@ -497,14 +498,38 @@ do_skip() {
 	printf 'skipped\t%s\n' "$1"
 }
 
+# merge <slot> <expected-base-sha> [expected-slot-tip]: the optional third
+# argument pins WHAT is merged, not just where. The compare view passes the
+# tip its ranking and validation described; if the agent committed since,
+# the merge refuses instead of landing a commit nobody compared, and when it
+# matches, the exact SHA is merged (not the branch name, which could move
+# between this check and git merge — the same rule publish follows).
 do_merge() {
 	require_slot_arg "${1-}" || return 1
-	local expected="${2-}"
+	local expected="${2-}" want_tip="${3-}" tip
 	if [ -z "$expected" ]; then
 		echo "herdr-swarm: merge needs the previewed base SHA (drift guard input)" >&2
 		return 1
 	fi
 	read_slot "$1" || return $?
+	if [ -n "$want_tip" ]; then
+		case "$want_tip" in
+		*[!0-9a-f]*)
+			echo "herdr-swarm: expected slot tip '$want_tip' is not a full SHA." >&2
+			return "$HS_EC_REFUSED"
+			;;
+		esac
+		if [ "${#want_tip}" -ne 40 ] && [ "${#want_tip}" -ne 64 ]; then
+			echo "herdr-swarm: expected slot tip '$want_tip' is not a full SHA." >&2
+			return "$HS_EC_REFUSED"
+		fi
+		tip="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$SLOT_BRANCH")" || tip=""
+		if [ "$tip" != "$want_tip" ]; then
+			echo "herdr-swarm: slot $1 moved since it was compared (${want_tip:0:7} -> ${tip:0:7}) — nothing merged; re-open compare and pick again." >&2
+			return "$HS_EC_REFUSED"
+		fi
+		SLOT_MERGE_REF="$want_tip"
+	fi
 	if [ "$SLOT_JOURNAL" != "null" ]; then
 		echo "herdr-swarm: slot $1 has an unfinished merge journaled — resume or abort-merge first." >&2
 		return "$HS_EC_REFUSED"
@@ -897,6 +922,41 @@ do_settle() {
 	herdr_notification_show "Swarm: all $summary slots finished" \
 		--body "Run $RUN_ID is ready to compare in Harvest." --sound "done" >/dev/null 2>&1 || true
 	printf 'notified\t%s\n' "$summary"
+}
+
+# compare: read-only side-by-side facts for every non-archived slot, ranked
+# (see scripts/compare.mjs for the record format and the ranking rule). Rows
+# failing the ownership check are left out with a warning, never compared:
+# their branch/path are not provably this run's.
+do_compare() {
+	local slots s finished rows=""
+	slots="$(printf '%s' "$DOC" | node -e '
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			for (const r of JSON.parse(d).slots || []) {
+				if (r.status === "archived") continue;
+				console.log([r.slot, r.finished?.reason ?? "-"].join("\t"));
+			}
+		});
+	')" || return 1
+	while IFS=$'\t' read -r s finished; do
+		[ -n "$s" ] || continue
+		if ! read_slot "$s" 2>/dev/null; then
+			echo "herdr-swarm: slot $s left out of compare — its ownership check failed." >&2
+			continue
+		fi
+		[ "$finished" != "-" ] || finished=""
+		# \x1f-separated like read_slot; a newline or \x1f inside a field would
+		# split the record, so such a row is left out rather than misparsed.
+		case "$SLOT_LABEL$SLOT_BRANCH$SLOT_PATH$SLOT_STATUS" in
+		*$'\n'* | *"$US"*)
+			echo "herdr-swarm: slot $s left out of compare — a field contains a record separator." >&2
+			continue
+			;;
+		esac
+		rows+="$s$US$SLOT_LABEL$US$SLOT_BRANCH$US$SLOT_PATH$US$SLOT_STATUS$US$finished"$'\n'
+	done <<<"$slots"
+	printf '%s' "$rows" | node "$PLUGIN_ROOT/scripts/compare.mjs" "$REPO_ROOT" "$FORK_SHA" "$RUN_ID" "$(state_dir)"
 }
 
 # validation_result_path <slot>: the one Swarm-produced checks file per slot.
@@ -1317,7 +1377,7 @@ skip)
 	do_skip "$1"
 	;;
 merge)
-	do_merge "${1-}" "${2-}"
+	do_merge "${1-}" "${2-}" "${3-}"
 	;;
 resume)
 	do_resume "${1-}" "${2-}"
@@ -1356,6 +1416,9 @@ validate)
 	;;
 settle)
 	do_settle
+	;;
+compare)
+	do_compare
 	;;
 *)
 	echo "herdr-swarm: unknown harvest verb '$VERB'" >&2

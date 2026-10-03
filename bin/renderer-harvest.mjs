@@ -62,6 +62,56 @@ export function previewFromStep(res) {
 // on views (conflict list, drift banner, prompts) without a PTY.
 // model: { runInfo, banner, phase, rows }  where rows carry {slot, label,
 // branch, status, preview} and phase is the state machine node.
+// The pane's env minus every variable that reroutes or reconfigures git —
+// the same list scripts/lib.sh clear_git_routing_env removes.
+const GIT_ROUTING = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+	"GIT_PREFIX", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]);
+export function gitDisplayEnv(env) {
+	return Object.fromEntries(Object.entries(env).filter(([k]) =>
+		!GIT_ROUTING.has(k) && !/^GIT_CONFIG_(KEY|VALUE)_/.test(k)));
+}
+
+// Compare table: ranked candidates first, then settled slots (no rank).
+// Every field is manifest- or git-derived text, so all of it is sanitized.
+export function renderCompare(view, cols = 80) {
+	const lines = [
+		` ${pad("rank", 5)}${pad("#", 3)}${pad("checks", 16)}${pad("commits", 8)}${pad("files", 6)}${pad("+/-", 12)}${pad("dirty", 6)}${pad("finished", 9)}label`.slice(0, cols),
+	];
+	if (!view.slots?.length) lines.push("  (no slots to compare)");
+	for (const s of view.slots ?? []) {
+		const v = s.validation ?? {};
+		const failed = v.failed_checks?.length ? `:${v.failed_checks.join(",")}` : "";
+		const checks = v.status === "none" ? "not run" : `${v.status}${failed}`;
+		const line = ` ${pad(s.rank ?? "-", 5)}${pad(s.slot, 3)}${pad(sanitizeText(checks).slice(0, 15), 16)}${pad(s.commits ?? "-", 8)}${pad(
+			s.file_count ?? "-",
+			6,
+		)}${pad(s.insertions == null ? "-" : `+${s.insertions}/-${s.deletions}`, 12)}${pad(s.dirty ?? "-", 6)}${pad(
+			sanitizeText(s.finished ?? (s.candidate ? "no" : s.status ?? "")),
+			9,
+		)}${sanitizeText(s.label ?? "")}`.slice(0, cols);
+		// Failed checks are the one thing that must not be missed when picking.
+		lines.push(v.status === "failed" ? `${ESC}[7m${line}${ESC}[0m` : line);
+	}
+	const overlaps = (view.overlaps ?? []).filter((o) => o.count !== 0);
+	if (overlaps.length) {
+		lines.push("");
+		lines.push(" overlap (files both slots changed):");
+		for (const o of overlaps) {
+			if (o.count < 0) {
+				lines.push(`   ${o.a} & ${o.b}: unknown - a diff could not be read; compare by hand (d)`.slice(0, cols));
+				continue;
+			}
+			const more = o.count > o.shared.length ? `, +${o.count - o.shared.length} more` : "";
+			lines.push(`   ${o.a} & ${o.b}: ${o.count} - ${sanitizeText(o.shared.join(", "))}${more}`.slice(0, cols));
+		}
+	} else if ((view.overlaps ?? []).length) {
+		lines.push("");
+		lines.push(" overlap: none - the candidates touch disjoint files");
+	}
+	return lines;
+}
+
 export function renderHarvest(model, cols = 80) {
 	const lines = [];
 	const title = model.runInfo
@@ -72,6 +122,32 @@ export function renderHarvest(model, cols = 80) {
 	lines.push(`${ESC}[7m${title.slice(0, cols)}${ESC}[0m`);
 	if (model.banner)
 		lines.push(` ! ${sanitizeText(model.banner)}`.slice(0, cols));
+	const ph = model.phase ?? { name: "list" };
+	// The compare view replaces the slot list: same slots, more columns.
+	if (ph.name === "compare" || ph.name === "winner-confirm") {
+		const view = ph.name === "compare" ? ph : ph.back;
+		lines.push(...renderCompare(view, cols));
+		lines.push("");
+		if (ph.name === "winner-confirm") {
+			lines.push(` MERGE slot ${ph.slot} at ${String(ph.tip ?? "").slice(0, 7)}${ph.locus === "user-tree" ? " into your checked-out branch" : ""}, then SKIP ${
+				ph.others.length ? `slot${ph.others.length > 1 ? "s" : ""} ${ph.others.join(", ")}` : "nothing"
+			}?`.slice(0, cols));
+			if (ph.unfinished?.length)
+				lines.push(` Left running, agent not finished: ${ph.unfinished.join(", ")}.`.slice(0, cols));
+			lines.push(" Branches are kept. Worktrees that archive cleanly are archived; the rest stay and are named.".slice(0, cols));
+			lines.push(" Nothing is skipped unless the merge lands, and it refuses if the slot moved since compare.".slice(0, cols));
+			lines.push(`${ESC}[2m [y]merge winner  [n]back${ESC}[0m`);
+		} else if (ph.pick?.op === "diff") {
+			lines.push(ph.pick.first == null ? " DIFF: first slot?" : ` DIFF: slot ${ph.pick.first} against which slot?`);
+			lines.push(`${ESC}[2m [1-9]slot  [Esc]cancel${ESC}[0m`);
+		} else if (ph.pick?.op === "merge") {
+			lines.push(" WINNER: merge which slot (the others are skipped)?");
+			lines.push(`${ESC}[2m [1-9]slot  [Esc]cancel${ESC}[0m`);
+		} else {
+			lines.push(`${ESC}[2m d:diff two slots  m:merge winner, skip the rest  r:refresh  b:back${ESC}[0m`);
+		}
+		return lines.join("\n");
+	}
 	lines.push(
 		` ${pad("#", 3)}${pad("state", 17)}${pad("dirty", 7)}${pad("label", 14)}branch`,
 	);
@@ -97,7 +173,6 @@ export function renderHarvest(model, cols = 80) {
 			lines.push(`      ${sanitizeText(s)}`.slice(0, cols));
 	}
 	lines.push("");
-	const ph = model.phase ?? { name: "list" };
 	switch (ph.name) {
 		case "resume": {
 			const o = ph.offers[ph.idx];
@@ -202,7 +277,7 @@ export function renderHarvest(model, cols = 80) {
 					j ? `  a:abort stale merge (slot ${j.slot})` : ""
 				}  q:quit${ESC}[0m`,
 			);
-			lines.push(`${ESC}[2m v:validate slot  g:draft GitHub PR  c:read GitHub CI${ESC}[0m`);
+			lines.push(`${ESC}[2m w:compare slots  v:validate slot  g:draft GitHub PR  c:read GitHub CI${ESC}[0m`);
 		}
 	}
 	return lines.join("\n");
@@ -378,10 +453,14 @@ export class HarvestRenderer {
 		await this.reload();
 	}
 
-	async doMerge(slot) {
+	// Returns true only when the merge landed; every other outcome has already
+	// set the phase/banner the user needs (conflict, drift, refusal).
+	// expectTip (compare view): merge refuses unless the slot is still at the
+	// exact tip that was ranked and validated, and then merges that SHA.
+	async doMerge(slot, expectTip = null) {
 		const row = this.rows.find((r) => r.slot === slot);
-		if (!row?.preview?.baseSha) return;
-		const r = await this.step("merge", [slot, row.preview.baseSha]);
+		if (!row?.preview?.baseSha) return false;
+		const r = await this.step("merge", expectTip ? [slot, row.preview.baseSha, expectTip] : [slot, row.preview.baseSha]);
 		if (r.code === 0) {
 			this.banner = `slot ${slot} merged`;
 			// Pane-backed slots retain their plugin-reported working state until
@@ -393,6 +472,7 @@ export class HarvestRenderer {
 			// Re-baseline: every remaining preview must diff and merge against
 			// the NEW base SHA (R7: drift re-checked before every merge).
 			await this.reload();
+			return true;
 		} else if (r.code === STEP_EC.DRIFT) {
 			this.banner = "base moved since preview — re-previewing all slots";
 			this.phase = { name: "list" };
@@ -412,6 +492,121 @@ export class HarvestRenderer {
 			this.phase = { name: "list" };
 			this.paint();
 		}
+		return false;
+	}
+
+	// Compare view: one read-only `compare` verb call, parsed into the phase.
+	async openCompare() {
+		const r = await this.step("compare");
+		if (r.code !== 0) {
+			this.banner = this.lastErrLine(r);
+			this.phase = { name: "list" };
+			this.paint();
+			return;
+		}
+		const slots = [];
+		for (const [json] of r.out.compare_slot ?? []) {
+			try {
+				slots.push(JSON.parse(json));
+			} catch {
+				/* a malformed record is dropped, never guessed at */
+			}
+		}
+		const overlaps = (r.out.compare_overlap ?? []).map(([a, b, n, shared]) => {
+			let files = [];
+			try {
+				files = JSON.parse(shared);
+			} catch {
+				/* count alone still informs */
+			}
+			return { a: Number(a), b: Number(b), count: Number(n), shared: files };
+		});
+		this.phase = { name: "compare", slots, overlaps, pick: null };
+		this.paint();
+	}
+
+	// Two slots' tips, full diff, in git's own pager: the same terminal
+	// handoff as the merge-tree shell, restored no matter how the pager ends.
+	showDiff(a, b) {
+		this.write(`${ESC}[?1049l${ESC}[?25h`);
+		this.setRaw(false);
+		try {
+			this.spawnDiff(a, b);
+		} finally {
+			this.setRaw(true);
+			this.write(`${ESC}[?1049h${ESC}[?25l`);
+			this.lastScreen = null;
+			this.paint();
+		}
+	}
+
+	// Seam for tests. Read-only git against the run's repo: inherited routing
+	// variables are dropped (as clear_git_routing_env does for the verbs) so
+	// the diff shown is the diff compared, and external diff drivers and
+	// textconv filters are off — the patch is agent-written content. The
+	// pager is the user's own git config; the bytes reach their terminal
+	// through it, exactly as `git diff` in their shell would.
+	spawnDiff(a, b) {
+		spawnSync("git", ["diff", "--no-ext-diff", "--no-textconv", "--stat", "--patch", a, b], {
+			cwd: this.runInfo?.repo_root || undefined,
+			stdio: "inherit",
+			env: gitDisplayEnv(this.env),
+		});
+	}
+
+	// Merge the chosen slot at the exact tip the compare view showed, then —
+	// only if that merge LANDED — skip every other running slot whose agent
+	// has FINISHED and archive whichever archive cleanly. Unfinished slots are
+	// left running (skipping one would let its agent keep committing to a
+	// settled slot nobody looks at again). Branches are always kept (skip is
+	// bookkeeping; archive never deletes a branch). Anything that refuses to
+	// archive — the winner included — is left in place and named, never forced.
+	async mergeWinner(confirm) {
+		const { slot, tip, others, unfinished, locus } = confirm;
+		await this.refresh();
+		const row = this.rows.find((r) => r.slot === slot);
+		if (row?.preview?.state !== "clean") {
+			this.banner = `slot ${slot} is '${row?.preview?.state ?? "unknown"}' — resolve it from the list (${slot}) first; nothing was merged or skipped`;
+			this.phase = { name: "list" };
+			this.paint();
+			return;
+		}
+		// The confirm named where the merge lands; if that changed since (base
+		// checked out or switched away meanwhile), ask again with the truth.
+		if ((row.preview.locus ?? null) !== locus) {
+			this.phase = { ...confirm, locus: row.preview.locus ?? null };
+			this.banner = "where the merge lands changed since you confirmed — confirm again";
+			this.paint();
+			return;
+		}
+		if (!(await this.doMerge(slot, tip))) return;
+		// doMerge already tried to archive the winner; an ignored-files approval
+		// or dirty prompt it raised must survive the summary below.
+		const winnerPrompt = ["ignored", "dirty"].includes(this.phase.name) ? this.phase : null;
+		const skipped = [];
+		const kept = [];
+		for (const s of others) {
+			if (this.rows.find((r) => r.slot === s)?.status !== "running") continue;
+			const sk = await this.step("skip", [s]);
+			if (sk.code !== 0) {
+				kept.push(`${s} (skip failed)`);
+				continue;
+			}
+			skipped.push(s);
+			const ar = await this.step("archive", [s]);
+			if (ar.code !== 0) kept.push(String(s));
+		}
+		await this.reload();
+		// A finalized run has no rows left at all — that means everything,
+		// winner included, archived. Only a winner row still present and not
+		// archived is a worktree left behind.
+		const winnerRow = this.rows.find((r) => r.slot === slot);
+		if (winnerRow && winnerRow.status !== "archived") kept.unshift(`${slot} (winner)`);
+		this.phase = winnerPrompt ?? { name: "list" };
+		this.banner = `slot ${slot} merged${skipped.length ? `; skipped ${skipped.join(", ")}` : ""}${
+			unfinished.length ? `; still running (agent not finished): ${unfinished.join(", ")}` : ""
+		}${kept.length ? `; worktrees kept for ${kept.join(", ")} — archive them from the list` : ""}`;
+		this.paint();
 	}
 
 	async doArchive(slot, approval = null) {
@@ -684,6 +879,61 @@ export class HarvestRenderer {
 					this.paint();
 				}
 				break;
+			case "compare": {
+				const bySlot = (n) => ph.slots.find((s) => s.slot === n);
+				if (ph.pick && ch >= "1" && ch <= "9") {
+					const n = Number(ch);
+					const chosen = bySlot(n);
+					if (!chosen) {
+						this.banner = `no slot ${n} in this comparison`;
+						ph.pick = null;
+					} else if (ph.pick.op === "diff" && ph.pick.first == null) {
+						ph.pick.first = n;
+					} else if (ph.pick.op === "diff") {
+						const first = bySlot(ph.pick.first);
+						ph.pick = null;
+						if (first.tip && chosen.tip) this.showDiff(first.tip, chosen.tip);
+						else this.banner = "both slots need a branch tip to diff";
+					} else if (!chosen.candidate) {
+						this.banner = `slot ${n} is '${chosen.status}' — only a running slot can win`;
+						ph.pick = null;
+					} else if (!chosen.tip) {
+						this.banner = `slot ${n} has no branch tip to merge`;
+						ph.pick = null;
+					} else {
+						const rest = ph.slots.filter((s) => s.candidate && s.slot !== n);
+						this.phase = {
+							name: "winner-confirm",
+							slot: n,
+							tip: chosen.tip,
+							others: rest.filter((s) => s.finished).map((s) => s.slot),
+							unfinished: rest.filter((s) => !s.finished).map((s) => s.slot),
+							locus: this.rows.find((r) => r.slot === n)?.preview?.locus ?? null,
+							back: ph,
+						};
+					}
+					this.paint();
+				} else if (ch === "d" || ch === "m") {
+					ph.pick = { op: ch === "d" ? "diff" : "merge", first: null };
+					this.paint();
+				} else if (ch === "r") {
+					await this.openCompare();
+				} else if (ch === "b" || ch === "\x1b" || ch === "q") {
+					if (ph.pick) ph.pick = null;
+					else this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
+			}
+			case "winner-confirm":
+				if (ch === "y" || ch === "Y") {
+					await this.mergeWinner(ph);
+				} else {
+					this.phase = ph.back;
+					this.phase.pick = null;
+					this.paint();
+				}
+				break;
 			case "validate-pick":
 				if (ch >= "1" && ch <= "9") {
 					const slot = Number(ch);
@@ -758,6 +1008,8 @@ export class HarvestRenderer {
 				} else if (ch === "v") {
 					this.phase = { name: "validate-pick" };
 					this.paint();
+				} else if (ch === "w") {
+					await this.openCompare();
 				} else if (ch === "g" || ch === "c") {
 					this.phase = { name: "github-pick", operation: ch === "g" ? "publish-pr" : "pr-status" };
 					this.paint();
