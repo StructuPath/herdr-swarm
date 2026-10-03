@@ -801,6 +801,41 @@ test("publish flow: p opens the picker, a digit routes through step('publish'), 
 	assert.match(r.banner, /no slot 7/);
 });
 
+test("validate flow: v opens the picker, a digit runs step('validate') on the validate budget", async () => {
+	const r = mkHarvest(h.freshEnv({ HERDR_SWARM_VALIDATE_TIMEOUT: "60" }));
+	r.rows = [{ slot: 1, label: "s1", branch: "b", status: "running", preview: { state: "clean", dirty: 0 } }];
+	const budgets = [];
+	r.step = async (verb, args = [], _env = {}, timeoutMs) => {
+		r.calls.push([verb, ...args]);
+		budgets.push(timeoutMs);
+		return { code: 0, verb, stdout: "", stderr: "", out: { validated: [["1", "a".repeat(40), "failed", "/x"]] } };
+	};
+	await r.onKey("v");
+	assert.equal(r.phase.name, "validate-pick");
+	assert.match(renderHarvest({ rows: [], phase: r.phase }, 100), /VALIDATE: run validate\.sh/);
+	await r.onKey("1");
+	assert.deepEqual(r.calls, [["validate", 1]]);
+	assert.deepEqual(budgets, [120_000], "never below the ordinary step budget");
+	assert.equal(r.banner, "slot 1 validation failed @ aaaaaaa");
+	assert.equal(r.phase.name, "list");
+	await r.onKey("v");
+	await r.onKey("\x1b");
+	await r.onKey("v");
+	await r.onKey("7");
+	assert.deepEqual(r.calls, [["validate", 1]], "cancel and unknown slot run nothing");
+	assert.match(r.banner, /no slot 7/);
+	assert.equal(new HarvestRenderer(h.freshEnv({ HERDR_SWARM_VALIDATE_TIMEOUT: "600" })).validateTimeoutMs, 630_000);
+});
+
+test("validate refusal surfaces the verb's own stderr line", async () => {
+	const r = mkHarvest();
+	r.rows = [{ slot: 1 }];
+	r.step = async (verb) => ({ code: 36, verb, stdout: "", stderr: "herdr-swarm: no validate.sh in the plugin config dir\n", out: {} });
+	await r.onKey("v");
+	await r.onKey("1");
+	assert.match(r.banner, /no validate\.sh/);
+});
+
 test("publish-pick phase renders its prompt and the list footer advertises p", () => {
 	const model = { runInfo: { run_id: "r1", base_ref: "refs/heads/main" }, rows: [], phase: { name: "publish-pick" } };
 	assert.match(renderHarvest(model, 100), /PUBLISH: push which slot/);

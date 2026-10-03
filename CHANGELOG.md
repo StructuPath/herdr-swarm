@@ -19,6 +19,13 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- `validate <slot>` harvest verb (`v`, then slot in the pane) runs the
+  operator's `validate.sh` hook against a slot's clean HEAD and records a
+  SHA-bound checks file. The strict candidate handoff now produces its own
+  validation evidence instead of requiring the caller to bring it. An explicit
+  `HERDR_SWARM_CANDIDATE_VALIDATION_FILE` still wins. The repo lock is released
+  while the hook runs. On `HERDR_SWARM_VALIDATE_TIMEOUT` the hook's whole
+  process group is killed. A slot that changes during the run records nothing.
 - Opt-in `publish-pr <slot>` harvest verb (`g`, then slot in the pane) pushes
   the audited commit and creates/reuses its exact GitHub draft PR. Existing
   `publish` remains push-only. Optional SHA-bound validation JSON or Browser

@@ -164,6 +164,67 @@ with_timeout() {
 	return $?
 }
 
+# with_group_timeout SECS cmd…: with_timeout for commands that spawn their own
+# children (a test runner, a dev server). The command gets its own process
+# group, and when it exits or times out the WHOLE group is sent TERM, then
+# KILL after a 2s grace, so no test worker or server outlives it. The
+# group id is published in SWARM_GROUP_PID while it runs so a caller's
+# signal trap can reap the group if the caller itself is terminated, and
+# SWARM_GROUP_TIMED_OUT=1 records a kill so callers never infer it from an
+# exit code the command could have produced itself. Call it in the current
+# shell, not a subshell, or neither variable reaches the caller.
+# shellcheck disable=SC2034 # SWARM_GROUP_TIMED_OUT is read by callers
+with_group_timeout() {
+	local secs="$1" deadline rc
+	shift
+	SWARM_GROUP_TIMED_OUT=0
+	set -m
+	"$@" &
+	SWARM_GROUP_PID=$!
+	set +m
+	# Wall clock, not an iteration count: each poll forks a sleep, which
+	# drifts ~10% and would let a caller's own deadline fire first.
+	deadline=$((SECONDS + secs))
+	while kill -0 "$SWARM_GROUP_PID" 2>/dev/null; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			SWARM_GROUP_TIMED_OUT=1
+			break
+		fi
+		sleep 0.1
+	done
+	# Reap the group on EVERY exit, not just timeout: a dev server or leaked
+	# worker the command backgrounded must not outlive it (and keep writing
+	# after the caller has re-checked what it ran against). A descendant
+	# that setsid()s out of the group is beyond reach. On a normal exit the
+	# leader is waited FIRST — unwaited, its zombie keeps the group signalable
+	# and reap_group would sit out its whole grace period for nothing.
+	if [ "$SWARM_GROUP_TIMED_OUT" = 1 ]; then
+		reap_group "$SWARM_GROUP_PID"
+		wait "$SWARM_GROUP_PID" 2>/dev/null
+		rc=$?
+	else
+		wait "$SWARM_GROUP_PID" 2>/dev/null
+		rc=$?
+		reap_group "$SWARM_GROUP_PID"
+	fi
+	SWARM_GROUP_PID=""
+	return "$rc"
+}
+
+# reap_group <pgid>: TERM a process group, then KILL whatever is still in it
+# after a 2s grace. Returns immediately when the group is already empty.
+reap_group() {
+	local pgid="${1-}" i=0
+	[ -n "$pgid" ] || return 0
+	kill -TERM -- "-$pgid" 2>/dev/null || return 0
+	while kill -0 -- "-$pgid" 2>/dev/null && [ "$i" -lt 20 ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	kill -KILL -- "-$pgid" 2>/dev/null
+	return 0
+}
+
 # parse_json_field <field> <json>: first "<field>":"<string>" in herdr JSON.
 # Whitespace-stripped first so compact and pretty-printed responses both parse
 # — which also means it can only read values that contain no whitespace (ids,

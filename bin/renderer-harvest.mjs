@@ -180,6 +180,11 @@ export function renderHarvest(model, cols = 80) {
 			);
 			lines.push(`${ESC}[2m [1-9]slot  [Esc]cancel${ESC}[0m`);
 			break;
+		case "validate-pick":
+			lines.push(" VALIDATE: run validate.sh against which slot's clean HEAD?");
+			lines.push(" The pane waits while it runs; output goes to the plugin state dir.");
+			lines.push(`${ESC}[2m [1-9]slot  [Esc]cancel${ESC}[0m`);
+			break;
 		case "github-pick":
 			lines.push(ph.operation === "publish-pr"
 				? " GITHUB DRAFT: push a slot and create/reuse its exact matching PR?"
@@ -197,7 +202,7 @@ export function renderHarvest(model, cols = 80) {
 					j ? `  a:abort stale merge (slot ${j.slot})` : ""
 				}  q:quit${ESC}[0m`,
 			);
-			lines.push(`${ESC}[2m g:draft GitHub PR  c:read GitHub CI${ESC}[0m`);
+			lines.push(`${ESC}[2m v:validate slot  g:draft GitHub PR  c:read GitHub CI${ESC}[0m`);
 		}
 	}
 	return lines.join("\n");
@@ -224,6 +229,13 @@ export class HarvestRenderer {
 			250,
 			Number(env.HERDR_SWARM_STEP_TIMEOUT_MS) || 120_000,
 		);
+		// validate runs the operator's test suite: its own budget (the hook
+		// timeout) plus headroom for the verb to kill the hook's process group
+		// and record the failure, so the pane never kills it mid-record.
+		this.validateTimeoutMs = Math.max(
+			this.stepTimeoutMs,
+			((Number(env.HERDR_SWARM_VALIDATE_TIMEOUT) || 900) + 30) * 1000,
+		);
 		this.rows = [];
 		this.runInfo = null;
 		this.banner = "";
@@ -238,7 +250,7 @@ export class HarvestRenderer {
 	// while it runs: interrupting a verb mid-merge is never fatal (lock +
 	// journal), but it strands state the user then has to resume — so the
 	// renderer simply refuses to race its own verbs.
-	async step(verb, args = [], extraEnv = {}) {
+	async step(verb, args = [], extraEnv = {}, timeoutMs = this.stepTimeoutMs) {
 		this.busy = true;
 		try {
 			const r = await new Promise((resolve) => {
@@ -248,7 +260,7 @@ export class HarvestRenderer {
 					{
 						env: { ...this.env, ...extraEnv },
 						maxBuffer: 16 * 1024 * 1024,
-						timeout: this.stepTimeoutMs,
+						timeout: timeoutMs,
 						// SIGTERM, not SIGKILL: harvest-step.sh's trap must still get
 						// to release the per-repo mutation lock on the way out.
 						killSignal: "SIGTERM",
@@ -270,21 +282,22 @@ export class HarvestRenderer {
 			// Banner set here (not only at the call sites): some callers consume
 			// the result as a typed preview and never reach lastErrLine, and the
 			// user must always learn why the pane went quiet.
-			if (r.timedOut) this.banner = this.timeoutBanner(verb);
+			r.timeoutMs = timeoutMs;
+			if (r.timedOut) this.banner = this.timeoutBanner(verb, timeoutMs);
 			return r;
 		} finally {
 			this.busy = false;
 		}
 	}
 
-	timeoutBanner(verb) {
-		return `harvest step '${verb}' timed out after ${this.stepTimeoutMs}ms and was killed — check for a hung git hook or lock, then retry (HERDR_SWARM_STEP_TIMEOUT_MS raises the limit)`;
+	timeoutBanner(verb, timeoutMs = this.stepTimeoutMs) {
+		return `harvest step '${verb}' timed out after ${timeoutMs}ms and was killed — check for a hung git hook or lock, then retry (HERDR_SWARM_STEP_TIMEOUT_MS raises the limit)`;
 	}
 
 	lastErrLine(res) {
 		// A killed child usually writes nothing to stderr, so the generic
 		// "step failed (code)" line would hide the real cause.
-		if (res.timedOut) return this.timeoutBanner(res.verb ?? "step");
+		if (res.timedOut) return this.timeoutBanner(res.verb ?? "step", res.timeoutMs);
 		const ls = String(res.stderr || "")
 			.split("\n")
 			.filter((l) => l.trim() !== "");
@@ -671,6 +684,28 @@ export class HarvestRenderer {
 					this.paint();
 				}
 				break;
+			case "validate-pick":
+				if (ch >= "1" && ch <= "9") {
+					const slot = Number(ch);
+					this.phase = { name: "list" };
+					if (!this.rows.some((row) => row.slot === slot)) {
+						this.banner = `no slot ${slot} in this run`;
+						this.paint();
+						break;
+					}
+					this.banner = `validating slot ${slot}…`;
+					this.paint();
+					const result = await this.step("validate", [slot], {}, this.validateTimeoutMs);
+					const [, sha, status] = result.out.validated?.[0] ?? [];
+					this.banner = result.code === 0 && sha
+						? `slot ${slot} validation ${status} @ ${sha.slice(0, 7)}`
+						: this.lastErrLine(result);
+					this.paint();
+				} else if (ch === "b" || ch === "\x1b") {
+					this.phase = { name: "list" };
+					this.paint();
+				}
+				break;
 			case "github-pick":
 				if (ch >= "1" && ch <= "9") {
 					const slot = Number(ch);
@@ -719,6 +754,9 @@ export class HarvestRenderer {
 				if (ch >= "1" && ch <= "9") await this.selectSlot(Number(ch));
 				else if (ch === "p") {
 					this.phase = { name: "publish-pick" };
+					this.paint();
+				} else if (ch === "v") {
+					this.phase = { name: "validate-pick" };
 					this.paint();
 				} else if (ch === "g" || ch === "c") {
 					this.phase = { name: "github-pick", operation: ch === "g" ? "publish-pr" : "pr-status" };
