@@ -8,6 +8,10 @@ Notable changes to the Swarm plugin. Format follows
 ## [Unreleased]
 
 ### Fixed
+- A conflicted harvest merge resolved by hand in its merge tree could not be
+  landed. Its commit was never journaled, so resume called it stale and
+  abort-merge refused it as an unknown merge commit. `conclude` now adopts
+  it.
 - Approving ignored-file cleanup failed with "Argument list too long" for any
   worktree holding a real dependency tree, so abort and archive kept it
   forever. The inventory went to Node as one argv string, past ARG_MAX. It now
@@ -28,6 +32,16 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- Conflict resolver: `resolve <slot>` (`g` in the conflict view) hands a
+  conflicted detached merge to an agent. It writes a brief into the merge tree
+  and starts the agent beside the slot's own on Herdr 0.7.5+. `conclude <slot>`
+  (`c`) is a read-only review of a merge resolved in its tree, by the agent or
+  by hand. It checks for exactly one finished merge of the exact slot tip
+  that was merged onto the journaled base. It lists every path changed
+  outside git's own automatic merge, and the full diffstat. `conclude <slot>
+  apply <sha>` (on `y`) records only that reviewed commit, which the existing
+  resume compare-and-swap then lands. Abort, abort-merge, and conclude keep the
+  merge tree until the resolver is proven gone.
 - `broadcast` harvest verb: types one single-line message into every running
   slot's agent (or `HERDR_SWARM_TARGETS`) and submits it. A slot is only typed
   into when its pane still holds the slot's terminal and a program, not the

@@ -108,6 +108,8 @@ add your own, see below):
      branch-name confirmation; a snapshot ref is written first).
    - *Conflict or hook failure* — classified distinctly; `s` shells into the
      merge tree, `a` aborts the merge (`git merge --abort`), `b` backs out.
+     For a conflict, `g` hands it to a resolver agent and `c` concludes a
+     merge you or the resolver committed. See "Resolving conflicts" below.
    - *Publish (PR-based harvest)* — `p` then a slot digit pushes that slot's
      branch to a remote (default `origin`, override with
      `HERDR_SWARM_PUBLISH_REMOTE`) instead of merging locally — plain push,
@@ -467,6 +469,74 @@ starts the agent anyway; output lands in the plugin state dir. The hook's
 stdout and stderr are logged there **verbatim and indefinitely** — the state
 dir is `0700`, but don't `echo`/`set -x` secrets in `setup.sh`: a token
 printed during dependency install stays on disk until you delete the log.
+
+## Resolving conflicts
+
+When a harvest merge conflicts in Swarm's own detached merge tree, the merge
+is left in place and journaled. There are two ways to resolve it, and both
+end the same way:
+
+- **By hand:** `s` shells into the merge tree. Resolve, `git add`, and
+  `git commit`.
+- **By an agent:** `g` (or `harvest-step.sh resolve <slot>`) writes a brief
+  into the merge tree (from `scripts/resolver-brief.md`): conflicted files,
+  both tips, and rules. The rules: resolve only the conflicts, conclude with
+  exactly one `git commit --no-edit`, never push, rebase, reset, or abort.
+  It then starts an agent in a pane split from the slot's own agent, working
+  in that tree. The preset is `HERDR_SWARM_RESOLVER_PRESET`, or the slot's own
+  by default. It needs Herdr 0.7.5+, and it merges nothing itself.
+
+Then `c` reviews the result. Scripted, that's `harvest-step.sh conclude
+<slot>`, which is **read-only**. It checks that the tree holds **exactly one
+finished merge of the exact slot commit that was merged onto the journaled
+base**:
+
+- no merge still in progress and no conflicted files;
+- nothing uncommitted;
+- a two-parent `HEAD` whose first parent is the journaled base and whose
+  second parent is the slot tip recorded when the merge started. A newer slot
+  commit swapped in by redoing the merge was never compared or validated, so
+  it's refused.
+
+It then shows:
+
+- **Every path the resolution changed beyond git's own automatic merge** of
+  the same two commits (`outside_conflict`, a loud block in the pane). Those
+  are changes neither side made: review them hardest.
+- The full diffstat against the base, or the head of it with an "N more"
+  line.
+
+Nothing is recorded by the review. Pressing `y` runs `conclude <slot> apply
+<sha>`, which re-checks everything, records **only the reviewed commit**, and
+lands it through the existing `resume` compare-and-swap. `n` leaves nothing
+behind. If the tree's commit changes after the review, apply refuses (exit 30)
+and you review again.
+
+Concluding also fixes a gap in the manual path. Before this, a merge you
+resolved by hand in the tree was never recorded, so resume called it stale
+and abort-merge refused over an unknown merge commit. A stale merge offers
+`c` too.
+
+**Safety:**
+
+- **Only Swarm's own trees.** A conflict in your own checked-out branch is
+  never handed to an agent or concluded by Swarm (exit 32). Resolve it there
+  yourself.
+- **The merge tree stays until the resolver is *proven* gone.** "Gone" needs
+  positive evidence:
+  - its pane is absent from its own workspace's pane list;
+  - the pane now holds another terminal;
+  - the bare shell is back in front.
+
+  "Live" (the resolver's program leads the pane) **and** "unknown" (for
+  example the agent shows up as `node cli.js`, or process info is missing)
+  both block `conclude`, a second `resolve`, `abort-merge`, and Abort's
+  removal. That holds even once every file is staged. Exit the agent first.
+  Agent CLIs stay at their prompt after committing, so exit it before `c`. If
+  you know it stopped but Swarm can't prove it,
+  `HERDR_SWARM_RESOLVER_STOPPED=yes` says so explicitly.
+- **Stale records are inert.** A resolver record is tied to the merge attempt
+  it was started for, so a record from an earlier attempt means nothing.
 
 ## Steering a running swarm
 

@@ -339,7 +339,11 @@ fi
 if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
   # Mirrors the real 0.7.4 pane_list schema: plugin panes carry the manifest
   # pane title as "label"; plain terminal panes have no label.
-  echo '{"id":"cli:pane:list","result":{"panes":[{"agent_status":"unknown","label":"Swarm Status","pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9"},{"agent":"claude","agent_status":"idle","pane_id":"w9:p4","tab_id":"w9:t1","terminal_title":"claude","workspace_id":"w9"}],"type":"pane_list"}}'
+  # STUB_PANE_LIST_ALSO adds one more pane id (e.g. a resolver's split pane
+  # w9:p7) so tests can tell "still in its workspace" from "gone".
+  extra=""
+  [ -n "\${STUB_PANE_LIST_ALSO:-}" ] && extra=',{"agent_status":"unknown","pane_id":"'"$STUB_PANE_LIST_ALSO"'","tab_id":"w9:t1","workspace_id":"w9"}'
+  echo '{"id":"cli:pane:list","result":{"panes":[{"agent_status":"unknown","label":"Swarm Status","pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9"},{"agent":"claude","agent_status":"idle","pane_id":"w9:p4","tab_id":"w9:t1","terminal_title":"claude","workspace_id":"w9"}'"$extra"'],"type":"pane_list"}}'
   exit 0
 fi
 if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
@@ -366,6 +370,8 @@ if [ "$1" = "pane" ] && [ "$2" = "get" ]; then
   n="\${3#w1}"; n="\${n%%:*}"
   term="term_s\${n}"
   case " \${STUB_REUSED_PANES:-} " in *" $3 "*) term="term_other" ;; esac
+  # Panes made by \`pane split\` (w9:p7 / term_split7 below) are not slot panes.
+  [ "$3" = "w9:p7" ] && term="term_split7"
   status=unknown
   case " \${STUB_BLOCKED_PANES:-} " in *" $3 "*) status=blocked ;; esac
   echo '{"id":"cli:pane:get","result":{"pane":{"agent_status":"'"$status"'","focused":false,"pane_id":"'"$3"'","revision":3,"tab_id":"w9:t1","terminal_id":"'"$term"'","workspace_id":"w9"},"type":"pane_info"}}'

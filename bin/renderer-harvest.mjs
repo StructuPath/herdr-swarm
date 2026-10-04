@@ -217,7 +217,33 @@ export function renderHarvest(model, cols = 80) {
 			lines.push(
 				` Until it is cleared, harvest refuses every merge in this repo.`,
 			);
-			lines.push(`${ESC}[2m [a]bort the stale merge  [n]leave it${ESC}[0m`);
+			lines.push(` If you (or a resolver) committed the merge in its tree, [c]onclude adopts it.`);
+			lines.push(`${ESC}[2m [c]onclude  [a]bort the stale merge  [n]leave it${ESC}[0m`);
+			break;
+		}
+		case "conclude-confirm": {
+			lines.push(` LAND slot ${ph.slot}'s resolved merge ${String(ph.sha).slice(0, 12)} onto the base?`.slice(0, cols));
+			// The one list that must never be missed: what the resolution changed
+			// beyond git's own merge of the same two commits.
+			if (ph.outside?.length) {
+				lines.push(`${ESC}[7m CHANGED OUTSIDE THE CONFLICTS (${ph.outside.length}) — not part of either side's work: ${ESC}[0m`);
+				for (const p of ph.outside.slice(0, 20)) lines.push(`${ESC}[7m   ${sanitizeText(p)}${ESC}[0m`.slice(0, cols + 8));
+				if (ph.outside.length > 20) lines.push(`${ESC}[7m   … and ${ph.outside.length - 20} more${ESC}[0m`);
+			} else if (ph.outsideUnknown) {
+				lines.push(" (could not check for changes outside the conflicts: git < 2.38)");
+			} else {
+				lines.push(" Only the conflicted files differ from git's own merge.");
+			}
+			lines.push(" Everything it changes against the base (the slot's work plus the resolution):");
+			// `git diff --stat`: file lines, then one summary line. Never a silent
+			// tail: show the head of the list, say how many were left out.
+			const stat = ph.stat ?? [];
+			const files = stat.slice(0, -1);
+			const shown = files.slice(0, 20);
+			for (const s of shown) lines.push(`   ${sanitizeText(s)}`.slice(0, cols));
+			if (files.length > shown.length) lines.push(`   … and ${files.length - shown.length} more files (harvest-step.sh conclude ${ph.slot} lists all)`);
+			if (stat.length) lines.push(`   ${sanitizeText(stat[stat.length - 1])}`.slice(0, cols));
+			lines.push(`${ESC}[2m [y]record and land it (compare-and-swap on the base)  [n]not now — nothing is recorded${ESC}[0m`);
 			break;
 		}
 		case "dirty":
@@ -255,7 +281,9 @@ export function renderHarvest(model, cols = 80) {
 			for (const f of ph.files ?? []) lines.push(`   ${sanitizeText(f)}`);
 			if (ph.message) lines.push(` ${sanitizeText(ph.message)}`.slice(0, cols));
 			lines.push(
-				`${ESC}[2m [s]hell into merge tree  [a]bort merge  [b]ack${ESC}[0m`,
+				ph.kind === "conflict"
+					? `${ESC}[2m [s]hell into merge tree  [g]ive it to a resolver agent  [c]onclude once committed  [a]bort merge  [b]ack${ESC}[0m`
+					: `${ESC}[2m [s]hell into merge tree  [a]bort merge  [b]ack${ESC}[0m`,
 			);
 			break;
 		}
@@ -513,6 +541,44 @@ export class HarvestRenderer {
 			this.paint();
 		}
 		return false;
+	}
+
+	// Adopt a merge resolved in its tree, then ask before landing it. Returns
+	// true when it moved to the confirm (the caller's phase is replaced);
+	// false leaves the caller's phase with the refusal in the banner.
+	async doConclude(slot) {
+		// Read-only check: nothing is recorded until `y` on the review below.
+		const r = await this.step("conclude", [slot]);
+		const [, sha] = r.out.conclude_ready?.[0] ?? [];
+		if (r.code !== 0 || !sha) {
+			this.banner = this.lastErrLine(r);
+			this.paint();
+			return false;
+		}
+		this.phase = {
+			name: "conclude-confirm",
+			slot,
+			sha,
+			stat: (r.out.stat ?? []).map((v) => v.join("\t")),
+			outside: (r.out.outside_conflict ?? []).map((v) => v[0]),
+			outsideUnknown: Boolean(r.out.outside_conflict_unknown),
+		};
+		this.paint();
+		return true;
+	}
+
+	// The operator's `y`: record exactly the reviewed commit, then land it
+	// through the compare-and-swap. Either step refusing lands nothing.
+	async applyConclude(ph) {
+		const a = await this.step("conclude", [ph.slot, "apply", ph.sha]);
+		if (a.code !== 0) {
+			this.banner = this.lastErrLine(a);
+		} else {
+			const r = await this.step("resume", ["complete", ph.slot]);
+			this.banner = r.code === 0 ? `slot ${ph.slot} merge landed (${ph.sha.slice(0, 7)})` : this.lastErrLine(r);
+		}
+		this.phase = { name: "list" };
+		await this.reload();
 	}
 
 	// Compare view: one read-only `compare` verb call, parsed into the phase.
@@ -810,6 +876,11 @@ export class HarvestRenderer {
 			}
 			case "stale": {
 				const slot = ph.slots[ph.idx];
+				if (ch === "c" || ch === "C") {
+					// A merge resolved in its tree (by hand or by a resolver) is
+					// "stale" only because its commit was never recorded.
+					if (await this.doConclude(slot)) break;
+				}
 				if (ch === "a" || ch === "A") {
 					const r = await this.step("abort-merge", [slot]);
 					this.banner =
@@ -859,9 +930,27 @@ export class HarvestRenderer {
 					this.paint();
 				}
 				break;
+			case "conclude-confirm":
+				if (ch === "y" || ch === "Y") {
+					await this.applyConclude(ph);
+				} else {
+					// Nothing was recorded: the merge stays exactly as it was.
+					this.banner = `slot ${ph.slot}: not landed, nothing recorded — press c again when ready`;
+					this.phase = { name: "list" };
+					await this.reload();
+				}
+				break;
 			case "conflict":
 				if (ch === "s" && ph.tree) {
 					this.shellInto(ph.tree);
+				} else if (ch === "g" && ph.kind === "conflict") {
+					const r = await this.step("resolve", [ph.slot]);
+					this.banner = r.code === 0
+						? `slot ${ph.slot}: resolver started beside the slot's agent — when it has committed, press c`
+						: this.lastErrLine(r);
+					this.paint();
+				} else if (ch === "c") {
+					await this.doConclude(ph.slot);
 				} else if (ch === "a") {
 					const r = await this.step("abort-merge", [ph.slot]);
 					this.banner =

@@ -427,9 +427,12 @@ slot_ignored_inventory() {
 	cleanup_inventory "$repo_root" "$binding" "$operation_id"
 }
 
+# verify_harvest_resource <run> <slot> <tree> <journal> [allowed-head]: the
+# optional head is the single extra HEAD accepted — only `conclude` passes it,
+# after checking that commit's first parent is the journaled base.
 verify_harvest_resource() {
-	local run_id="$1" slot="$2" wt="$3" journal="$4"
-	safety_state verify-harvest "$(state_dir)" "${SWARM_REPO:?}" "$run_id" "$slot" "$wt" "$journal" "$(manifest_path)"
+	local run_id="$1" slot="$2" wt="$3" journal="$4" allowed_head="${5-}"
+	safety_state verify-harvest "$(state_dir)" "${SWARM_REPO:?}" "$run_id" "$slot" "$wt" "$journal" "$(manifest_path)" "$allowed_head"
 }
 
 harvest_ignored_inventory() {
@@ -1017,6 +1020,71 @@ pane_foreground_program() {
 			console.log(names.length ? ["program", ...names].join("\t") : "unknown");
 		});
 	' 2>/dev/null || printf 'unknown\n'
+}
+
+# resolver_state <slot-row-json>: `gone`, `live`, or `unknown` for the slot's
+# conflict resolver. Destructive callers (abort, abort-merge, conclude, a
+# second resolve) must treat anything but `gone` as "may still be working":
+# a false "gone" would reset or delete a live agent's tree. So `gone` needs
+# POSITIVE evidence —
+#   - no resolver record for the CURRENT journal generation (an older
+#     attempt's record is inert), or
+#   - its pane is absent from `pane list`, or now holds another terminal, or
+#   - the pane's foreground is the bare shell (the agent exited).
+# `live` = the recorded program leads the pane's foreground. Everything else
+# (a timeout, no process-info, the agent under an interpreter name such as
+# `node cli.js`) is `unknown` — never guessed to be gone.
+#
+# The pane-absent proof lists the resolver's OWN workspace (recorded at
+# resolve): an unscoped `pane list` has undocumented scope, and absence from
+# a list that never covered the pane would be a false "gone". If that cannot
+# be listed at all (workspace closed), the operator can assert it with
+# HERDR_SWARM_RESOLVER_STOPPED=yes — an explicit human statement, never
+# inferred.
+resolver_state() {
+	local fields pane term cmd ws listed got kind a b
+	fields="$(printf '%s' "${1-}" | node -e '
+		let d = ""; process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			let r; try { r = JSON.parse(d); } catch { return; }
+			const v = r?.resolver, gen = r?.journal?.resource?.generation;
+			if (!v || !gen || v.generation !== gen) return;
+			process.stdout.write([v.pane_id ?? "", v.terminal_id ?? "", v.agent_command ?? "", v.workspace_id ?? ""].join("\t"));
+		});' 2>/dev/null)" || {
+		printf 'unknown\n'
+		return 0
+	}
+	if [ -z "$fields" ] || [ "${HERDR_SWARM_RESOLVER_STOPPED:-}" = yes ]; then
+		printf 'gone\n'
+		return 0
+	fi
+	IFS=$'\t' read -r pane term cmd ws <<<"$fields"
+	if [ -z "$pane" ] || [ -z "$term" ] || [ -z "$cmd" ]; then
+		printf 'unknown\n'
+		return 0
+	fi
+	if [ -n "$ws" ] && listed="$(herdr_pane_list --workspace "$ws" 2>/dev/null)" &&
+		printf '%s' "$listed" | tr -d ' \n\r\t' | grep -q '"type":"pane_list"' &&
+		! printf '%s' "$listed" | tr -d ' \n\r\t' | grep -q "\"pane_id\":\"$pane\""; then
+		printf 'gone\n'
+		return 0
+	fi
+	got="$(herdr_pane_get "$pane" 2>/dev/null)" || {
+		printf 'unknown\n'
+		return 0
+	}
+	case "$(parse_json_field terminal_id "$got")" in
+	"$term") ;;
+	'') printf 'unknown\n'; return 0 ;;
+	*) printf 'gone\n'; return 0 ;;
+	esac
+	IFS=$'\t' read -r kind a b <<<"$(pane_foreground_program "$pane")"
+	if [ "$kind" = shell ]; then
+		printf 'gone\n'
+	elif [ "$kind" = program ] && { [ "$a" = "$cmd" ] || [ "$b" = "$cmd" ]; }; then
+		printf 'live\n'
+	else
+		printf 'unknown\n'
+	fi
 }
 
 # report_slot_agent_state <pane_id> <agent label> <idle|working|blocked|unknown>
