@@ -512,6 +512,36 @@ test("no ambient-cwd git invocations outside lib.sh (every repo git names its ta
 // ancestry — nothing there is manifest-path-derived. fanout-pane.sh's detritus
 // reaper is the same shape: `_swarm_worktrees` reads git's own worktree list,
 // so its path/branch pairing comes from git, not from a file on disk.
+// Each PROGRAM in scripts/, as [entry file, every file it is made of]. The
+// harvest verbs are split across harvest-step-<area>.sh modules that only
+// harvest-step.sh sources, so they are checked as that one program — exactly
+// as when they were one file. lib.sh is excluded as a shared library.
+function scriptPrograms() {
+	const dir = path.join(repoRoot, "scripts");
+	const shells = fs.readdirSync(dir).filter((f) => f.endsWith(".sh") && f !== "lib.sh");
+	const modules = shells.filter((f) => /^harvest-step-.+\.sh$/.test(f));
+	return shells
+		.filter((f) => !modules.includes(f))
+		.map((f) => [
+			path.join(dir, f),
+			[f, ...(f === "harvest-step.sh" ? modules : [])].map((m) => path.join(dir, m)),
+		]);
+}
+
+test("harvest-step modules are sourced by harvest-step.sh and nothing else", () => {
+	const dir = path.join(repoRoot, "scripts");
+	const entry = fs.readFileSync(path.join(dir, "harvest-step.sh"), "utf8");
+	const modules = fs.readdirSync(dir).filter((f) => /^harvest-step-.+\.sh$/.test(f));
+	assert.ok(modules.length >= 8, "the split modules exist");
+	for (const m of modules) {
+		assert.match(entry, new RegExp(`\\. "\\$PLUGIN_ROOT/scripts/${m.replace(".", "\\.")}"`), `${m} is sourced by the entry point`);
+		for (const other of fs.readdirSync(dir).filter((f) => f.endsWith(".sh") && f !== "harvest-step.sh")) {
+			assert.doesNotMatch(fs.readFileSync(path.join(dir, other), "utf8"), new RegExp(`scripts/${m.replace(".", "\\.")}`),
+				`${other} must not source ${m} (it would escape the per-program invariants)`);
+		}
+	}
+});
+
 test("every script that mutates a manifest-named slot worktree calls verify_slot_ownership", () => {
 	// Mutations that can destroy work in a worktree. `worktree list` and
 	// `merge-base` are deliberately absent: read-only calls are not the hazard.
@@ -525,13 +555,12 @@ test("every script that mutates a manifest-named slot worktree calls verify_slot
 	// (SLOT_PATH) and the inline-node side (`s.path ?? ""`) both count.
 	const SLOT_ROW_READERS = [/\bSLOT_PATH\b/, /\b[a-z]\.path\s*\?\?/];
 	const offenders = [];
-	for (const f of fs.readdirSync(path.join(repoRoot, "scripts"))) {
-		if (!f.endsWith(".sh") || f === "lib.sh") continue;
-		const file = path.join(repoRoot, "scripts", f);
+	for (const [file, sources] of scriptPrograms()) {
 		// Comments describe these mutations at length in this repo; only code
 		// lines can actually run one.
-		const code = fs
-			.readFileSync(file, "utf8")
+		const code = sources
+			.map((f) => fs.readFileSync(f, "utf8"))
+			.join("\n")
 			.split("\n")
 			.filter((l) => !/^\s*#/.test(l))
 			.join("\n");
@@ -555,10 +584,11 @@ test("every script that mutates a manifest-named slot worktree calls verify_slot
 });
 
 test("every harvest-worktree removal route uses the shared exact verifier/remover", () => {
-	const harvest = fs.readFileSync(
-		path.join(repoRoot, "scripts/harvest-step.sh"),
-		"utf8",
-	);
+	// The harvest program: harvest-step.sh plus the modules it sources.
+	const harvest = scriptPrograms()
+		.find(([file]) => file.endsWith("/harvest-step.sh"))[1]
+		.map((f) => fs.readFileSync(f, "utf8"))
+		.join("\n");
 	const abort = fs.readFileSync(path.join(repoRoot, "scripts/abort.sh"), "utf8");
 	const lib = fs.readFileSync(path.join(repoRoot, "scripts/lib.sh"), "utf8");
 	assert.doesNotMatch(harvest, /worktree remove "\$(?:hwt|wt|jwt|d)"/);
