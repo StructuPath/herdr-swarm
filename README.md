@@ -13,6 +13,25 @@ at a time. Agents commit locally and never push; the orchestrator merges.
 is the practical guide to this plugin and its three siblings (Browser, Guard,
 Conductor).
 
+## The workflow (0.5.0)
+
+Running N agents only pays off if you can pick the best result. From fan-out
+to a landed winner:
+
+| Step | What happens | Section |
+| --- | --- | --- |
+| **Fan out** | One task, or a different task per slot, into N worktrees. Each slot gets its dependencies (copy-on-write `node_modules`), its own ports, and its slot variables. Swarm warns up front when two slots' tasks name the same files | [Scripting fan-out](#scripting-fan-out), [Fresh worktrees](#fresh-worktrees-lack-your-env) |
+| **Steer** | `broadcast` one message to every running agent | [Steering](#steering-a-running-swarm) |
+| **Know when done** | The status pane records each slot finished (its marker, or its agent exiting), shows elapsed time, and notifies once when all are done | [Finish detection](#finish-detection) |
+| **Check** | `validate.sh` runs on each slot's exact commit, automatically on finish if you opt in | [Validating slots](#validating-slots) |
+| **Compare** | A ranked table (checks, commits, files, overlap, time) and a diff of any two slots | [Comparing slots](#comparing-slots-and-picking-a-winner) |
+| **Land** | Merge the winner at the exact commit you compared; finished losers are skipped and archived, and branches are kept | [Comparing slots](#comparing-slots-and-picking-a-winner) |
+| **Resolve** | A conflicting merge can go to a resolver agent. You review the resolution (including any change outside the conflicts) before it lands | [Resolving conflicts](#resolving-conflicts) |
+
+Nothing merges without your explicit selection or confirmation. The merge
+guarantees are unchanged: drift-checked, compare-and-swap, journaled, and
+review-first.
+
 ## Requirements
 
 - **herdr 0.7.4 or newer.** Fan-out works on both 0.7.4 and 0.7.5+, by two
@@ -39,6 +58,12 @@ Conductor).
   Harvest, abort, and prune of an existing run work on every supported
   version (they are mostly git). Versions above the newest tested get a
   warning, never a refusal.
+
+  Two 0.5.0 features need the 0.7.5+ pane-built path: the **conflict
+  resolver** (refused on 0.7.4) and **slot variables inside the agent
+  process** (on 0.7.4 the agent learns its ports from the task file instead).
+  The whole 0.5.0 flow was exercised live on Herdr 0.8.2; see
+  [readiness](docs/readiness.md).
 - **git >= 2.38** recommended (relies on `git worktree`, three-arg
   `git update-ref` compare-and-swap, and `git merge-base --is-ancestor`).
 - **Node.js >= 20** on your PATH (manifest handling, manifest validation, and
@@ -97,7 +122,8 @@ add your own, see below):
    unreachable agents show as `unknown` with their committed work still
    harvestable.
 3. **Harvest** (`structupath.swarm.harvest`) — review-first merge-back. Keys:
-   `1`–`9` select a slot, `r` re-previews, `q` quits. Per slot:
+   `1`–`9` select a slot, `w` opens the compare view (diff two slots, merge a
+   winner), `v` validates a slot, `r` re-previews, `q` quits. Per slot:
    - *Clean slot* — merged `--no-ff` with a templated message. The base ref is
      drift-checked before **every** merge; if it moved, all slots re-preview.
      When base is not checked out anywhere, the merge runs in a plugin-owned
@@ -343,12 +369,15 @@ not copied.
 See [GitHub handoff contract and recovery](docs/github-handoff.md) for the file
 schema, Console integration output, and failure handling.
 
-### Strict candidate handoff (opt-in development path)
+### Strict candidate handoff
 
 For a selected **clean** slot HEAD, keep validation, Browser QA, and the
 operator's review in three separate regular files. Validation checks must all
 pass; Browser QA must pass for that same SHA; the review must approve the exact
-run ID, slot, and SHA. Preview the readiness gaps locally before publishing:
+run ID, slot, and SHA. The validation file can be the one `validate <slot>`
+records: with `HERDR_SWARM_CANDIDATE_VALIDATION_FILE` unset, it's used
+automatically (see [Validating slots](#validating-slots)). Preview the
+readiness gaps locally before publishing:
 
 ```sh
 export HERDR_SWARM_CANDIDATE_VALIDATION_FILE=/absolute/private/checks.json
