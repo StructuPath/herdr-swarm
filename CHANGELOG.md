@@ -28,6 +28,14 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- `broadcast` harvest verb: types one single-line message into every running
+  slot's agent (or `HERDR_SWARM_TARGETS`) and submits it. A slot is only typed
+  into when its pane still holds the slot's terminal and a program, not the
+  shell, is in the foreground. Multi-line text, control characters, and a
+  leading `-` are refused.
+- Elapsed time per slot in the status pane and the compare view (fan-out now
+  records `started_at`). Token and cost display is deferred: Herdr has no
+  usage channel and agents do not report usage to it.
 - Per-slot tasks without a TTY: `<!-- swarm-slot: N -->` marker lines split
   `HERDR_SWARM_TASK_FILE` into per-slot sections after a shared preamble.
   The highest section sets the slot count when `HERDR_SWARM_SLOTS` is unset,

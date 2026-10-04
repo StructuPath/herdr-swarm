@@ -359,12 +359,44 @@ if [ "$1" = "pane" ] && [ "$2" = "report-agent" ]; then
   exit 0
 fi
 if [ "$1" = "pane" ] && [ "$2" = "read" ]; then exit "\${STUB_PANE_ALIVE:-1}"; fi
+if [ "$1" = "pane" ] && [ "$2" = "get" ]; then
+  # Live-captured pane_info shape on 0.8.2. Fixture panes are w1N:p1 for slot
+  # N with terminal term_sN; STUB_REUSED_PANES lists panes whose terminal is
+  # now a different one (the slot's pane was reused).
+  n="\${3#w1}"; n="\${n%%:*}"
+  term="term_s\${n}"
+  case " \${STUB_REUSED_PANES:-} " in *" $3 "*) term="term_other" ;; esac
+  status=unknown
+  case " \${STUB_BLOCKED_PANES:-} " in *" $3 "*) status=blocked ;; esac
+  echo '{"id":"cli:pane:get","result":{"pane":{"agent_status":"'"$status"'","focused":false,"pane_id":"'"$3"'","revision":3,"tab_id":"w9:t1","terminal_id":"'"$term"'","workspace_id":"w9"},"type":"pane_info"}}'
+  exit 0
+fi
+if [ "$1" = "pane" ] && { [ "$2" = "send-text" ] || [ "$2" = "send-keys" ]; }; then
+  # Live-verified: both print nothing on success.
+  if [ "$2" = "send-keys" ] && [ -n "\${STUB_SENDKEYS_FAIL:-}" ]; then exit 1; fi
+  exit 0
+fi
 if [ "$1" = "pane" ] && [ "$2" = "process-info" ]; then
   # Live-captured on 0.8.2 (protocol 20), paths sanitized. STUB_PANE_FG picks
   # the pane's foreground: "busy" (argv running), "shell" (argv exited — the
   # foreground group IS the shell), unset = herdr refuses (older herdr).
-  case "\${STUB_PANE_FG:-}" in
-  busy) echo '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":53782,"foreground_processes":[{"argv":["sleep","40"],"argv0":"sleep","cmdline":"sleep 40","cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","name":"sleep","pid":53782}],"pane_id":"w9:p7","shell_pid":53593},"type":"pane_process_info"}}' ;;
+  # STUB_SHELL_PANES lists panes that read "shell" whatever STUB_PANE_FG says;
+  # STUB_FG_ARGV (JSON array) is the busy group leader's argv (default
+  # ["sleep","40"]); STUB_FOREIGN_PANES lead with a user-started \`bash\` instead,
+  # beside the agent as a non-leader member (as a nested shell would be);
+  # STUB_FG_FLIP_FILE flips a pane to "shell" on the call after it was busy.
+  fg="\${STUB_PANE_FG:-}"
+  case " \${STUB_SHELL_PANES:-} " in *" $4 "*) fg=shell ;; esac
+  if [ -n "\${STUB_FG_FLIP_FILE:-}" ] && [ "$fg" = busy ]; then
+    if [ -e "$STUB_FG_FLIP_FILE" ]; then fg=shell; else : > "$STUB_FG_FLIP_FILE"; fi
+  fi
+  argv="\${STUB_FG_ARGV:-[\\"sleep\\",\\"40\\"]}"
+  case " \${STUB_FOREIGN_PANES:-} " in *" $4 "*)
+    echo '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":61000,"foreground_processes":[{"argv":'"$argv"',"pid":53782},{"argv":["bash"],"argv0":"bash","name":"bash","pid":61000}],"pane_id":"'"$4"'","shell_pid":53593},"type":"pane_process_info"}}'
+    exit 0 ;;
+  esac
+  case "$fg" in
+  busy) echo '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":53782,"foreground_processes":[{"argv":'"$argv"',"argv0":"sleep","cmdline":"sleep 40","cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","name":"sleep","pid":53782}],"pane_id":"w9:p7","shell_pid":53593},"type":"pane_process_info"}}' ;;
   shell) echo '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":53593,"foreground_processes":[{"argv":["-zsh"],"argv0":"zsh","cmdline":"-zsh","cwd":"/tmp/herdr-worktrees/repo/swarm-r1-s1","name":"zsh","pid":53593}],"pane_id":"w9:p7","shell_pid":53593},"type":"pane_process_info"}}' ;;
   *) exit 1 ;;
   esac

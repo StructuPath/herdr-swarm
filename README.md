@@ -468,6 +468,60 @@ stdout and stderr are logged there **verbatim and indefinitely** — the state
 dir is `0700`, but don't `echo`/`set -x` secrets in `setup.sh`: a token
 printed during dependency install stays on disk until you delete the log.
 
+## Steering a running swarm
+
+Send one message to every running slot's agent. It is typed in and submitted,
+as if you had typed it into each agent:
+
+```sh
+HERDR_SWARM_MESSAGE="Also add tests for the edge cases, then commit." \
+  bash scripts/harvest-step.sh broadcast
+```
+
+- `HERDR_SWARM_MESSAGE_FILE` takes the message from a file instead.
+- `HERDR_SWARM_TARGETS=1,3` limits it to some slots.
+- Output: one record per targeted slot:
+  - `broadcast_sent<TAB>slot`
+  - `broadcast_skipped<TAB>slot<TAB>why`
+  - `broadcast_partial<TAB>slot<TAB>why`: the text was typed but **not
+    submitted**. Clear that pane's input line rather than re-running.
+- The verb exits 36 unless every target received the message. Targets are
+  slot numbers, each named at most once.
+
+**One line of plain text.** A newline inside the text reaches the agent as a
+real line break, so a terminal agent would submit half the message
+(live-verified). Control characters are keystrokes (Ctrl-C, escape sequences),
+not text. Swarm refuses both, plus Unicode line separators,
+direction overrides, invalid UTF-8, and a leading `-` (which the Herdr CLI
+would parse as a flag). This check doesn't depend on your locale. For longer
+instructions, write a file and broadcast "read NOTES.md and follow it".
+
+**Only into the slot's own agent.** Typing into the wrong program can *run*
+the message: a shell executes it, `less` runs `!…`, `vim` treats it as
+commands, and an approval dialog takes letters as choices and Enter as "yes".
+Right before typing, a slot must pass all of these:
+
+- its pane still holds the slot's own terminal;
+- Herdr doesn't report the agent `blocked`;
+- the foreground process group's **leader** is the slot's own agent program
+  (recorded at fan-out as `agent_command`, e.g. `claude`, or `codex` when
+  launched as `node …/codex`), not the shell or anything started in the pane;
+- the agent hasn't finished by exiting.
+
+The program is checked again between typing and Enter. If it changed, Enter is
+withheld, because unsubmitted text is inert. Rows from runs started before this
+version have no `agent_command` and are skipped. On Herdr 0.7.5+ Swarm reports
+the agent's state itself, so a `blocked` approval prompt isn't visible. Don't
+broadcast while an agent may be asking for approval. Herdr's `agent prompt`
+isn't used, because on 0.7.5+ it refuses panes where Swarm reports the agent
+state (live-verified: `agent_not_ready`).
+
+**Elapsed time** per slot shows in the status pane's `time` column and the
+compare view. It runs from when the slot started to when finish detection
+recorded it done, or to now. Token usage and cost aren't shown: Herdr has no
+channel that carries them (its pane `tokens` are display metadata), and no
+agent reports them to it.
+
 ## Comparing slots and picking a winner
 
 In the harvest pane, `w` opens the compare view, which replaces the slot list

@@ -942,6 +942,24 @@ herdr_pane_process_info() {
 	with_timeout 5 "$HERDR" pane process-info --pane "$@"
 }
 
+# `pane get <pane_id>` → result.pane {pane_id, terminal_id, workspace_id, …}
+# (live-captured on 0.8.2). Read-only.
+herdr_pane_get() {
+	with_timeout 5 "$HERDR" pane get "$@"
+}
+
+# `pane send-text <pane_id> <text>` types the text into the pane's foreground
+# program; `pane send-keys <pane_id> Enter` submits it. Both print nothing on
+# success (live-verified on 0.8.2). A newline inside send-text arrives as a
+# real line break — callers must keep messages single-line.
+herdr_pane_send_text() {
+	with_timeout 5 "$HERDR" pane send-text "$@"
+}
+
+herdr_pane_send_keys() {
+	with_timeout 5 "$HERDR" pane send-keys "$@"
+}
+
 # `notification show <title> [--body T] [--sound none|done|request]`
 # (live-captured on 0.8.2): result = {type:"notification_show", shown, reason}.
 herdr_notification_show() {
@@ -967,6 +985,36 @@ pane_foreground() {
 			try { p = JSON.parse(d).result.process_info; } catch {}
 			const ok = p && Number.isSafeInteger(p.shell_pid) && Number.isSafeInteger(p.foreground_process_group_id);
 			console.log(!ok ? "unknown" : p.foreground_process_group_id === p.shell_pid ? "shell" : "busy");
+		});
+	' 2>/dev/null || printf 'unknown\n'
+}
+
+# pane_foreground_program <pane_id>: `shell` / `unknown` as pane_foreground,
+# otherwise `program<TAB>name` where name is the basename of the foreground
+# process GROUP LEADER's argv[0] (pid == foreground_process_group_id). The
+# leader, not just any member: a live 0.8.2 capture showed an agent's own
+# helper processes (MCP servers, caffeinate) sharing its group, while a
+# shell, pager or editor the user starts in the pane leads a group of its own.
+# Interpreter-launched CLIs (`node …/codex`) also report argv[1]'s basename,
+# as `program<TAB>node<TAB>codex`.
+pane_foreground_program() {
+	local out
+	out="$(herdr_pane_process_info "${1-}" 2>/dev/null)" || {
+		printf 'unknown\n'
+		return 0
+	}
+	printf '%s' "$out" | node -e '
+		const path = require("path");
+		let d = "";
+		process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			let p;
+			try { p = JSON.parse(d).result.process_info; } catch {}
+			if (!p || !Number.isSafeInteger(p.shell_pid) || !Number.isSafeInteger(p.foreground_process_group_id)) return console.log("unknown");
+			if (p.foreground_process_group_id === p.shell_pid) return console.log("shell");
+			const leader = (p.foreground_processes || []).find((x) => x?.pid === p.foreground_process_group_id);
+			const argv = Array.isArray(leader?.argv) ? leader.argv : [];
+			const names = argv.slice(0, 2).map((a) => path.basename(String(a))).filter((n) => /^[A-Za-z0-9._+-]{1,64}$/.test(n));
+			console.log(names.length ? ["program", ...names].join("\t") : "unknown");
 		});
 	' 2>/dev/null || printf 'unknown\n'
 }

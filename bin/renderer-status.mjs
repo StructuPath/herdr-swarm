@@ -17,6 +17,7 @@ import {
 	parseDiffStat,
 	parseStatusPorcelain,
 	pollDelay,
+	formatDuration,
 } from "./renderer-shared.mjs";
 
 const pExecFile = promisify(execFile);
@@ -26,7 +27,7 @@ const pExecFile = promisify(execFile);
 // inverse+red — R5 says loud, and color alone is invisible on some themes,
 // so inverse carries the weight even without color support.
 export function renderStatus(rows, cols = 80) {
-	const head = ` ${pad("#", 3)}${pad("state", 9)}${pad("c/u", 8)}${pad("label", 14)}${pad("branch", 28)}path`;
+	const head = ` ${pad("#", 3)}${pad("state", 9)}${pad("time", 7)}${pad("c/u", 8)}${pad("label", 14)}${pad("branch", 28)}path`;
 	const lines = [head.slice(0, cols)];
 	if (rows.length === 0) lines.push("  (no slots in this run)");
 	for (const r of rows) {
@@ -34,7 +35,7 @@ export function renderStatus(rows, cols = 80) {
 		// state comes from herdr's agent_status — externally controlled text on
 		// the same footing as a branch name, so it sanitizes like one.
 		const line =
-			` ${pad(r.slot, 3)}${pad(sanitizeText(r.state ?? ""), 9)}${pad(counts, 8)}${pad(
+			` ${pad(r.slot, 3)}${pad(sanitizeText(r.state ?? ""), 9)}${pad(formatDuration(r.elapsed ?? null), 7)}${pad(counts, 8)}${pad(
 				sanitizeText(r.label ?? ""),
 				14,
 			)}${pad(sanitizeText(r.branch ?? ""), 28)}${sanitizeText(r.path ?? "-")}`.slice(
@@ -247,7 +248,7 @@ export class Renderer {
 		m.slots.forEach((row, i) => {
 			gitFacts[row.slot] = factsList[i];
 		});
-		this.rows = sortSlots(reconcileSlots(m.slots, agents, gitFacts));
+		this.rows = sortSlots(reconcileSlots(m.slots, agents, gitFacts, m.created_at));
 		this.banner =
 			agents === null ? "agent list unavailable — states shown as unknown" : "";
 		this.paint();

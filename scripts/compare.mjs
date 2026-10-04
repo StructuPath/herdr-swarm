@@ -43,13 +43,23 @@ function validationFor(stateDir, runId, slot, tip) {
 	return { status: value.status, failed_checks: failed };
 }
 
-export function compareSlots({ repo, fork, runId, stateDir, rows }) {
-	const slots = rows.map(({ slot, label, branch, path: wt, status, finished }) => {
+// Seconds from a slot's start to its finish, or to now while it runs; null
+// when the start is unknown ("-" in the manifest).
+function elapsedSeconds(startedAt, finishedAt, now) {
+	const start = Date.parse(startedAt ?? "");
+	if (!Number.isFinite(start)) return null;
+	const end = Date.parse(finishedAt ?? "");
+	return Math.max(0, Math.round(((Number.isFinite(end) ? end : now) - start) / 1000));
+}
+
+export function compareSlots({ repo, fork, runId, stateDir, rows, now = Date.now() }) {
+	const slots = rows.map(({ slot, label, branch, path: wt, status, finished, startedAt, finishedAt }) => {
 		const tip = git(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])?.trim() || null;
 		// files stays null when the diff could not be read: "no files" would be
 		// a false claim of zero overlap with every other slot.
 		const out = { slot, label, branch, status, finished: finished || null, tip, commits: null,
-			files: null, insertions: null, deletions: null, dirty: null, validation: { status: "none" } };
+			files: null, insertions: null, deletions: null, dirty: null, validation: { status: "none" },
+			elapsed_seconds: elapsedSeconds(startedAt, finishedAt, now) };
 		if (tip) {
 			const count = git(repo, ["rev-list", "--count", `${fork}..${tip}`]);
 			out.commits = count === null ? null : Number(count.trim());
@@ -111,8 +121,8 @@ function main() {
 	const [repo, fork, runId, stateDir] = process.argv.slice(2);
 	// Fields are \x1f-separated, like read_slot's: TAB is legal in a path.
 	const rows = fs.readFileSync(0, "utf8").split("\n").filter(Boolean).map((line) => {
-		const [slot, label, branch, wt, status, finished] = line.split("\x1f");
-		return { slot: Number(slot), label, branch, path: wt, status, finished };
+		const [slot, label, branch, wt, status, finished, startedAt, finishedAt] = line.split("\x1f");
+		return { slot: Number(slot), label, branch, path: wt, status, finished, startedAt, finishedAt };
 	});
 	const { slots, overlaps } = compareSlots({ repo, fork, runId, stateDir, rows });
 	for (const s of slots) {
