@@ -28,6 +28,13 @@ Notable changes to the Swarm plugin. Format follows
   agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
+- Per-slot tasks without a TTY: `<!-- swarm-slot: N -->` marker lines split
+  `HERDR_SWARM_TASK_FILE` into per-slot sections after a shared preamble.
+  The highest section sets the slot count when `HERDR_SWARM_SLOTS` is unset,
+  and sections that don't fit the run refuse before anything is created.
+  Fan-out also warns when slots given different tasks name the same tracked
+  file or directory, since their merges may conflict. This applies to
+  interactive overrides too.
 - Slot environment: fan-out clones the repo's ignored `node_modules` (or a
   `clone-paths` list) into each worktree copy-on-write (`cp -c` / `--reflink`;
   skipped, not fully copied, where unsupported), before `setup.sh`. Each slot

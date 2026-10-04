@@ -927,6 +927,127 @@ test("fan-out targets the workspace's repo, not the process cwd", () => {
 // started. These tests pin the closing of that gap, including the part that
 // must NOT close: the unmerged-work guard.
 
+// --- per-slot tasks from one file (roadmap item 5) ---
+
+function taskFile(text) {
+	const f = path.join(mkdtemp("hs-brief-"), "brief.md");
+	fs.writeFileSync(f, text);
+	return f;
+}
+
+// A repo whose tracked files the conflict hint can match against.
+function setupWithSources(extraEnv) {
+	const ctx = setup(extraEnv);
+	fs.mkdirSync(path.join(ctx.repo, "src", "api"), { recursive: true });
+	fs.writeFileSync(path.join(ctx.repo, "src", "api", "client.ts"), "export {};\n");
+	fs.writeFileSync(path.join(ctx.repo, "src", "ui.ts"), "export {};\n");
+	git(ctx.repo, "add", "src");
+	git(ctx.repo, "commit", "-q", "-m", "sources");
+	return ctx;
+}
+
+test("env-driven: a sectioned task file gives each slot its own task and sets the slot count", () => {
+	const brief = taskFile([
+		"Shared context: the repo uses pnpm.",
+		"",
+		"<!-- swarm-slot: 1 -->",
+		"Add retries to the HTTP client.",
+		"<!-- swarm-slot: 2 -->",
+		"Write the migration guide.",
+		"<!-- swarm-slot: 3 -->",
+		"Benchmark cold start.",
+		"",
+	].join("\n"));
+	const { repo, env } = setup({ HERDR_SWARM_TASK_FILE: brief, HERDR_SWARM_PRESETS: "claude" });
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /3 slots, from the task file's slot sections/);
+	const tasks = readManifest().slots.map((s) => fs.readFileSync(path.join(s.path, ".swarm-task.md"), "utf8"));
+	assert.equal(tasks.length, 3);
+	for (const [i, own] of ["Add retries", "Write the migration guide", "Benchmark cold start"].entries()) {
+		assert.match(tasks[i], /^Shared context: the repo uses pnpm\.\n\n/);
+		assert.match(tasks[i], new RegExp(own));
+		for (const other of ["Add retries", "Write the migration guide", "Benchmark cold start"].filter((o) => o !== own))
+			assert.doesNotMatch(tasks[i], new RegExp(other), `slot ${i + 1} must not see another slot's task`);
+		assert.match(tasks[i], /## Standing instructions/, "the footer still follows");
+		assert.doesNotMatch(tasks[i], /swarm-slot:/, "markers never reach the agent");
+	}
+	assert.doesNotMatch(r.stderr, /may conflict/);
+});
+
+test("env-driven: sections that do not fit the slot count refuse before anything is created", () => {
+	for (const [slots, text, why] of [
+		["2", "<!-- swarm-slot: 3 -->\nx\n", /section for slot 3, but the run has 2/],
+		["2", "<!-- swarm-slot: 1 -->\nonly one\n", /slot 2 has no task/],
+		[undefined, "<!-- swarm-slot: 1 -->\na\n<!-- swarm-slot: 1 -->\nb\n", /slot 1 has two sections/],
+	]) {
+		const { repo, env } = setup({ HERDR_SWARM_TASK_FILE: taskFile(text), HERDR_SWARM_PRESETS: "claude", ...(slots ? { HERDR_SWARM_SLOTS: slots } : {}) });
+		const r = runPaneNoStdin(env, repo);
+		assert.notEqual(r.status, 0);
+		assert.match(r.stderr, why);
+		assert.doesNotMatch(log(), /worktree create/, "nothing was created");
+	}
+});
+
+test("a preamble lets more slots than sections share it", () => {
+	const { repo, env } = setup({
+		HERDR_SWARM_TASK_FILE: taskFile("Everyone: keep the API stable.\n<!-- swarm-slot: 1 -->\nAlso add retries.\n"),
+		HERDR_SWARM_SLOTS: "2",
+		HERDR_SWARM_PRESETS: "claude",
+	});
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	const [one, two] = readManifest().slots.map((s) => fs.readFileSync(path.join(s.path, ".swarm-task.md"), "utf8"));
+	assert.match(one, /keep the API stable\.\n\nAlso add retries\./);
+	assert.match(two, /^Everyone: keep the API stable\.\n/);
+	assert.doesNotMatch(two, /retries/);
+	assert.match(r.stderr, /slot 2 has no section of its own; it gets the shared preamble alone/);
+});
+
+test("a near-miss marker or an unreadable task file refuses before anything is created, with the right reason", () => {
+	{
+		const { repo, env } = setup({ HERDR_SWARM_TASK_FILE: taskFile("<!-- swarm-slot: 1 -->\nA\n<!-- swarm_slot: 2 -->\nB\n"), HERDR_SWARM_PRESETS: "claude" });
+		const r = runPaneNoStdin(env, repo);
+		assert.notEqual(r.status, 0);
+		assert.match(r.stderr, /line 3 looks like a slot marker but is not one/);
+	}
+	{
+		const brief = taskFile("Do it.\n");
+		fs.chmodSync(brief, 0o000);
+		const { repo, env } = setup({ HERDR_SWARM_TASK_FILE: brief, HERDR_SWARM_SLOTS: "1", HERDR_SWARM_PRESETS: "claude" });
+		const r = runPaneNoStdin(env, repo);
+		fs.chmodSync(brief, 0o600);
+		assert.notEqual(r.status, 0);
+		assert.match(r.stderr, /is not a readable file/);
+		assert.doesNotMatch(r.stderr, /invalid slot section/);
+	}
+	assert.doesNotMatch(log(), /worktree create/, "nothing was created");
+});
+
+test("different tasks naming the same tracked path get a conflict warning; best-of-N does not", () => {
+	const brief = taskFile("<!-- swarm-slot: 1 -->\nAdd retries in `src/api/client.ts`.\n<!-- swarm-slot: 2 -->\nRework src/api auth.\n<!-- swarm-slot: 3 -->\nRestyle src/ui.ts.\n");
+	{
+		const { repo, env } = setupWithSources({ HERDR_SWARM_TASK_FILE: brief, HERDR_SWARM_PRESETS: "claude" });
+		const r = runPaneNoStdin(env, repo);
+		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+		assert.match(r.stderr, /WARNING slots 1 and 2 were given different tasks that both name src\/api\/client\.ts/);
+		assert.doesNotMatch(r.stderr, /slots (1|2) and 3/);
+	}
+	{
+		const { repo, env } = setupWithSources({ HERDR_SWARM_TASK: "Add retries in src/api/client.ts", HERDR_SWARM_SLOTS: "3", HERDR_SWARM_PRESETS: "claude" });
+		const r = runPaneNoStdin(env, repo);
+		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+		assert.doesNotMatch(r.stderr, /may conflict/, "the same task on every slot is best-of-N, not a conflict");
+	}
+});
+
+test("interactive overrides get the same conflict hint", () => {
+	const { repo, env } = setupWithSources();
+	const r = runPane(lines(["2", "", "", "Shared: improve src/ui.ts", ".", "y", "Rewrite src/api/client.ts", ".", "y", "Add tests for src/api/client.ts", "."]), env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stderr, /slots 1 and 2 were given different tasks that both name src\/api\/client\.ts/);
+});
+
 test("env-driven: SLOTS+PRESETS+TASK fan out with no stdin at all", () => {
 	const { repo, wtRoot, env } = setup({
 		HERDR_SWARM_SLOTS: "2",

@@ -91,7 +91,10 @@ read_task() {
 #   HERDR_SWARM_TASK_FILE  file whose contents become the shared task — a FILE,
 #                          not a var, because the task is normally multi-line
 #                          and the stdin protocol's lone "." terminator has no
-#                          environment equivalent
+#                          environment equivalent. `<!-- swarm-slot: N -->`
+#                          marker lines split it into per-slot sections after
+#                          a shared preamble (scripts/tasks.mjs); with no
+#                          HERDR_SWARM_SLOTS the highest section sets N
 #   HERDR_SWARM_TASK       single-line shared task; the file wins if both are set
 #   HERDR_SWARM_DETRITUS   delete | rename | abort — replaces the d/r/q prompt
 #   HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes
@@ -100,10 +103,8 @@ read_task() {
 #                          leftovers REFUSES: the P0 guard is not bypassable
 #                          just because nobody is at the keyboard.
 #
-# Per-slot task overrides stay interactive-only. Encoding N free-form multi-line
-# prompts into the environment buys nothing a caller cannot get by fanning out
-# once per distinct task, and every encoding scheme reintroduces the terminator
-# problem HERDR_SWARM_TASK_FILE exists to dodge.
+# Per-slot tasks without a TTY go through slot sections in HERDR_SWARM_TASK_FILE
+# — one file, so the terminator problem it exists to dodge never comes back.
 SCRIPTED=0
 if [ -n "${HERDR_SWARM_SLOTS:-}${HERDR_SWARM_PRESETS:-}${HERDR_SWARM_TASK:-}${HERDR_SWARM_TASK_FILE:-}${HERDR_SWARM_DETRITUS:-}" ]; then
 	SCRIPTED=1
@@ -436,11 +437,35 @@ fi
 
 # --- Collect inputs (nothing is created until every input is validated) -----
 
+# Task scratch (the task-file snapshot, per-slot splits, conflict-hint inputs)
+# lives in the 0700 state dir and goes on exit. The EXIT trap extends — never
+# replaces — the lock-release trap set above.
+task_scratch="$(mktemp -d "$(state_dir)/tasks.XXXXXX")" || fatal 1 "herdr-swarm: could not create task scratch space."
+trap 'rm -rf "$task_scratch"; release_lock "$MUTATION_LOCK"' EXIT
+
+# The task file is read ONCE, into a snapshot every later step uses: a file
+# still being written when fan-out starts must not be counted from one
+# version and split from another. A task file with per-slot sections
+# (scripts/tasks.mjs) implies its own slot count when none was given.
+task_sections=0
+task_source=""
+if [ -n "${HERDR_SWARM_TASK_FILE:-}" ]; then
+	{ [ -f "$HERDR_SWARM_TASK_FILE" ] && [ -r "$HERDR_SWARM_TASK_FILE" ]; } ||
+		fatal 1 "herdr-swarm: HERDR_SWARM_TASK_FILE '$HERDR_SWARM_TASK_FILE' is not a readable file."
+	task_source="$task_scratch/brief.md"
+	cp "$HERDR_SWARM_TASK_FILE" "$task_source" || fatal 1 "herdr-swarm: could not read HERDR_SWARM_TASK_FILE '$HERDR_SWARM_TASK_FILE'."
+	task_sections="$(node "$PLUGIN_ROOT/scripts/tasks.mjs" max "$task_source")" || fatal 1 "herdr-swarm: HERDR_SWARM_TASK_FILE has an invalid slot section (see above)."
+fi
+
 if [ -n "${HERDR_SWARM_SLOTS:-}" ]; then
 	# No re-prompt loop here: a scripted caller cannot fix a typo mid-run, so a
 	# bad count is a refusal with the cap check's own message above it.
 	n="$HERDR_SWARM_SLOTS"
 	preflight_check_slot_cap "$n" || fatal $? "herdr-swarm: HERDR_SWARM_SLOTS='$n' refused."
+elif [ "$task_sections" -gt 0 ]; then
+	n="$task_sections"
+	preflight_check_slot_cap "$n" || fatal $? "herdr-swarm: the task file's highest slot section ($n) is over the slot cap."
+	echo "herdr-swarm: $n slots, from the task file's slot sections."
 else
 	require_var HERDR_SWARM_SLOTS "the slot count"
 	while :; do
@@ -501,8 +526,8 @@ fi
 if [ -n "${HERDR_SWARM_TASK_FILE:-}" ]; then
 	# The file wins over HERDR_SWARM_TASK on purpose: it is the channel that can
 	# carry a real multi-line brief, so a caller that set both meant this one.
-	[ -f "$HERDR_SWARM_TASK_FILE" ] || fatal 1 "herdr-swarm: HERDR_SWARM_TASK_FILE '$HERDR_SWARM_TASK_FILE' is not a readable file."
-	shared_task="$(cat "$HERDR_SWARM_TASK_FILE")" || fatal 1 "herdr-swarm: could not read HERDR_SWARM_TASK_FILE '$HERDR_SWARM_TASK_FILE'."
+	# Read from the snapshot taken (and validated) before the slot count.
+	shared_task="$(cat "$task_source")" || fatal 1 "herdr-swarm: could not read HERDR_SWARM_TASK_FILE '$HERDR_SWARM_TASK_FILE'."
 	# Command substitution ate the trailing newline; restore it so the task file
 	# has the same shape it gets from the interactive reader (body, then footer).
 	shared_task="$shared_task"$'\n'
@@ -518,11 +543,26 @@ fi
 trimmed="${shared_task//[[:space:]]/}"
 [ -n "$trimmed" ] || fatal 1 "herdr-swarm: empty task prompt — nothing to hand the agents."
 
+# Per-slot split of a sectioned task file, plus each slot's OWN text for the
+# conflict hint below.
+if [ "$task_sections" -gt 0 ]; then
+	split_out="$(node "$PLUGIN_ROOT/scripts/tasks.mjs" split "$task_source" "$n" "$task_scratch")" ||
+		fatal 1 "herdr-swarm: HERDR_SWARM_TASK_FILE's slot sections do not fit this run (see above)."
+	while IFS=$'\t' read -r kind s; do
+		[ "$kind" = preamble_only ] || continue
+		echo "herdr-swarm: note — slot $s has no section of its own; it gets the shared preamble alone." >&2
+	done <<<"$split_out"
+fi
+
 for ((i = 1; i <= n; i++)); do
+	if [ "$task_sections" -gt 0 ]; then
+		slot_tasks[i]="$(cat "$task_scratch/slot-$i.md")"$'\n'
+		continue
+	fi
 	if [ "$TASK_FROM_ENV" -eq 1 ]; then
-		# Per-slot overrides are interactive-only (see the env block up top):
-		# the shared task arrived from the environment, so there is no prompt
-		# session to elaborate it in.
+		# Per-slot overrides from the environment come through slot sections in
+		# HERDR_SWARM_TASK_FILE (handled above); a plain shared task has no
+		# prompt session to elaborate it in.
 		slot_tasks[i]="$shared_task"
 		continue
 	fi
@@ -536,6 +576,23 @@ for ((i = 1; i <= n; i++)); do
 	*) slot_tasks[i]="$shared_task" ;;
 	esac
 done
+
+# Conflict hint, before anything is created: slots given DIFFERENT work that
+# name the same tracked path are likely to conflict at harvest. Compares each
+# slot's own text (its section, or its whole task when unsectioned), so a
+# shared preamble — or best-of-N on one task — is never flagged. Warns only.
+focus_files=()
+for ((i = 1; i <= n; i++)); do
+	if [ "$task_sections" -eq 0 ]; then printf '%s' "${slot_tasks[i]}" >"$task_scratch/slot-$i.focus.md"; fi
+	focus_files+=("$task_scratch/slot-$i.focus.md")
+done
+while IFS=$'\t' read -r kind a b overlap_path; do
+	case "$kind" in
+	overlap) echo "herdr-swarm: WARNING slots $a and $b were given different tasks that both name $overlap_path — their merges may conflict." >&2 ;;
+	# Never silent: an empty hint must not read as "no conflicts".
+	skipped) echo "herdr-swarm: note — conflict hint skipped ($a)." >&2 ;;
+	esac
+done < <(node "$PLUGIN_ROOT/scripts/tasks.mjs" overlaps "$SWARM_REPO" "${focus_files[@]}" 2>/dev/null)
 
 # Every slot's binary is checked BEFORE any create: a missing binary found
 # after worktree create would strand a half-built run (R3/R4).

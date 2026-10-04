@@ -193,11 +193,57 @@ Notes:
   `HERDR_SWARM_DETRITUS_ACK_UNMERGED=yes` is the explicit opt-in, exactly as
   prune gates its destructive classes separately. `rename` keeps the work under
   `swarm-kept/` and always succeeds.
-- **Per-slot task overrides stay interactive-only.** Fan out once per distinct
-  task instead; there is no env encoding for N free-form multi-line prompts.
+- **Per-slot tasks go in the task file.** See below.
 - **Nothing blocks on a read.** With any of these variables set and stdin not a
   terminal, a missing piece is a loud refusal naming the variable — never a
   process waiting forever for input nobody will type.
+
+### Different tasks per slot
+
+To give slots different work, split `HERDR_SWARM_TASK_FILE` with marker lines.
+Text before the first marker is shared context every slot receives:
+
+```markdown
+The repo uses pnpm. Keep the public API unchanged.
+
+<!-- swarm-slot: 1 -->
+Add retry-with-backoff to `src/http/client.ts`.
+
+<!-- swarm-slot: 2 -->
+Write the v3 migration guide in docs/migration.md.
+```
+
+- Slot N's task is the preamble, then its own section. Markers never reach the
+  agent, and they're HTML comments, so the file still renders cleanly as
+  markdown.
+- With no `HERDR_SWARM_SLOTS`, the highest section number sets the slot count.
+  With it, extra slots get the preamble alone, and fan-out notes each slot
+  that did.
+- The fan-out is **refused, before anything is created**, if a section
+  exceeds the slot count, a slot number appears twice, or a slot is left with
+  no task at all. It's also refused on any comment line that *looks* like a
+  marker but doesn't parse (`<!-- swarm_slot: 2 -->`). Kept as text, that
+  line would silently hand one slot two slots' work.
+- Inside ```` ``` ```` or `~~~` fenced code blocks, marker lines are plain
+  text, so a brief can show the syntax as an example.
+- The file is read once, into a snapshot, so rewriting it during fan-out
+  can't mis-split it.
+- A file with no markers is one shared task, as before. Interactive runs keep
+  the per-slot override prompt.
+
+**Conflict hint.** Before creating anything, fan-out compares each slot's own
+task: its section, or its override when interactive. When two slots were given
+*different* tasks that name the same tracked file, or a file inside a
+directory the other names, it warns:
+
+```text
+herdr-swarm: WARNING slots 1 and 2 were given different tasks that both name src/api/client.ts — their merges may conflict.
+```
+
+Only paths that exist in git count, so ordinary prose never matches. Shared
+preamble text and best-of-N runs (the same task in every slot) are never
+flagged. It's a hint, not a gate: the fan-out proceeds. If the repo can't be
+listed, the hint says it was skipped rather than staying silent.
 
 ### Can an agent drive the whole plugin?
 
