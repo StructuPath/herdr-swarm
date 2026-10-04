@@ -244,7 +244,7 @@ function parseHarvestJournal(raw) {
 	return { journal, resource };
 }
 
-function harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manifestFile) {
+function harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manifestFile, allowedHead = "") {
 	if (!isSafeId(runId) || !/^[1-9][0-9]*$/.test(slot))
 		throw new Error("harvest resource run/slot binding is invalid");
 	const { journal, resource } = parseHarvestJournal(journalRaw);
@@ -281,7 +281,11 @@ function harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manif
 	)
 		throw new Error("harvest resource belongs to a different repository");
 	const head = git(physical, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
-	if (head !== resource.head) throw new Error("harvest resource HEAD changed");
+	// allowedHead: the one extra HEAD `conclude` may accept — the commit that
+	// concluded this merge, whose first parent the caller has checked is the
+	// journaled base. Every other identity check above still applies.
+	if (head !== resource.head && !(allowedHead && head === allowedHead))
+		throw new Error("harvest resource HEAD changed");
 	const matches = worktreeRegistrations(repo).filter((row) => {
 		try {
 			return fs.realpathSync(row.path) === physical;
@@ -293,7 +297,7 @@ function harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manif
 		throw new Error("harvest resource registration is missing or duplicated");
 	if (!matches[0].detached || matches[0].branch)
 		throw new Error("harvest resource registration is not detached");
-	if (matches[0].head !== resource.head)
+	if (matches[0].head !== resource.head && !(allowedHead && matches[0].head === allowedHead))
 		throw new Error("harvest resource registration HEAD mismatch");
 
 	const manifestStat = fs.lstatSync(manifestFile);
@@ -415,9 +419,9 @@ try {
 			);
 			break;
 		case "verify-harvest": {
-			const [stateDir, repo, runId, slot, worktree, journalRaw, manifestFile] = args;
+			const [stateDir, repo, runId, slot, worktree, journalRaw, manifestFile, allowedHead] = args;
 			process.stdout.write(
-				`${JSON.stringify(harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manifestFile))}\n`,
+				`${JSON.stringify(harvestBinding(stateDir, repo, runId, slot, worktree, journalRaw, manifestFile, allowedHead))}\n`,
 			);
 			break;
 		}

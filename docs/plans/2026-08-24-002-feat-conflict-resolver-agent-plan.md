@@ -1,8 +1,30 @@
 # Plan: agent-assisted conflict resolution (deferred follow-up, design)
 
-Status: **design for review** — implementation gated on live-herdr validation
-of the spawn path (marked below). Everything else is buildable and testable
-under the existing stub harness.
+Status: **implemented 2026-10-04**, with these deviations (the design below
+is kept as written, as history):
+
+- **The premise "resume picks up a hand-resolved merge" was false.** A
+  conflict journals `merge_commit_sha: null`, and resume only offers when it is
+  set, so a resolved commit read as stale and abort-merge refused it. A
+  `conclude <slot>` verb now adopts it: one two-parent merge, first parent =
+  the journaled base, second parent = new slot work, a clean tree. The
+  merge-tree identity check gained one allowed HEAD for this, and only
+  conclude passes it. This also fixes the human path.
+- **The anchor is the slot's own agent pane, not the harvest pane.** It is
+  an ordinary pane (like fan-out's anchors), it groups the resolver beside the
+  work, and it avoided opening plugin panes during the live probe.
+- **0.7.4 is refused**; only the 0.7.5+ pane path was probed. Live (0.8.2):
+  a split into an existing detached worktree mid-conflict reported that
+  worktree as its cwd. Running a command inside that pane was not re-probed;
+  it is the `pane run` path fan-out already uses.
+- **"Stop a recorded resolver" became "keep its tree while it runs".**
+  Liveness is the resolver's program leading its pane's foreground (fact,
+  not plugin-reported state), tied to the journal generation it was started
+  for.
+
+Original status: **design for review** — implementation gated on live-herdr
+validation of the spawn path (marked below). Everything else is buildable and
+testable under the existing stub harness.
 
 ## Goal
 

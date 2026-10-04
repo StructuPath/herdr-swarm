@@ -368,6 +368,19 @@ reap_harvest_worktree() {
 		note_kept "harvest worktree $jwt (live conflict resolution)"
 		return 0
 	fi
+	# A resolver agent may have staged every file (no unmerged paths left) yet
+	# still be working there; merge --abort and removal would reset its work.
+	# Only POSITIVE evidence that it is gone lets the tree go (lib.sh).
+	local rstate
+	rstate="$(resolver_state "$(printf '%s' "$DOC" | node -e '
+		let d = ""; process.stdin.on("data", (c) => (d += c)).on("end", () => {
+			process.stdout.write(JSON.stringify((JSON.parse(d).slots || []).find((x) => String(x.slot) === process.argv[1]) ?? null));
+		});' "$slot")")"
+	if [ "$rstate" != gone ]; then
+		echo "herdr-swarm: slot $slot conflict RESOLVER is $rstate in $jwt — KEPT untouched; exit the agent (or close its pane), then abort again. If you know it stopped, HERDR_SWARM_RESOLVER_STOPPED=yes." >&2
+		note_kept "harvest worktree $jwt (conflict resolver $rstate)"
+		return 0
+	fi
 	if ! verify_harvest_resource "$RUN_ID" "$slot" "$jwt" "$journal" >/dev/null; then
 		echo "herdr-swarm: slot $slot harvest resource identity FAILED — KEPT untouched." >&2
 		note_kept "harvest worktree $jwt (exact resource identity failed)"

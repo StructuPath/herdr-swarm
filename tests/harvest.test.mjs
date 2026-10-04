@@ -1461,7 +1461,7 @@ test("renderHarvest: conflict view lists files, drift banner shows, dirty rows a
 	assert.match(out, /CONFLICT/);
 	assert.match(out, /README\.md/);
 	assert.ok(!out.includes("\x1b]"), "hostile filename cannot smuggle escapes");
-	assert.match(out, /\[s\]hell into merge tree\s+\[a\]bort merge/);
+	assert.match(out, /\[s\]hell into merge tree\s+\[g\]ive it to a resolver agent\s+\[c\]onclude once committed\s+\[a\]bort merge/);
 	out = renderHarvest(
 		{
 			runInfo: null,
@@ -1472,6 +1472,7 @@ test("renderHarvest: conflict view lists files, drift banner shows, dirty rows a
 		120,
 	);
 	assert.match(out, /HOOK\/OTHER FAILURE/, "hook failure is a distinct view");
+	assert.doesNotMatch(out, /resolver/, "a hook failure has no conflicts to hand over");
 	out = renderHarvest(
 		{
 			runInfo: null,
