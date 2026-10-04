@@ -7,6 +7,13 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-04
+
+The "pick the winner" release: Swarm now checks each slot, notices when a
+slot is done, compares them, lands the winner, steers running agents, and
+hands merge conflicts to a resolver, all without giving up review-first
+merging. Exercised live end to end on Herdr 0.8.2 (see `docs/readiness.md`).
+
 ### Changed
 - `scripts/harvest-step.sh` (1,863 lines, 23 verbs) is split into domain
   modules it sources: `harvest-step-{merge,slot,publish,validate,settle,compare,broadcast,resolve}.sh`.
@@ -30,15 +37,6 @@ Notable changes to the Swarm plugin. Format follows
   harvest preview. The plugin's own report holds Herdr's lifecycle authority,
   which suppresses screen detection (live-verified on 0.8.2). Finish
   detection now corrects it while the status pane is open.
-- The shared test environment now supplies its fixture Git identity to stub
-  subprocesses too, avoiding hostname-based identity detection during commits
-  and reflog writes when user/system Git configuration is disabled (#11).
-- Harvest now reconciles the completed slot's plugin-reported state before
-  automatic archive. On Herdr's pane-backed path, a successful merge could
-  previously leave the slot marked working and unnecessarily block cleanup.
-  Archive still verifies agent state and worktree contents before removal.
-- Archive recognizes Herdr 0.8.2's `done` state (an unseen background idle
-  agent) as settled, instead of refusing cleanup until its tab is focused.
 
 ### Added
 - Conflict resolver: `resolve <slot>` (`g` in the conflict view) hands a
@@ -97,6 +95,26 @@ Notable changes to the Swarm plugin. Format follows
   `HERDR_SWARM_CANDIDATE_VALIDATION_FILE` still wins. The repo lock is released
   while the hook runs. On `HERDR_SWARM_VALIDATE_TIMEOUT` the hook's whole
   process group is killed. A slot that changes during the run records nothing.
+- Strict candidate handoff (#15): `candidate-status <slot>` previews, and
+  `publish-candidate-pr <slot>` publishes, a clean slot only with passing
+  validation, a passing Browser QA result for the same SHA, and an operator
+  review bound to the run, slot, and SHA. Every input is re-read before any
+  push, and the handoff never merges.
+
+## [0.4.0] — 2026-09-14
+
+### Fixed
+- The shared test environment now supplies its fixture Git identity to stub
+  subprocesses too, avoiding hostname-based identity detection during commits
+  and reflog writes when user/system Git configuration is disabled (#11).
+- Harvest now reconciles the completed slot's plugin-reported state before
+  automatic archive. On Herdr's pane-backed path, a successful merge could
+  previously leave the slot marked working and unnecessarily block cleanup.
+  Archive still verifies agent state and worktree contents before removal.
+- Archive recognizes Herdr 0.8.2's `done` state (an unseen background idle
+  agent) as settled, instead of refusing cleanup until its tab is focused.
+
+### Added
 - Opt-in `publish-pr <slot>` harvest verb (`g`, then slot in the pane) pushes
   the audited commit and creates/reuses its exact GitHub draft PR. Existing
   `publish` remains push-only. Optional SHA-bound validation JSON or Browser
