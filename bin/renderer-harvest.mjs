@@ -13,6 +13,7 @@ import {
 	sanitizeText,
 	manifestPath,
 	parseManifest,
+	formatDuration,
 } from "./renderer-shared.mjs";
 
 // --- harvest mode (U6) -------------------------------------------------------
@@ -95,7 +96,7 @@ export function gitDisplayEnv(env) {
 // Every field is manifest- or git-derived text, so all of it is sanitized.
 export function renderCompare(view, cols = 80) {
 	const lines = [
-		` ${pad("rank", 5)}${pad("#", 3)}${pad("checks", 16)}${pad("commits", 8)}${pad("files", 6)}${pad("+/-", 12)}${pad("dirty", 6)}${pad("finished", 9)}label`.slice(0, cols),
+		` ${pad("rank", 5)}${pad("#", 3)}${pad("checks", 16)}${pad("commits", 8)}${pad("files", 6)}${pad("+/-", 12)}${pad("dirty", 6)}${pad("finished", 9)}${pad("time", 7)}label`.slice(0, cols),
 	];
 	if (!view.slots?.length) lines.push("  (no slots to compare)");
 	for (const s of view.slots ?? []) {
@@ -108,7 +109,7 @@ export function renderCompare(view, cols = 80) {
 		)}${pad(s.insertions == null ? "-" : `+${s.insertions}/-${s.deletions}`, 12)}${pad(s.dirty ?? "-", 6)}${pad(
 			sanitizeText(s.finished ?? (s.candidate ? "no" : s.status ?? "")),
 			9,
-		)}${sanitizeText(s.label ?? "")}`.slice(0, cols);
+		)}${pad(formatDuration(Number.isSafeInteger(s.elapsed_seconds) ? s.elapsed_seconds : null), 7)}${sanitizeText(s.label ?? "")}`.slice(0, cols);
 		// Failed checks are the one thing that must not be missed when picking.
 		lines.push(v.status === "failed" ? `${ESC}[7m${line}${ESC}[0m` : line);
 	}

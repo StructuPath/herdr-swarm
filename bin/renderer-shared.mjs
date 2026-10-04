@@ -65,7 +65,27 @@ export const TERMINAL_STATUSES = new Set(["archived", "merged", "skipped", "fail
 //
 // agents: array from the agent-list query, or null when it was unanswerable.
 // gitFacts: { [slot]: { worktreeMissing, branchMissing, committed, uncommitted } }
-export function reconcileSlots(manifestSlots, agents, gitFacts) {
+// Elapsed time for a slot: from its recorded start (started_at, written when
+// fan-out marks it running; older rows fall back to the run's created_at) to
+// its finish (finished.at from settle), or to `now` while it is still going.
+// null when no valid start is known — rendered "-", never guessed.
+export function slotElapsedSeconds(row, runCreatedAt, now = Date.now()) {
+	const start = Date.parse(row?.started_at ?? runCreatedAt ?? "");
+	if (!Number.isFinite(start)) return null;
+	const finished = Date.parse(row?.finished?.at ?? "");
+	const end = Number.isFinite(finished) ? finished : now;
+	return Math.max(0, Math.round((end - start) / 1000));
+}
+
+export function formatDuration(seconds) {
+	if (seconds == null) return "-";
+	if (seconds < 60) return `${seconds}s`;
+	const m = Math.floor(seconds / 60);
+	if (m < 60) return `${m}m`;
+	return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+export function reconcileSlots(manifestSlots, agents, gitFacts, runCreatedAt = null, now = Date.now()) {
 	return (manifestSlots || []).map((row) => {
 		const facts = (gitFacts && gitFacts[row.slot]) || {};
 		let state;
@@ -108,6 +128,8 @@ export function reconcileSlots(manifestSlots, agents, gitFacts) {
 			agent_name: row.agent_name,
 			state,
 			finished: row.finished ?? null,
+			// Settled history (merged, skipped…) has no live clock to show.
+			elapsed: TERMINAL_STATUSES.has(row.status) && !row.finished ? null : slotElapsedSeconds(row, runCreatedAt, now),
 			committed: facts.committed ?? null,
 			uncommitted: facts.uncommitted ?? null,
 		};

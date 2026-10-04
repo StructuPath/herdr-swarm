@@ -1062,6 +1062,9 @@ test("env-driven: SLOTS+PRESETS+TASK fan out with no stdin at all", () => {
 	assert.equal(m.slots.length, 2);
 	assert.equal(m.slots[0].branch, `swarm/${m.run_id}/s1-claude`);
 	assert.equal(m.slots[1].branch, `swarm/${m.run_id}/s2-codex`);
+	// What broadcast checks the pane's foreground against, and when time starts.
+	assert.deepEqual(m.slots.map((s) => s.agent_command), ["claude", "codex"]);
+	for (const s of m.slots) assert.match(s.started_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
 	for (const s of m.slots) {
 		assert.equal(s.status, "running");
 		assert.ok(

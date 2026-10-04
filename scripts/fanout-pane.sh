@@ -201,15 +201,20 @@ parse_start_json() {
 }
 
 running_patch_json() {
-	# argv: name pane terminal ws → the row-running patch.
+	# argv: name pane terminal ws command → the row-running patch.
 	node -e '
-		const [an, pi, ti, w] = process.argv.slice(1);
+		const [an, pi, ti, w, cmd] = process.argv.slice(1);
 		process.stdout.write(JSON.stringify({
 			status: "running",
 			agent_name: an || null,
 			pane_id: pi || null,
 			terminal_id: ti || null,
 			workspace_id: w || null,
+			// The program the slot runs (basename of the preset argv[0]): broadcast
+			// types only into a pane whose foreground leader is this program.
+			agent_command: cmd ? require("path").basename(cmd) : null,
+			// Elapsed time per slot (status and compare views) counts from here.
+			started_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
 		}));
 	' "$@"
 }
@@ -762,7 +767,7 @@ for ((i = 1; i <= n; i++)); do
 	IFS=$'\t' read -r a_name a_pane a_term a_ws <<<"$sinfo"
 	# Row running with the ids the START returned (spike (k)): the agent's
 	# pane, not the worktree root pane recorded above.
-	rpatch="$(running_patch_json "$a_name" "$a_pane" "$a_term" "$a_ws")" || fatal 1 "herdr-swarm: internal error building the running patch."
+	rpatch="$(running_patch_json "$a_name" "$a_pane" "$a_term" "$a_ws" "${argv_arr[0]}")" || fatal 1 "herdr-swarm: internal error building the running patch."
 	manifest_update_slot "$i" "$rpatch" || fatal 1 "herdr-swarm: manifest write failed marking slot $i running — stopping."
 	started=$((started + 1))
 	echo "herdr-swarm: slot $i running — $branch -> $wt_path"
