@@ -7,6 +7,15 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+### Changed
+- `scripts/harvest-step.sh` (1,863 lines, 23 verbs) is split into domain
+  modules it sources: `harvest-step-{merge,slot,publish,validate,settle,compare,broadcast,resolve}.sh`.
+  The entry point, verbs, arguments, output, and exit codes are unchanged, and
+  every function moved byte-for-byte. The modules stay directly in `scripts/`
+  so CI's shellcheck and syntax globs, and the repository's invariant checks,
+  still cover them. Those invariants treat `harvest-step.sh` and its modules
+  as one program.
+
 ### Fixed
 - A conflicted harvest merge resolved by hand in its merge tree could not be
   landed. Its commit was never journaled, so resume called it stale and
