@@ -605,8 +605,12 @@ preflight_check_argv "${slot_argvs[@]}" || fatal $?
 
 # Same rule for ports: the HIGHEST slot's range is checked here, so a range
 # that only overflows for slot N never strands slots 1..N-1 half-built.
-slot_port_base "$n" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_PORT_START/_SPAN give $n slots no valid port range (need 1024-65535, decimal)."
+slot_port_base "$n" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_PORT_START/_SPAN (or git config swarm.portStart/portSpan) give $n slots no valid port range (need 1024-65535, decimal)."
 port_span="$(slot_port_span)"
+# And for the timeouts fan-out applies per slot: a bad value found mid-run
+# would only surface as every clone or setup silently "failing".
+positive_seconds "${HERDR_SWARM_CLONE_TIMEOUT:-120}" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_CLONE_TIMEOUT must be a positive whole number of seconds."
+positive_seconds "${HERDR_SWARM_SETUP_TIMEOUT:-300}" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_SETUP_TIMEOUT must be a positive whole number of seconds."
 
 # --- Run identity and manifest ----------------------------------------------
 

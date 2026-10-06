@@ -91,13 +91,10 @@ do_validate() {
 		echo "herdr-swarm: no validate.sh in the plugin config dir — add one to run checks per slot (see README: Validating slots)." >&2
 		return "$HS_EC_REFUSED"
 	fi
-	case "${HERDR_SWARM_VALIDATE_TIMEOUT:-900}" in
-	'' | *[!0-9]* | 0)
+	secs="$(positive_seconds "${HERDR_SWARM_VALIDATE_TIMEOUT:-900}")" || {
 		echo "herdr-swarm: HERDR_SWARM_VALIDATE_TIMEOUT must be a positive number of seconds." >&2
 		return "$HS_EC_REFUSED"
-		;;
-	*) secs="${HERDR_SWARM_VALIDATE_TIMEOUT:-900}" ;;
-	esac
+	}
 	head="$(slot_clean_head "$1")" || return $?
 	VALIDATE_LOCK="$(state_dir)/validating-$RUN_ID-s$1"
 	trap 'release_lock "$MUTATION_LOCK"; validating_lock_drop "${VALIDATE_LOCK:-}"' EXIT
@@ -155,7 +152,7 @@ validate_record() {
 	}
 	if [ "$after" != "$head" ]; then
 		echo "herdr-swarm: slot $slot moved from $head to $after while validate.sh ran — result not recorded; re-run validate." >&2
-		return "$HS_EC_DRIFT"
+		return "$HS_EC_REFUSED"
 	fi
 	recorded="$(node -e '
 		const fs = require("fs");

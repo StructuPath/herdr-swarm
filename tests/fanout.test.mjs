@@ -1424,6 +1424,57 @@ test("port range is configurable and refused when it does not fit", () => {
 	}
 });
 
+test("a repo's git config sets its own port range; an exported variable still wins", () => {
+	{
+		const { repo, env } = setup();
+		git(repo, "config", "swarm.portStart", "5200");
+		git(repo, "config", "swarm.portSpan", "5");
+		const r = runPane(lines(["2", "", "", "Task", ".", "", ""]), env, repo);
+		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+		assert.deepEqual(readManifest().slots.map((s) => [s.port_base, s.port_span]), [[5200, 5], [5205, 5]]);
+	}
+	{
+		const { repo, env } = setup({ HERDR_SWARM_PORT_START: "6000" });
+		git(repo, "config", "swarm.portStart", "5200");
+		const r = runPane(lines(["1", "", "Task", ".", ""]), env, repo);
+		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+		assert.equal(readManifest().slots[0].port_base, 6000);
+	}
+	{
+		const { repo, env } = setup();
+		git(repo, "config", "swarm.portStart", "80");
+		const r = runPane(lines(["1", "", "Task", ".", ""]), env, repo);
+		assert.notEqual(r.status, 0);
+		assert.match(r.stderr + r.stdout, /no valid port range/);
+	}
+});
+
+test("a timeout that is not whole seconds refuses fan-out before any worktree is created", () => {
+	for (const bad of [{ HERDR_SWARM_CLONE_TIMEOUT: "2m" }, { HERDR_SWARM_CLONE_TIMEOUT: "0" }, { HERDR_SWARM_SETUP_TIMEOUT: "abc" }]) {
+		const { repo, env } = setup(bad);
+		const r = runPane(lines(["1", "", "Task", ".", ""]), env, repo);
+		assert.notEqual(r.status, 0, JSON.stringify(bad));
+		assert.match(r.stderr + r.stdout, new RegExp(`${Object.keys(bad)[0]} must be a positive whole number`));
+		assert.doesNotMatch(log(), /worktree create/, `${JSON.stringify(bad)}: nothing was created`);
+	}
+});
+
+test("a timeout helper given a bad duration starts nothing", () => {
+	const dir = mkdtemp("hs-tmo-");
+	for (const fn of ["with_timeout", "with_group_timeout"]) {
+		for (const bad of ["2m", "08x", "0", ""]) {
+			const flag = path.join(dir, `${fn}-${bad || "empty"}`);
+			const r = runLib(`${fn} "${bad}" touch "${flag}"`);
+			assert.equal(r.status, 2, `${fn} ${bad}`);
+			assert.match(r.stderr, /not a positive whole number of seconds/);
+			assert.equal(fs.existsSync(flag), false, `${fn} ${bad}: command never started`);
+		}
+		const ok = path.join(dir, `${fn}-ok`);
+		assert.equal(runLib(`${fn} 08 touch "${ok}"`).status, 0, `${fn}: 08 is eight seconds, not an octal error`);
+		assert.ok(fs.existsSync(ok));
+	}
+});
+
 test("a port range that only overflows for a later slot refuses before any worktree is created", () => {
 	const { repo, env } = setup({ HERDR_SWARM_PORT_START: "65500", HERDR_SWARM_PORT_SPAN: "10" });
 	const r = runPane(lines(["4", "", "", "", "", "Task", ".", "", "", "", ""]), env, repo);

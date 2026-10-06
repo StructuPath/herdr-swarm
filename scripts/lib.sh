@@ -10,6 +10,18 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 # shellcheck disable=SC2034  # consumed by sourcing scripts, not here
 PLUGIN_ID="structupath.swarm"
 
+# validate_in_flight <run_id> <slot>: a `validate` hook is running in this
+# slot's worktree right now (its per-slot lock is held by a live pid). The
+# hook runs with the repo lock RELEASED and may still be writing — coverage/,
+# .next/ — so anything that resets or removes that worktree checks this
+# under the repo lock first; otherwise files written after an inventory or
+# snapshot would go with it, unapproved.
+validate_in_flight() {
+	local holder
+	holder="$(cat "$(state_dir)/validating-$1-s$2/pid" 2>/dev/null)" || return 1
+	[ -n "$holder" ] && kill -0 "$holder" 2>/dev/null
+}
+
 state_dir() {
 	local d="${HERDR_PLUGIN_STATE_DIR:-$HOME/.local/state/herdr-swarm}"
 	# A literal leading '~' inside a variable value is never expanded by bash;
@@ -143,11 +155,28 @@ clear_git_routing_env() {
 	done < <(compgen -e)
 }
 
+# positive_seconds <value>: digits only, read as DECIMAL (10#) — bash reads
+# "0900" as octal and rejects "08" outright, mid-arithmetic — capped in
+# length so it cannot overflow, and > 0. Prints the normalized integer.
+positive_seconds() {
+	case "${1-}" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "${#1}" -le 7 ] && [ "$((10#$1))" -gt 0 ] || return 1
+	printf '%s\n' "$((10#$1))"
+}
+
 # Portable timeout (macOS lacks GNU timeout): poll the child and SIGKILL it
 # after SECONDS (exit 137). Done in-shell (no background watchdog) so a dying
 # script can never orphan a sleep that holds the caller's stdout pipe open.
+# A bad SECS refuses (exit 2) BEFORE anything starts: found after the fork,
+# the arithmetic error would abort the caller and orphan the child.
 with_timeout() {
-	local secs="$1"
+	local secs
+	secs="$(positive_seconds "${1-}")" || {
+		echo "herdr-swarm: internal error: timeout '${1-}' is not a positive whole number of seconds" >&2
+		return 2
+	}
 	shift
 	"$@" &
 	local pid=$!
@@ -175,7 +204,13 @@ with_timeout() {
 # shell, not a subshell, or neither variable reaches the caller.
 # shellcheck disable=SC2034 # SWARM_GROUP_TIMED_OUT is read by callers
 with_group_timeout() {
-	local secs="$1" deadline rc
+	local secs deadline rc
+	# Checked before the fork, as in with_timeout: a child with no deadline
+	# is exactly what this function exists to prevent.
+	secs="$(positive_seconds "${1-}")" || {
+		echo "herdr-swarm: internal error: timeout '${1-}' is not a positive whole number of seconds" >&2
+		return 2
+	}
 	shift
 	SWARM_GROUP_TIMED_OUT=0
 	set -m

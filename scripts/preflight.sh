@@ -415,10 +415,12 @@ provision_slot_paths() {
 # slot_port_base <slot>: the first of HERDR_SWARM_PORT_SPAN (default 10)
 # ports reserved for this slot, from HERDR_SWARM_PORT_START (default 4100):
 # slot 1 → 4100–4109, slot 2 → 4110–4119. A convention the agents are told
-# about, not a reservation the OS enforces.
+# about, not a reservation the OS enforces. The ranges know nothing about
+# other repos: two repos swarming at once both start at 4100 unless one of
+# them sets swarm.portStart.
 slot_port_base() {
 	local start span base
-	start="$(_port_decimal "${HERDR_SWARM_PORT_START:-4100}")" || return 1
+	start="$(_port_decimal "$(_port_setting "${HERDR_SWARM_PORT_START:-}" swarm.portStart 4100)")" || return 1
 	span="$(slot_port_span)" || return 1
 	[ "$span" -ge 1 ] || return 1
 	base=$((start + ($1 - 1) * span))
@@ -427,7 +429,18 @@ slot_port_base() {
 }
 
 slot_port_span() {
-	_port_decimal "${HERDR_SWARM_PORT_SPAN:-10}"
+	_port_decimal "$(_port_setting "${HERDR_SWARM_PORT_SPAN:-}" swarm.portSpan 10)"
+}
+
+# _port_setting <env value> <git config key> <default>: the exported variable
+# wins; else the repo's own git config, which is per repo and — unlike the
+# environment — reaches an action-invoked fan-out pane; else the default.
+_port_setting() {
+	if [ -n "${1-}" ]; then
+		printf '%s\n' "$1"
+		return 0
+	fi
+	git -C "${SWARM_REPO:-.}" config --get "$2" 2>/dev/null || printf '%s\n' "$3"
 }
 
 # _port_decimal <value>: digits only, read as DECIMAL (10#) — bash would read

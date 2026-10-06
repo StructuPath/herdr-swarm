@@ -200,6 +200,61 @@ test("merge verb: an expected slot tip pins the exact SHA merged and refuses jun
 	assert.equal(spawnSync("git", ["-C", run.repo, "merge-base", "--is-ancestor", tip, "main"]).status, 0);
 });
 
+test("merge winner refuses when the base moved after it was confirmed", async () => {
+	const run = makeFannedOutRun(h, { prefix: "cm", slots: 2 });
+	commitIn(run.wt(1), "one.js");
+	const winner = commitIn(run.wt(2), "two.js");
+	finishAll(run, [1, 2]);
+	const r = pane(run);
+	await r.refresh();
+	await keys(r, "w", "m", "2");
+	const confirmedBase = r.phase.base;
+	const moved = commitIn(run.repo, "elsewhere.js"); // someone lands on main meanwhile
+	await keys(r, "y");
+	assert.match(r.banner, new RegExp(`base moved since you confirmed \\(${confirmedBase.slice(0, 7)} -> ${moved.slice(0, 7)}\\)`));
+	assert.equal(spawnSync("git", ["-C", run.repo, "merge-base", "--is-ancestor", winner, "main"]).status, 1, "nothing merged");
+	assert.deepEqual(run.manifest().slots.map((s) => s.status), ["running", "running"], "nothing skipped");
+});
+
+test("merge winner leaves a finished slot running when its work changed after compare", async () => {
+	const run = makeFannedOutRun(h, { prefix: "cm", slots: 4 });
+	for (const i of [1, 2, 3, 4]) commitIn(run.wt(i), `f${i}.js`);
+	finishAll(run, [1, 2, 3, 4]);
+	const r = pane(run);
+	await r.refresh();
+	await keys(r, "w", "m", "1");
+	assert.deepEqual(r.phase.others, [2, 3, 4]);
+	// A `marker` finish is never cleared by settle: the operator gave slots 3
+	// and 4 a follow-up, and changed work is the only trace of it.
+	commitIn(run.wt(3), "followup.js");
+	fs.writeFileSync(path.join(run.wt(4), "f4.js"), "editing\n");
+	await keys(r, "y");
+	assert.equal(run.slotRow(2).status, "archived", "unchanged finished slot is still skipped");
+	assert.deepEqual([3, 4].map((i) => run.slotRow(i).status), ["running", "running"]);
+	assert.ok(fs.existsSync(run.wt(3)) && fs.existsSync(run.wt(4)), "their worktrees were not touched");
+	assert.match(r.banner, /slot 1 merged; skipped 2; still running \(agent not finished\): 3, 4/);
+});
+
+test("merge winner re-settles first: an exited agent restarted by hand is not skipped", async () => {
+	const run = makeFannedOutRun(h, { prefix: "cm", slots: 3 });
+	for (const i of [1, 2, 3]) commitIn(run.wt(i), `f${i}.js`);
+	setManifest(run, (d) => {
+		d.slots[1].finished = { at: "x", reason: "marker" };
+		d.slots[2].finished = { at: "x", reason: "exited" };
+		d.slots[2].seen_running = true;
+	});
+	Object.assign(run.env, { STUB_HERDR_VERSION: "0.8.2", STUB_PANE_FG: "busy" }); // slot 3's agent is back
+	const r = pane(run);
+	await r.refresh();
+	await keys(r, "w", "m", "1");
+	assert.deepEqual(r.phase.others, [2, 3], "compare still showed slot 3 finished");
+	await keys(r, "y");
+	assert.equal(run.slotRow(2).status, "archived");
+	assert.equal(run.slotRow(3).status, "running");
+	assert.equal(run.slotRow(3).finished ?? null, null, "settle cleared the reversible finish");
+	assert.match(r.banner, /skipped 2; still running \(agent not finished\): 3/);
+});
+
 test("merge winner leaves unfinished slots running and says so", async () => {
 	const run = makeFannedOutRun(h, { prefix: "cm", slots: 3 });
 	commitIn(run.wt(1), "one.js");

@@ -453,7 +453,8 @@ Where copy-on-write isn't available, behaviour depends on the platform:
 - **macOS:** `cp -c` silently falls back to a full copy when it can't clone,
   for example on a non-APFS volume or with worktrees on another volume.
 
-`HERDR_SWARM_CLONE_TIMEOUT` (default 120 s) bounds each clone. A timeout stops
+`HERDR_SWARM_CLONE_TIMEOUT` (default 120 s, whole seconds — `2m` refuses the
+fan-out before any worktree is created) bounds each clone. A timeout stops
 `cp` and everything it started, and removes the partial copy. A clone failure
 never fails the slot. Cloning happens before `setup.sh`, so the hook can build
 on it.
@@ -487,7 +488,23 @@ Each slot gets `HERDR_SWARM_RUN_ID`, `HERDR_SWARM_SLOT`,
 Ports start at `HERDR_SWARM_PORT_START` (default 4100), with
 `HERDR_SWARM_PORT_SPAN` (default 10) per slot: slot 1 gets 4100–4109, slot 2
 gets 4110–4119. This is a convention the agents are told, not an OS
-reservation. A range that doesn't fit in 1024–65535 refuses the fan-out. The same applies to repo hooks during harvest: a hook that
+reservation. A range that doesn't fit in 1024–65535 refuses the fan-out.
+
+Ranges are not coordinated across repos: two repos swarming at the same time
+both start at 4100. Give each repo its own range with git config, which a
+fan-out pane reads even though it never inherits your shell's environment:
+
+```sh
+git config swarm.portStart 5100   # in the second repo
+git config swarm.portSpan 10      # optional
+```
+
+An exported `HERDR_SWARM_PORT_START`/`_SPAN` still overrides git config.
+
+### Fresh-worktree hooks
+
+Fresh worktrees lack gitignored files that the clone list doesn't cover
+(`.env`, build output). The same applies to repo hooks during harvest: a hook that
 shells into `node_modules/.bin` fails in the plugin-owned merge worktree —
 `HERDR_SWARM_HARVEST_WT_NO_HOOKS=1` disables hooks in that worktree *only*
 (never in your tree). To automate worktree prep, drop a `setup.sh` in the
@@ -650,21 +667,25 @@ In the compare view:
   merge-tree shell.
 - `m`, then a slot digit, then `y`: **merge the winner and skip the rest**.
   The winner is merged **at the exact tip the table showed**: if its agent
-  committed since, the merge refuses and you re-open compare. Otherwise it
-  goes through the normal merge: re-previewed and drift-checked. If the merge
-  would now land in your checked-out branch and the confirm didn't say so,
-  you are asked again. **Only if that merge lands** are the other running
-  slots whose agent has *finished* marked skipped and archived. Slots still
+  committed since, the merge refuses and you re-open compare. If the base
+  moved after you confirmed, it refuses too. Otherwise it goes through the
+  normal merge: re-previewed and drift-checked. If the merge would now land
+  in your checked-out branch and the confirm didn't say so, you are asked
+  again. **Only if that merge lands** are the other running slots whose agent
+  has *finished* marked skipped and archived. "Finished" is re-checked at
+  that moment, not taken from the table: finish detection runs again, and a
+  slot whose tip or uncommitted changes differ from what the table showed is
+  treated as working (you may have given its agent a follow-up). Slots still
   working are left running and named. Branches are always kept. A worktree
   that won't archive cleanly (dirty, ignored files, a working agent) is left
   in place and named in the banner. If that's the winner's, its approval
   prompt stays open. A winner that isn't clean, or a merge that conflicts,
   skips nothing.
+- `r` refreshes; `b`/Esc goes back.
 
 Scripted, the same pin is `harvest-step.sh merge <slot> <base-sha>
 <slot-tip>`: it refuses unless the slot is still at `<slot-tip>`, then merges
 that SHA rather than the branch name.
-- `r` refreshes; `b`/Esc goes back.
 
 ## Finish detection
 
@@ -725,7 +746,7 @@ npm test >/dev/null 2>&1 && echo "unit-tests passed" >>"$HERDR_SWARM_CHECKS_FILE
   reserved line records the whole result as failed rather than trusting part
   of it.
 - A dirty slot refuses before the hook runs. If the slot is dirty or its HEAD
-  moved when the hook finishes, nothing is recorded (exit 36 or 30). A hook
+  moved when the hook finishes, nothing is recorded (exit 36). A hook
   that leaves build output behind needs that output gitignored.
 - Passing and failing hooks both exit 0 with a
   `validated<TAB>slot<TAB>sha<TAB>passed|failed<TAB>path` record.
@@ -738,6 +759,9 @@ npm test >/dev/null 2>&1 && echo "unit-tests passed" >>"$HERDR_SWARM_CHECKS_FILE
   sent TERM and then KILL. A dev server or test worker it started therefore
   can't outlive it. A timeout is recorded as failed. A process that calls
   `setsid` to leave its group is beyond reach.
+- While a slot's hook runs, archive, discard and abort refuse to touch that
+  slot's worktree (abort keeps it and says so): the hook may still be writing
+  files there that no cleanup approval or snapshot has seen.
 - Only one validate runs per slot at a time; a second is refused (exit 36).
 - `candidate-status` and `publish-candidate-pr` use this result when
   `HERDR_SWARM_CANDIDATE_VALIDATION_FILE` is unset. In that case the file must

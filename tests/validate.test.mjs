@@ -114,10 +114,10 @@ test("a hook that leaves untracked files is not recorded", () => {
 	assert.equal(fs.existsSync(run.resultFile), false);
 });
 
-test("a commit landing during validation is drift, not a stale pass", () => {
+test("a commit landing during validation is refused, not a stale pass — and not base drift", () => {
 	const run = fixture("echo more > more.txt && git add more.txt && git commit -q -m more\n");
 	const r = run.step();
-	assert.equal(r.status, 30);
+	assert.equal(r.status, 36, "30 means the BASE moved; the slot moving is a refusal");
 	assert.match(r.stderr, /moved from/);
 	assert.equal(fs.existsSync(run.resultFile), false);
 });
@@ -212,9 +212,74 @@ test("a planted default-path file that is not Swarm's record for this run and sl
 	assert.match(r.stdout, /"validation_status":"passed"/);
 });
 
-test("invalid timeout refuses", () => {
-	const run = fixture("true\n", { HERDR_SWARM_VALIDATE_TIMEOUT: "soon" });
-	assert.equal(run.step().status, 36);
+test("invalid timeout refuses before the hook runs", () => {
+	for (const bad of ["soon", "0", "000", "2m", "-5", "99999999"]) {
+		const run = fixture("true\n", { HERDR_SWARM_VALIDATE_TIMEOUT: bad });
+		const r = run.step();
+		assert.equal(r.status, 36, bad);
+		assert.match(r.stderr, /HERDR_SWARM_VALIDATE_TIMEOUT must be a positive/, bad);
+		assert.equal(fs.existsSync(path.join(run.sdir, `validation-${run.runId}-s1.log`)), false, `${bad}: hook never started`);
+	}
+});
+
+test("a timeout with leading zeros is decimal, not octal", () => {
+	for (const [given, secs] of [["0900", 900], ["08", 8]]) {
+		const run = fixture("true\n", { HERDR_SWARM_VALIDATE_TIMEOUT: given });
+		assert.equal(validated(run.step()).status, "passed", given);
+		assert.equal(run.result().timeout_seconds, secs, given);
+	}
+});
+
+test("a run replaced while the hook runs discards the result", () => {
+	// The hook stands in for an abort-and-refan landing mid-validate.
+	const run = fixture(`node -e '
+const fs = require("fs"), f = process.env.HERDR_PLUGIN_STATE_DIR + "/run-w9.json";
+const d = JSON.parse(fs.readFileSync(f, "utf8")); d.run_id = "replaced"; d.slots = []; fs.writeFileSync(f, JSON.stringify(d));'
+`);
+	const r = run.step();
+	assert.equal(r.status, 36, r.stderr);
+	assert.match(r.stderr, /is no longer the live run — validation result discarded/);
+	assert.equal(fs.existsSync(run.resultFile), false, "no evidence written against a dead run");
+});
+
+test("archive and discard refuse while a validate hook is still writing in the slot", async () => {
+	const marker = path.join(mkdtemp("hs-vbusy-"), "child.pid");
+	const run = fixture(`sleep 30 &\necho $! > "${marker}"\nwait\n`);
+	const v = await startValidate(run, marker);
+	const mf = path.join(run.sdir, "run-w9.json");
+	const d = JSON.parse(fs.readFileSync(mf, "utf8"));
+	d.slots[0].status = "skipped";
+	fs.writeFileSync(mf, JSON.stringify(d));
+	const ar = run.step("archive");
+	assert.equal(ar.status, 36);
+	assert.match(ar.stderr, /being validated.*archive refused/);
+	assert.equal(run.step("snapshot").status, 0);
+	const dc = run.step("discard", { HERDR_SWARM_CONFIRM: run.branch(1) });
+	assert.equal(dc.status, 36);
+	assert.match(dc.stderr, /being validated.*discard refused/);
+	assert.ok(fs.existsSync(run.wt(1)), "worktree untouched");
+	v.child.kill("SIGTERM");
+	await v.done;
+	// The inverse: a lock left by a dead validate never blocks archive.
+	const stale = path.join(run.sdir, `validating-${run.runId}-s1`);
+	fs.mkdirSync(stale);
+	fs.writeFileSync(path.join(stale, "pid"), "999999\n");
+	const ok = run.step("archive");
+	assert.equal(ok.status, 0, ok.stderr);
+	assert.equal(fs.existsSync(run.wt(1)), false);
+});
+
+test("abort keeps a slot whose validate hook is still running, and removes it once that holder is gone", () => {
+	const run = fixture("true\n");
+	const lock = path.join(run.sdir, `validating-${run.runId}-s1`);
+	fs.mkdirSync(lock);
+	fs.writeFileSync(path.join(lock, "pid"), `${process.pid}\n`); // a live holder
+	const kept = h.runScript("abort.sh", [], run.env);
+	assert.match(kept.stderr, /slot 1 KEPT — a validate hook is still running/);
+	assert.ok(fs.existsSync(run.wt(1)), "worktree untouched");
+	fs.writeFileSync(path.join(lock, "pid"), "999999\n"); // holder died
+	h.runScript("abort.sh", [], run.env);
+	assert.equal(fs.existsSync(run.wt(1)), false, "a dead holder blocks nothing");
 });
 
 test("harvest pane drives the real verb end to end", async () => {

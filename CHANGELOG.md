@@ -7,6 +7,35 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+### Added
+- Per-repo port ranges: `git config swarm.portStart` / `swarm.portSpan`. Two
+  repos swarming at once both started at 4100, and the only override was
+  environment-only, which an action-invoked fan-out pane never inherits. An
+  exported `HERDR_SWARM_PORT_START`/`_SPAN` still wins.
+
+### Fixed
+- Merge winner could skip — and, on a clean worktree, archive and so kill — an
+  agent that was working again. Which slots were "finished" came from the
+  compare table, and a `marker` finish is never cleared. It now runs `settle`
+  after the merge and re-reads compare: a slot is skipped only if it is still
+  finished and its tip and dirty count are what you saw. Anything else is left
+  running and named.
+- Merge winner checked base drift against the base it had just re-read, so a
+  base that moved after you confirmed merged without the drift warning. It now
+  checks against the base current at confirm, and refuses if it moved.
+- Archive, discard and abort no longer act on a slot whose `validate` hook is
+  still running. The hook runs with the repo lock released and could write
+  ignored files after the cleanup inventory was approved, or after the
+  discard snapshot.
+- A timeout that is not whole seconds (`HERDR_SWARM_CLONE_TIMEOUT=2m`, `0900`,
+  `08`) was found only after the timed command had started: the arithmetic
+  error ended the caller, leaving `cp` (or the validate hook) running with no
+  deadline and, for validate, its per-slot lock dropped. Timeouts are now
+  parsed as decimal before anything starts, and fan-out refuses a bad clone or
+  setup timeout before creating any worktree.
+- `validate` exited 30 (base drift) when the *slot* moved while its hook ran.
+  It now exits 36 (refused); 30 still means only that the base moved.
+
 ## [0.5.0] — 2026-10-04
 
 The "pick the winner" release: Swarm now checks each slot, notices when a
