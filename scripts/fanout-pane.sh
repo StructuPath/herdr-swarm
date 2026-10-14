@@ -732,8 +732,10 @@ for ((i = 1; i <= n; i++)); do
 	slot_env=(HERDR_SWARM_RUN_ID="$run_id" HERDR_SWARM_SLOT="$i"
 		HERDR_SWARM_PORT_BASE="$port_base" HERDR_SWARM_PORT_SPAN="$port_span")
 
-	# Optional per-repo setup hook: fresh worktrees lack gitignored deps
-	# (.env, node_modules), the most likely "all my agents failed" cause.
+	# Optional per-repo setup hook, run after the dependency clones above:
+	# it covers whatever they did not (.env, build output, a dep tree the
+	# clone list skipped) — missing deps being the likeliest "all my agents
+	# failed" cause.
 	# Failure warns but does not fail the slot — the agent may not need
 	# what setup provides, and the warning names the log for diagnosis.
 	setup_hook="${HERDR_PLUGIN_CONFIG_DIR:-}/setup.sh"

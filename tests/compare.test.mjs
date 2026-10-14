@@ -88,12 +88,45 @@ test("settled slots are listed unranked and kept out of overlaps; archived slots
 test("a validation file that is not Swarm's record for this run and slot counts as not run", () => {
 	const run = makeFannedOutRun(h, { prefix: "cm" });
 	const tip = commitIn(run.wt(1), "x.js");
-	for (const forged of [{ run_id: "other" }, { slot: 2 }, { kind: "something-else" }, { status: "maybe" }]) {
-		fs.writeFileSync(path.join(run.sdir, `validation-${run.runId}-s1.json`), JSON.stringify({
-			schema_version: 1, kind: "herdr-swarm-validation", run_id: run.runId, slot: 1, head_sha: tip, status: "passed", checks: [], ...forged,
-		}));
+	const write = (forged) => fs.writeFileSync(path.join(run.sdir, `validation-${run.runId}-s1.json`), JSON.stringify({
+		schema_version: 1, kind: "herdr-swarm-validation", run_id: run.runId, slot: 1, head_sha: tip, status: "passed",
+		checks: [{ name: "validate", status: "passed" }], ...forged,
+	}));
+	write({});
+	assert.equal(compare(run).slots[0].validation.status, "passed", "the genuine record ranks — each case below differs by one field");
+	for (const forged of [
+		{ run_id: "other" }, { slot: 2 }, { kind: "something-else" }, { status: "maybe" }, { schema_version: 2 },
+		// The strict candidate gate rejects a record without the hook's own
+		// check; compare once ranked it "passed" anyway.
+		{ checks: [{ name: "tests", status: "passed" }] },
+	]) {
+		write(forged);
 		assert.equal(compare(run).slots[0].validation.status, "none", JSON.stringify(forged));
 	}
+});
+
+test("compare and the strict candidate gate share one identity rule", async () => {
+	const { isSwarmValidationRecord } = await import("../scripts/pr-handoff.mjs");
+	const src = fs.readFileSync(new URL("../scripts/compare.mjs", import.meta.url), "utf8");
+	assert.match(src, /import \{ isSwarmValidationRecord \} from "\.\/pr-handoff\.mjs"/);
+	assert.doesNotMatch(src, /"herdr-swarm-validation"/, "no second copy of the rule in compare");
+	const ok = { schema_version: 1, kind: "herdr-swarm-validation", run_id: "r", slot: 1, checks: [{ name: "validate" }] };
+	assert.equal(isSwarmValidationRecord(ok, "r", 1), true);
+	assert.equal(isSwarmValidationRecord(ok, "r", "1"), false, "slot is compared as a number");
+});
+
+test("with checks equal, commits outrank finished, finished outranks neither, and diff size never decides", () => {
+	const run = makeFannedOutRun(h, { prefix: "cm", slots: 5 });
+	commitIn(run.wt(2), "two.js");
+	commitIn(run.wt(3), "big.js", "x\n".repeat(500)); // larger than slot 5's
+	commitIn(run.wt(5), "small.js", "y\n");
+	setManifest(run, (d) => {
+		for (const i of [3, 4, 5]) d.slots[i - 1].finished = { at: "x", reason: "marker" };
+	});
+	// No validation anywhere: every slot ties on the first key.
+	const { slots } = compare(run);
+	assert.deepEqual(slots.map((s) => s.slot), [3, 5, 2, 4, 1],
+		"commits+finished (3 before 5 by slot, not by size), commits, finished, neither");
 });
 
 test("a row failing its ownership check is left out of compare, loudly", () => {
@@ -305,6 +338,22 @@ test("the diff handoff drops inherited git routing", async () => {
 	const { gitDisplayEnv } = await import("../bin/renderer-harvest.mjs");
 	const env = gitDisplayEnv({ PATH: "/bin", GIT_DIR: "/elsewhere", GIT_CONFIG_PARAMETERS: "x", GIT_CONFIG_KEY_0: "k", GIT_CONFIG_VALUE_0: "v", GIT_PAGER: "less" });
 	assert.deepEqual(env, { PATH: "/bin", GIT_PAGER: "less" });
+});
+
+test("the renderer's git routing list is lib.sh's list, exactly", async () => {
+	const { GIT_ROUTING } = await import("../bin/renderer-harvest.mjs");
+	const lib = fs.readFileSync(new URL("../scripts/lib.sh", import.meta.url), "utf8");
+	const body = lib.match(/clear_git_routing_env\(\) \{[\s\S]*?for key in ([\s\S]*?); do/);
+	assert.ok(body, "clear_git_routing_env's variable list not found in lib.sh");
+	const names = body[1].replace(/\\\n/g, " ").split(/\s+/).filter(Boolean);
+	assert.ok(names.length >= 10, `parsed ${names.length} names`);
+	assert.deepEqual([...GIT_ROUTING].sort(), names.sort());
+});
+
+test("a validate timeout names the variable that sets validate's budget", async () => {
+	const r = new HarvestRenderer(h.freshEnv());
+	assert.match(r.timeoutBanner("validate", 930_000), /HERDR_SWARM_VALIDATE_TIMEOUT raises the limit/);
+	assert.match(r.timeoutBanner("merge"), /HERDR_SWARM_STEP_TIMEOUT_MS raises the limit/);
 });
 
 test("merge winner never skips anything when the merge does not land", async () => {

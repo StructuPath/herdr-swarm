@@ -24,8 +24,8 @@ auto_validate_enabled() {
 #            AND a bare shell on two consecutive settles, so a reading taken
 #            mid-restart does not count.
 # A finished slot gets `finished: {at, reason}` (status stays `running`; the
-# harvest state machine is untouched), with auto-validate on a detached
-# `validate` is started for it, and its plugin-reported agent state flips to
+# harvest state machine is untouched); with auto-validate on, a detached
+# `validate` is started for it; and its plugin-reported agent state flips to
 # idle. `exited` is reversible: a later busy reading (Ctrl-Z then fg, an
 # agent restarted by hand) clears it and reports working again. `marker` is
 # the agent's own declaration and is final. When every running slot has

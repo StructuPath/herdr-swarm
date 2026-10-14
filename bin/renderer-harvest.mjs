@@ -83,8 +83,9 @@ export function summarizeIgnored(files, limit = 20) {
 }
 
 // The pane's env minus every variable that reroutes or reconfigures git —
-// the same list scripts/lib.sh clear_git_routing_env removes.
-const GIT_ROUTING = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+// the same list scripts/lib.sh clear_git_routing_env removes (a test holds
+// the two in lockstep).
+export const GIT_ROUTING = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
 	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 	"GIT_PREFIX", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]);
 export function gitDisplayEnv(env) {
@@ -414,7 +415,9 @@ export class HarvestRenderer {
 	}
 
 	timeoutBanner(verb, timeoutMs = this.stepTimeoutMs) {
-		return `harvest step '${verb}' timed out after ${timeoutMs}ms and was killed — check for a hung git hook or lock, then retry (HERDR_SWARM_STEP_TIMEOUT_MS raises the limit)`;
+		// validate's budget follows the hook timeout, so that is the knob.
+		const knob = verb === "validate" ? "HERDR_SWARM_VALIDATE_TIMEOUT" : "HERDR_SWARM_STEP_TIMEOUT_MS";
+		return `harvest step '${verb}' timed out after ${timeoutMs}ms and was killed — check for a hung git hook or lock, then retry (${knob} raises the limit)`;
 	}
 
 	lastErrLine(res) {

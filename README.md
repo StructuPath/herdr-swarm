@@ -644,8 +644,9 @@ In the harvest pane, `w` opens the compare view, which replaces the slot list
 with one ranked row per slot. The same data is scriptable as
 `bash scripts/harvest-step.sh compare`, which emits one
 `compare_slot<TAB>{json}` per slot and one
-`compare_overlap<TAB>a<TAB>b<TAB>n<TAB>[files]` per candidate pair. It is
-read-only.
+`compare_overlap<TAB>a<TAB>b<TAB>n<TAB>[files]` per candidate pair, where
+`n` is `-1` when either slot's diff could not be read (overlap unknown, not
+zero) and `[files]` lists at most 10 of the shared files. It is read-only.
 
 | Column | Source |
 | --- | --- |
@@ -657,8 +658,9 @@ read-only.
 
 **Ranking** is an order, not a score: checks (passed > not run > stale >
 failed), then having commits, then finished, then slot number. Diff size is
-shown but never ranked, because a smaller change isn't a better one. Settled
-slots (merged, skipped) are listed without a rank.
+shown but never ranked, because a smaller change isn't a better one. Slots
+that are no longer running (merged, skipped, failed) are listed without a
+rank.
 
 In the compare view:
 
@@ -717,7 +719,7 @@ yourself. A marker with content in it is treated as agent data, so archive
 needs the usual ignored-file approval to remove it.
 
 **Auto-validate (opt-in).** With `HERDR_SWARM_AUTO_VALIDATE=1`, or an empty
-`auto-validate` file in the plugin config dir, a slot that settles also starts
+`auto-validate` file in the plugin config dir, a slot that finishes also starts
 a detached `validate` for that slot, if `validate.sh` exists (log:
 `auto-validate-<run>-s<slot>.log` in the state dir). Use the file when the
 status pane is opened through the plugin action, because action-launched panes
