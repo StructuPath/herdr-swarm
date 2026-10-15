@@ -48,3 +48,13 @@ recovers it.
 `validation-<run>-s<N>.{json,log}` and `validation-checks.*` left by a
 SIGKILL accumulate in the `0700` state dir. Run IDs are unique, so nothing
 collides; this is disk use only. Fold into prune when it next changes.
+
+## Addendum 2026-10-06
+
+"Roadmap item 2" above is finish detection, which shipped in 0.5.0. Finding 2
+still stands: manual `validate` does not wait for a finished agent. Only
+auto-validate is tied to finishing. Two related gaps from the post-0.5.0
+review are now fixed: archive, discard and abort refuse while a slot's hook is
+running, and the validate timeout is parsed as decimal before the hook starts
+(`0900` used to be octal, and `08` aborted mid-run with the per-slot lock
+dropped).

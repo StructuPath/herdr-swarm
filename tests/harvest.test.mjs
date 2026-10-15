@@ -1392,13 +1392,18 @@ test("no git-mutation strings in bin/ (destructive-git-in-scripts-only KTD)", ()
 		for (const re of forbidden) {
 			assert.doesNotMatch(code, re, `bin/${f} contains mutation string ${re}`);
 		}
-		// Every git invocation the renderer makes goes through this.git([...]) —
-		// its first argument must be a read-only subcommand.
+		// Every git invocation the renderer makes — through this.git([...]) or
+		// a direct spawn/exec of "git" — must name a read-only subcommand
+		// first, and a spawn of git whose argv this cannot read is refused.
 		for (const m of code.matchAll(/\.git\(\s*\[\s*"([a-z-]+)"/g)) {
 			assert.ok(
 				readOnlyGit.has(m[1]),
 				`bin/${f}: this.git(["${m[1]}", …]) is not read-only`,
 			);
+		}
+		for (const m of code.matchAll(/(?:spawn|spawnSync|execFile|execFileSync|pExecFile)\(\s*"git"\s*,\s*(\[\s*"([a-z-]+)")?/g)) {
+			assert.ok(m[1], `bin/${f}: a direct git spawn must pass a literal argv whose first element is the subcommand`);
+			assert.ok(readOnlyGit.has(m[2]), `bin/${f}: direct git spawn of "${m[2]}" is not read-only`);
 		}
 	}
 });

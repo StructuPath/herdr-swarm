@@ -7,6 +7,42 @@ Notable changes to the Swarm plugin. Format follows
 
 ## [Unreleased]
 
+### Added
+- Per-repo port ranges: `git config swarm.portStart` / `swarm.portSpan`. Two
+  repos swarming at once both started at 4100, and the only override was
+  environment-only, which an action-invoked fan-out pane never inherits. An
+  exported `HERDR_SWARM_PORT_START`/`_SPAN` still wins.
+
+### Fixed
+- Merge winner could skip — and, on a clean worktree, archive and so kill — an
+  agent that was working again. Which slots were "finished" came from the
+  compare table, and a `marker` finish is never cleared. It now runs `settle`
+  after the merge and re-reads compare: a slot is skipped only if it is still
+  finished and its tip and dirty count are what you saw. Anything else is left
+  running and named.
+- Merge winner checked base drift against the base it had just re-read, so a
+  base that moved after you confirmed merged without the drift warning. It now
+  checks against the base current at confirm, and refuses if it moved.
+- Archive, discard and abort no longer act on a slot whose `validate` hook is
+  still running. The hook runs with the repo lock released and could write
+  ignored files after the cleanup inventory was approved, or after the
+  discard snapshot.
+- A timeout that is not whole seconds (`HERDR_SWARM_CLONE_TIMEOUT=2m`, `0900`,
+  `08`) was found only after the timed command had started: the arithmetic
+  error ended the caller, leaving `cp` (or the validate hook) running with no
+  deadline and, for validate, its per-slot lock dropped. Timeouts are now
+  parsed as decimal before anything starts, and fan-out refuses a bad clone or
+  setup timeout before creating any worktree.
+- `validate` exited 30 (base drift) when the *slot* moved while its hook ran.
+  It now exits 36 (refused); 30 still means only that the base moved.
+- Compare could rank a slot `passed` on a validation record that the strict
+  candidate handoff rejects (one without the hook's own `validate` check):
+  the two had separate copies of the identity rule. Both now use
+  `isSwarmValidationRecord` from `pr-handoff.mjs`.
+- A `validate` that times out in the harvest pane now names
+  `HERDR_SWARM_VALIDATE_TIMEOUT`, the setting that sets its budget, not the
+  generic step timeout.
+
 ## [0.5.0] — 2026-10-04
 
 The "pick the winner" release: Swarm now checks each slot, notices when a
@@ -70,7 +106,11 @@ merging. Exercised live end to end on Herdr 0.8.2 (see `docs/readiness.md`).
   gets `HERDR_SWARM_RUN_ID`, `_SLOT`, `_PORT_BASE`, `_PORT_SPAN`: in
   `setup.sh` always, in the agent via `pane split --env` on Herdr 0.7.5+, and
   as a port-range line in the task file. Ports default to 10 per slot from
-  4100 and are recorded on the manifest row.
+  4100 and are recorded on the manifest row. Settings:
+  `HERDR_SWARM_PORT_START` / `_SPAN`, `HERDR_SWARM_CLONE_MODE=copy` (full copy
+  where copy-on-write is unavailable), `HERDR_SWARM_CLONE_TIMEOUT` (default
+  120s), and a `clone-paths` file in the plugin config dir. Clone temps
+  (`.swarm-clone.*`) are added to `info/exclude`.
 - Compare view (`w` in the harvest pane; scriptable as the read-only
   `compare` verb). It ranks running slots by validation of their current
   tip, then commits, then finished, never by diff size, and shows commits,
@@ -78,8 +118,11 @@ merging. Exercised live end to end on Herdr 0.8.2 (see `docs/readiness.md`).
   `d` shows the full diff between two slots' tips in git's pager. `m` merges
   a chosen winner through the normal merge, and only if it lands, skips and
   archives the other running slots (branches kept; anything that won't
-  archive cleanly is left and named).
-- Finish detection: the status pane runs a new `settle` verb every 10s. It
+  archive cleanly is left and named). The merge verb takes an optional third
+  argument, `merge <slot> <base-sha> [expected-slot-tip]`: it refuses unless
+  the slot is still at that SHA, then merges the SHA, not the branch name.
+- Finish detection: the status pane runs a new `settle` verb every 10s
+  (`HERDR_SWARM_SETTLE_INTERVAL_MS`). It
   records a slot as finished when its agent creates `.swarm-done` (now asked
   for in the task file's standing instructions, and excluded from `git status`
   and from ignored-file cleanup approval like `.swarm-task.md`). It also does
@@ -87,7 +130,8 @@ merging. Exercised live end to end on Herdr 0.8.2 (see `docs/readiness.md`).
   Finished slots show `finished`, flip their plugin-reported state to `idle`,
   and get one Herdr notification per run when all are done. Opt-in
   auto-validate (`HERDR_SWARM_AUTO_VALIDATE=1` or a config-dir
-  `auto-validate` file) runs `validate` on each settled slot.
+  `auto-validate` file) runs `validate` on each finished slot. An empty
+  `.swarm-done` is exempt from that approval; one with content is not.
 - `validate <slot>` harvest verb (`v`, then slot in the pane) runs the
   operator's `validate.sh` hook against a slot's clean HEAD and records a
   SHA-bound checks file. The strict candidate handoff now produces its own

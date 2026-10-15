@@ -1,6 +1,7 @@
 // compare.mjs — read-only slot comparison behind `harvest-step.sh compare`.
-// The verb verifies ownership of every row in bash, then feeds one TSV line
-// per slot on stdin: slot, label, branch, path, status, finished_reason. This
+// The verb verifies ownership of every row in bash, then feeds one
+// \x1f-separated line per slot on stdin: slot, label, branch, path, status,
+// finished_reason, started_at, finished_at. This
 // script only READS git (rev-parse, rev-list, diff, status) and the
 // Swarm-produced validation files, and prints:
 //
@@ -15,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { isSwarmValidationRecord } from "./pr-handoff.mjs";
 
 const VALIDATION_ORDER = { passed: 0, none: 1, stale: 2, failed: 3 };
 const SHARED_LIMIT = 10;
@@ -34,9 +36,9 @@ function validationFor(stateDir, runId, slot, tip) {
 	} catch {
 		return { status: "none" };
 	}
-	// Same identity rule the strict candidate gate applies to the default file.
-	if (value?.kind !== "herdr-swarm-validation" || value.run_id !== runId || value.slot !== slot ||
-		!["passed", "failed"].includes(value.status)) return { status: "none" };
+	// The strict candidate gate's own rule, so compare never ranks "passed" a
+	// record that gate would reject.
+	if (!isSwarmValidationRecord(value, runId, slot) || !["passed", "failed"].includes(value.status)) return { status: "none" };
 	if (!tip || value.head_sha !== tip) return { status: "stale", head_sha: value.head_sha ?? null };
 	const failed = (Array.isArray(value.checks) ? value.checks : [])
 		.filter((c) => c?.status !== "passed").map((c) => String(c?.name ?? "?")).slice(0, 5);

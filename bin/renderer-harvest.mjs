@@ -83,8 +83,9 @@ export function summarizeIgnored(files, limit = 20) {
 }
 
 // The pane's env minus every variable that reroutes or reconfigures git —
-// the same list scripts/lib.sh clear_git_routing_env removes.
-const GIT_ROUTING = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+// the same list scripts/lib.sh clear_git_routing_env removes (a test holds
+// the two in lockstep).
+export const GIT_ROUTING = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
 	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 	"GIT_PREFIX", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]);
 export function gitDisplayEnv(env) {
@@ -414,7 +415,9 @@ export class HarvestRenderer {
 	}
 
 	timeoutBanner(verb, timeoutMs = this.stepTimeoutMs) {
-		return `harvest step '${verb}' timed out after ${timeoutMs}ms and was killed — check for a hung git hook or lock, then retry (HERDR_SWARM_STEP_TIMEOUT_MS raises the limit)`;
+		// validate's budget follows the hook timeout, so that is the knob.
+		const knob = verb === "validate" ? "HERDR_SWARM_VALIDATE_TIMEOUT" : "HERDR_SWARM_STEP_TIMEOUT_MS";
+		return `harvest step '${verb}' timed out after ${timeoutMs}ms and was killed — check for a hung git hook or lock, then retry (${knob} raises the limit)`;
 	}
 
 	lastErrLine(res) {
@@ -583,13 +586,21 @@ export class HarvestRenderer {
 
 	// Compare view: one read-only `compare` verb call, parsed into the phase.
 	async openCompare() {
-		const r = await this.step("compare");
-		if (r.code !== 0) {
-			this.banner = this.lastErrLine(r);
+		const c = await this.readCompare();
+		if (!c.ok) {
+			this.banner = c.error;
 			this.phase = { name: "list" };
 			this.paint();
 			return;
 		}
+		this.phase = { name: "compare", slots: c.slots, overlaps: c.overlaps, pick: null };
+		this.paint();
+	}
+
+	// The `compare` verb, parsed: { ok, slots, overlaps } or { ok: false, error }.
+	async readCompare() {
+		const r = await this.step("compare");
+		if (r.code !== 0) return { ok: false, error: this.lastErrLine(r) };
 		const slots = [];
 		for (const [json] of r.out.compare_slot ?? []) {
 			try {
@@ -607,8 +618,7 @@ export class HarvestRenderer {
 			}
 			return { a: Number(a), b: Number(b), count: Number(n), shared: files };
 		});
-		this.phase = { name: "compare", slots, overlaps, pick: null };
-		this.paint();
+		return { ok: true, slots, overlaps };
 	}
 
 	// Two slots' tips, full diff, in git's own pager: the same terminal
@@ -640,15 +650,21 @@ export class HarvestRenderer {
 		});
 	}
 
-	// Merge the chosen slot at the exact tip the compare view showed, then —
-	// only if that merge LANDED — skip every other running slot whose agent
-	// has FINISHED and archive whichever archive cleanly. Unfinished slots are
-	// left running (skipping one would let its agent keep committing to a
-	// settled slot nobody looks at again). Branches are always kept (skip is
-	// bookkeeping; archive never deletes a branch). Anything that refuses to
-	// archive — the winner included — is left in place and named, never forced.
+	// Merge the chosen slot at the exact tip the compare view showed, onto the
+	// base that was current when it was confirmed, then — only if that merge
+	// LANDED — skip every other running slot whose agent has FINISHED and
+	// archive whichever archive cleanly. Unfinished slots are left running
+	// (skipping one would let its agent keep committing to a slot nobody looks
+	// at again). "Finished" is re-read after the merge, not trusted from the
+	// compare table: settle runs first (an exited agent restarted by hand
+	// flips back to working), and a slot whose tip or dirty count changed
+	// since compare is treated as resumed — a `marker` finish is never
+	// cleared by settle, so changed work is the only sign an agent was given a
+	// follow-up. Branches are always kept (skip is bookkeeping; archive never
+	// deletes a branch). Anything that refuses to archive — the winner
+	// included — is left in place and named, never forced.
 	async mergeWinner(confirm) {
-		const { slot, tip, others, unfinished, locus } = confirm;
+		const { slot, tip, others, unfinished, locus, base, seen } = confirm;
 		await this.refresh();
 		const row = this.rows.find((r) => r.slot === slot);
 		if (row?.preview?.state !== "clean") {
@@ -665,14 +681,32 @@ export class HarvestRenderer {
 			this.paint();
 			return;
 		}
+		// The merge verb's drift guard compares against the base it is handed;
+		// handing it the base refresh() just read would compare new to new.
+		if (row.preview.baseSha !== base) {
+			this.banner = `base moved since you confirmed (${String(base ?? "").slice(0, 7)} -> ${String(row.preview.baseSha ?? "").slice(0, 7)}) — compare again; nothing was merged or skipped`;
+			this.phase = { name: "list" };
+			this.paint();
+			return;
+		}
 		if (!(await this.doMerge(slot, tip))) return;
 		// doMerge already tried to archive the winner; an ignored-files approval
 		// or dirty prompt it raised must survive the summary below.
 		const winnerPrompt = ["ignored", "dirty"].includes(this.phase.name) ? this.phase : null;
 		const skipped = [];
 		const kept = [];
+		const resumed = [...unfinished];
+		const settled = await this.step("settle");
+		const now = settled.code === 0 ? await this.readCompare() : { ok: false };
 		for (const s of others) {
 			if (this.rows.find((r) => r.slot === s)?.status !== "running") continue;
+			const cur = now.ok ? now.slots.find((c) => c.slot === s) : null;
+			const was = seen?.[s];
+			// Unconfirmable is unfinished: no fresh reading, no skip.
+			if (!cur?.finished || !was || cur.tip !== was.tip || cur.dirty !== was.dirty) {
+				resumed.push(s);
+				continue;
+			}
 			const sk = await this.step("skip", [s]);
 			if (sk.code !== 0) {
 				kept.push(`${s} (skip failed)`);
@@ -690,7 +724,7 @@ export class HarvestRenderer {
 		if (winnerRow && winnerRow.status !== "archived") kept.unshift(`${slot} (winner)`);
 		this.phase = winnerPrompt ?? { name: "list" };
 		this.banner = `slot ${slot} merged${skipped.length ? `; skipped ${skipped.join(", ")}` : ""}${
-			unfinished.length ? `; still running (agent not finished): ${unfinished.join(", ")}` : ""
+			resumed.length ? `; still running (agent not finished): ${resumed.join(", ")}` : ""
 		}${kept.length ? `; worktrees kept for ${kept.join(", ")} — archive them from the list` : ""}`;
 		this.paint();
 	}
@@ -1017,7 +1051,10 @@ export class HarvestRenderer {
 							tip: chosen.tip,
 							others: rest.filter((s) => s.finished).map((s) => s.slot),
 							unfinished: rest.filter((s) => !s.finished).map((s) => s.slot),
+							// What the operator is agreeing to skip, as they saw it.
+							seen: Object.fromEntries(rest.map((s) => [s.slot, { tip: s.tip, dirty: s.dirty }])),
 							locus: this.rows.find((r) => r.slot === n)?.preview?.locus ?? null,
+							base: this.rows.find((r) => r.slot === n)?.preview?.baseSha ?? null,
 							back: ph,
 						};
 					}

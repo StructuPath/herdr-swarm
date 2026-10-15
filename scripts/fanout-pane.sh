@@ -605,8 +605,12 @@ preflight_check_argv "${slot_argvs[@]}" || fatal $?
 
 # Same rule for ports: the HIGHEST slot's range is checked here, so a range
 # that only overflows for slot N never strands slots 1..N-1 half-built.
-slot_port_base "$n" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_PORT_START/_SPAN give $n slots no valid port range (need 1024-65535, decimal)."
+slot_port_base "$n" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_PORT_START/_SPAN (or git config swarm.portStart/portSpan) give $n slots no valid port range (need 1024-65535, decimal)."
 port_span="$(slot_port_span)"
+# And for the timeouts fan-out applies per slot: a bad value found mid-run
+# would only surface as every clone or setup silently "failing".
+positive_seconds "${HERDR_SWARM_CLONE_TIMEOUT:-120}" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_CLONE_TIMEOUT must be a positive whole number of seconds."
+positive_seconds "${HERDR_SWARM_SETUP_TIMEOUT:-300}" >/dev/null || fatal 1 "herdr-swarm: HERDR_SWARM_SETUP_TIMEOUT must be a positive whole number of seconds."
 
 # --- Run identity and manifest ----------------------------------------------
 
@@ -728,8 +732,10 @@ for ((i = 1; i <= n; i++)); do
 	slot_env=(HERDR_SWARM_RUN_ID="$run_id" HERDR_SWARM_SLOT="$i"
 		HERDR_SWARM_PORT_BASE="$port_base" HERDR_SWARM_PORT_SPAN="$port_span")
 
-	# Optional per-repo setup hook: fresh worktrees lack gitignored deps
-	# (.env, node_modules), the most likely "all my agents failed" cause.
+	# Optional per-repo setup hook, run after the dependency clones above:
+	# it covers whatever they did not (.env, build output, a dep tree the
+	# clone list skipped) — missing deps being the likeliest "all my agents
+	# failed" cause.
 	# Failure warns but does not fail the slot — the agent may not need
 	# what setup provides, and the warning names the log for diagnosis.
 	setup_hook="${HERDR_PLUGIN_CONFIG_DIR:-}/setup.sh"

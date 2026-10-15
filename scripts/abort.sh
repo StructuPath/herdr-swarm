@@ -253,6 +253,11 @@ reap_slot_worktree() {
 		note_kept "slot $slot worktree $wt (ownership check failed: $why)"
 		return 0
 	fi
+	if validate_in_flight "$RUN_ID" "$slot"; then
+		echo "herdr-swarm: slot $slot KEPT — a validate hook is still running in $wt; abort again once it finishes." >&2
+		note_kept "slot $slot worktree $wt (validate in flight)"
+		return 0
+	fi
 	if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
 		# Dirty is KEPT, never prompted (no TTY) and never forced (R11); the
 		# commit/skip/discard flow belongs to harvest (R9), not abort.

@@ -108,6 +108,17 @@ function candidateRefuse(issue, message) {
 	throw new CandidateEvidenceError(issue, message);
 }
 
+// A file nobody named (the slot's default validate result) sits at a
+// predictable path, so it must also prove it is Swarm's own record for exactly
+// this run and slot, with the hook's own check present. The one definition of
+// that rule: the compare view ranks by it too, and a copy here and there had
+// already drifted apart.
+export function isSwarmValidationRecord(value, runId, slot) {
+	return value?.kind === "herdr-swarm-validation" && value.schema_version === 1 &&
+		value.run_id === runId && value.slot === slot && Array.isArray(value.checks) &&
+		value.checks.some(check => check?.name === "validate");
+}
+
 function candidateValidation(filename, plan) {
 	const sha = plan.sha;
 	if (!filename) candidateRefuse("validation_missing", "Candidate handoff requires a validation evidence file.");
@@ -118,12 +129,7 @@ function candidateValidation(filename, plan) {
 		candidateRefuse("validation_invalid", `Candidate validation evidence is invalid: ${error.message}`);
 	}
 	if (value?.schema_version !== 1 || !Array.isArray(value.checks)) candidateRefuse("validation_invalid", "Candidate validation evidence must use the typed checks schema.");
-	// A file nobody named (the slot's default validate result) sits at a
-	// predictable path, so it must also prove it is Swarm's own record for
-	// exactly this run and slot, with the hook's own check present.
-	if (process.env.HERDR_SWARM_CANDIDATE_VALIDATION_PRODUCED === "1" &&
-		(value.kind !== "herdr-swarm-validation" || value.run_id !== plan.run || value.slot !== plan.slot ||
-			!value.checks.some(check => check?.name === "validate"))) {
+	if (process.env.HERDR_SWARM_CANDIDATE_VALIDATION_PRODUCED === "1" && !isSwarmValidationRecord(value, plan.run, plan.slot)) {
 		candidateRefuse("validation_invalid", "The slot's validate result is not a Swarm validation record for this run and slot.");
 	}
 	if (value.head_sha !== sha) candidateRefuse("validation_stale", "Candidate validation evidence does not match the selected slot HEAD.");

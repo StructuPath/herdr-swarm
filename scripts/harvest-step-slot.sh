@@ -141,6 +141,10 @@ do_discard() {
 		echo "herdr-swarm: slot $1 worktree is gone ($SLOT_PATH)" >&2
 		return "$HS_EC_REFUSED"
 	}
+	if validate_in_flight "$RUN_ID" "$1"; then
+		echo "herdr-swarm: slot $1 is being validated — its hook is still writing in the worktree; discard refused until it finishes." >&2
+		return "$HS_EC_REFUSED"
+	fi
 	# reset --hard, not `checkout -- .`: checkout restores the working tree FROM
 	# the index, so STAGED changes survive it. The verb then reports "discarded"
 	# while the slot is still dirty, and every later archive fails HS_EC_DIRTY
@@ -203,6 +207,10 @@ do_archive() {
 		printf 'archived\t%s\n' "$1"
 		finalize_run "$REPO_ROOT" "$RUN_ID" || return $?
 		return 0
+	fi
+	if validate_in_flight "$RUN_ID" "$1"; then
+		echo "herdr-swarm: slot $1 is being validated — its hook is still writing in the worktree; archive refused until it finishes." >&2
+		return "$HS_EC_REFUSED"
 	fi
 	# Cleanup is preview/apply, not a process-global boolean. The recursive
 	# inventory is canonicalized as NUL-delimited path bytes and its digest is

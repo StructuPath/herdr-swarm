@@ -54,3 +54,12 @@ labelled finished rather than lost, which is misleading but not destructive.
 That includes `HERDR_SOCKET_PATH` / `HERDR_PANE_ID`. A `validate.sh` that
 calls bare `herdr` acts as the Status pane. The same exposure already exists
 when validate runs from the Harvest pane.
+
+## Addendum 2026-10-06
+
+"Roadmap item 3" above is the compare view, which shipped in 0.5.0. Finding 2
+still stands: a refused auto-validate writes no result file, so compare shows
+the slot as `not run`, the same as one never validated; the refusal is still
+only in the log. Separately, merge winner no longer trusts the compare
+table's `finished` column at the moment it skips slots. It re-runs settle and
+re-reads compare after the merge (fixed on worktree-swarm-review-fixes).
