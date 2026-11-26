@@ -14,6 +14,8 @@ Notable changes to the Swarm plugin. Format follows
   exported `HERDR_SWARM_PORT_START`/`_SPAN` still wins.
 
 ### Fixed
+- Slot markers inside nested Markdown fence examples no longer create
+  unintended task sections or incorrect fan-out slot counts.
 - Merge winner could skip — and, on a clean worktree, archive and so kill — an
   agent that was working again. Which slots were "finished" came from the
   compare table, and a `marker` finish is never cleared. It now runs `settle`

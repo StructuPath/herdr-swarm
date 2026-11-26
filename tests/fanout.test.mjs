@@ -975,6 +975,24 @@ test("env-driven: a sectioned task file gives each slot its own task and sets th
 	assert.doesNotMatch(r.stderr, /may conflict/);
 });
 
+test("env-driven: fenced marker examples do not increase the inferred slot count", () => {
+	const example = ["Document marker syntax.", "````markdown", "```", "<!-- swarm-slot: 9 -->", "```", "````"].join("\n");
+	const brief = taskFile(`<!-- swarm-slot: 1 -->\n${example}\n<!-- swarm-slot: 2 -->\nSecond real task.\n`);
+	const { repo, env } = setup({ HERDR_SWARM_TASK_FILE: brief, HERDR_SWARM_PRESETS: "claude" });
+	delete env.HERDR_SWARM_SLOTS;
+	const r = runPaneNoStdin(env, repo);
+	assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+	assert.match(r.stdout, /2 slots, from the task file's slot sections/);
+	const slots = readManifest().slots;
+	assert.equal(slots.length, 2);
+	const [one, two] = slots.map((s) => fs.readFileSync(path.join(s.path, ".swarm-task.md"), "utf8"));
+	assert.ok(one.startsWith(`${example}\n`), "the complete example survives verbatim");
+	assert.doesNotMatch(one, /Second real task/);
+	assert.match(two, /^Second real task\.\n/);
+	assert.doesNotMatch(two, /Document marker syntax|swarm-slot:/);
+	for (const task of [one, two]) assert.match(task, /## Standing instructions/);
+});
+
 test("env-driven: sections that do not fit the slot count refuse before anything is created", () => {
 	for (const [slots, text, why] of [
 		["2", "<!-- swarm-slot: 3 -->\nx\n", /section for slot 3, but the run has 2/],
