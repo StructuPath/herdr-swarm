@@ -49,6 +49,43 @@ test("a marker inside prose or a fenced code block is not a marker", () => {
 	assert.match(sections.get(1), /```markdown\n<!-- swarm-slot: 1 -->/, "the example survives verbatim");
 });
 
+test("fences close only with the same character, sufficient length, and no trailing text", () => {
+	for (const char of ["`", "~"]) {
+		for (const closingLength of [4, 5]) {
+			const fence = char.repeat(4);
+			const example = [
+				"Document the syntax:",
+				`  ${fence}markdown`,
+				char.repeat(3),
+				"<!-- swarm-slot: 9 -->",
+				`${fence}still-code`,
+				"<!-- swarm-slot: 9 -->",
+				(char === "`" ? "~" : "`").repeat(5),
+				"<!-- swarm-slot: 9 -->",
+				"<!-- swarm_slot: typo inside an example is fine -->",
+				`  ${char.repeat(closingLength)} \t\r`,
+			].join("\n");
+			const doc = `<!-- swarm-slot: 1 -->\n${example}\n<!-- swarm-slot: 2 -->\nSecond task.`;
+			const { sections } = parseSections(doc);
+			assert.deepEqual([...sections.keys()], [1, 2]);
+			assert.equal(sections.get(1), example.trimEnd());
+			assert.deepEqual(splitTasks(doc, 2), [
+				{ task: example.trimEnd(), focus: example.trimEnd(), preambleOnly: false },
+				{ task: "Second task.", focus: "Second task.", preambleOnly: false },
+			]);
+		}
+	}
+});
+
+test("an unterminated fence keeps markers and near-miss markers as text", () => {
+	for (const char of ["`", "~"]) {
+		const example = [char.repeat(4), char.repeat(3), "<!-- swarm-slot: 9 -->", "<!-- swarm_slot: typo -->"].join("\n");
+		const doc = `<!-- swarm-slot: 1 -->\n${example}`;
+		assert.deepEqual([...parseSections(doc).sections], [[1, example]]);
+		assert.deepEqual(splitTasks(doc, 1), [{ task: example, focus: example, preambleOnly: false }]);
+	}
+});
+
 test("a near-miss marker is refused by line, never kept as text", () => {
 	for (const typo of ["<!-- swarm_slot: 2 -->", "<!-- swarm slot: 2 -->", "<!-- Swarm-Slot: 2 -->", "<!-- swarm-slot: two -->", "<!-- swarm-slot 2 -->"]) {
 		assert.throws(() => parseSections(`<!-- swarm-slot: 1 -->\nA\n${typo}\nB\n`), /line 3 looks like a slot marker but is not one/, typo);

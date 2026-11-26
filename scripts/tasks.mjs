@@ -34,7 +34,7 @@ const MARKER = /^\s*<!--\s*swarm-slot:\s*(\d+)\s*-->\s*$/;
 // keeping it as text would hand one slot two slots' work (and could shrink
 // the slot count when it was the highest marker), so it is a refusal.
 const NEAR_MARKER = /<!--\s*swarm[-_ ]?slot/i;
-const FENCE = /^\s*(```|~~~)/;
+const FENCE = /^\s*(`{3,}|~{3,})(.*)$/s;
 
 export function parseSections(text) {
 	const sections = new Map();
@@ -46,9 +46,14 @@ export function parseSections(text) {
 		// Inside a fenced code block nothing is a marker: a brief may well show
 		// the marker syntax as an example.
 		const f = line.match(FENCE);
-		if (f && (fence === null || f[1] === fence)) fence = fence === null ? f[1] : null;
-		const m = fence === null && !f ? line.match(MARKER) : null;
-		if (!m && fence === null && !f && NEAR_MARKER.test(line) && /^\s*<!--/.test(line)) {
+		if (fence !== null || f) {
+			if (fence === null) fence = f[1];
+			else if (f && f[1][0] === fence[0] && f[1].length >= fence.length && /^[ \t\r]*$/.test(f[2])) fence = null;
+			(current ?? preamble).push(line);
+			continue;
+		}
+		const m = line.match(MARKER);
+		if (!m && NEAR_MARKER.test(line) && /^\s*<!--/.test(line)) {
 			throw new Error(`line ${index + 1} looks like a slot marker but is not one: '${line.trim()}' — write it as <!-- swarm-slot: N -->`);
 		}
 		if (m) {
